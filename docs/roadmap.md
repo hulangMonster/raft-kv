@@ -15,17 +15,21 @@
 **M1 → M2 之间补课**：Raft 论文 §5（5.1–5.3）、gRPC 入门示例、
 一致性哈希 / CAP 通俗材料，读一遍即可动手。
 
-## M2 🔜 Raft：选主 + 日志复制（下一个里程碑）
+## M2 ✅ Raft：选主 + 日志复制（已完成）
 
-- 3 节点（进程）模拟：Leader 选举（随机超时、心跳续任）
-- 日志追加与复制（AppendEntries）、提交过半即应用
-- 客户端只写 Leader；写操作先落本机 WAL 再走 Raft（复用 M1 的 Wal）
-- 验收：
-  - 脚本启 3 节点，kill Leader → 其余节点在超时窗口内选出新 Leader
-  - kill 任意 1~2 节点期间写入不丢（数据由日志重放恢复）
-  - `scripts/raft_test.sh` 可重复跑通（含故障注入）
-- 设计要点：节点间消息沿用现有 `codec` 风格自描述帧，先不引入 gRPC，
-  减少依赖、便于讲清协议边界；M5 可选统一迁移 gRPC。
+> 详细设计见 [m2-design.md](m2-design.md)，前置校验见
+> [m2-prerequisites.md](m2-prerequisites.md)。
+
+- 3 节点集群：Leader 选举（确定性随机超时、心跳续任、任期规则、投票日志新旧限制）
+- 日志复制：AppendEntries 一致性校验 / 冲突截断 / 掉队追赶；§5.4.2 提交规则（只提交当前 term 的多数派）
+- `KvStateMachine` 幂等 apply（clientId/requestId 去重）；`propose` 等待 提交/降级/超时
+- `FileLogStore`：meta.dat 原子写（tmp+rename+fsync）+ raft.log CRC 帧 + torn-tail 截断 + truncateSuffix —— 决策 D1（Raft log 为唯一持久化真相源）
+- 节点进程 `main_raft_node`（RaftNode + TcpTransport + ticker 线程 + 锁纪律）；集群客户端 `main_raft_client`（NotLeader 重定向重试 + REPL）
+- M2.5：conflictIndex 快速回退 + **§5.4.2 严格反例测试**（5 节点确定性构造：旧 term 条目复制到多数派仍不得提交）
+- 验收（均实测通过）：
+  - `raftkv_raft_tests` **14/14**（含 §5.4.2 反例、崩溃重启、torn-tail）
+  - `scripts/raft_e2e.sh` **PASS**：kill -9 Leader 自动重选、数据存活、无多数派写失败
+  - `scripts/raft_fault.sh --repeat 50` **PASS**：SIGSTOP 分区 + 追平 + 稳定性
 
 ## M3 快照与日志压缩
 

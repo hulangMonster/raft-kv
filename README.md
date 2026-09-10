@@ -1,11 +1,11 @@
 # raftkv —— Raft-based Distributed Key-Value Store
 
-> 里程碑 M1：单机版 KV + WAL 持久化（当前进度）。Roadmap 见
+> 里程碑：M1 ✅ 单机版 KV + WAL；M2 ✅ Raft 选主 + 日志复制。Roadmap 见
 > [docs/roadmap.md](docs/roadmap.md)。
 
-一个从零实现、面向简历与生产场景的分布式 KV 存储练习项目：
-先用 C++ 写出一台**可持久化、可压测、有单元测试与故障测试**的单机 KV，
-再在它之上实现 Raft 共识，逐步演进为多节点、可故障切换的存储系统。
+一个从零实现、面向简历与生产场景的分布式 KV 存储项目：
+M1 先写出一台**可持久化、可压测、有故障测试**的单机 KV，
+M2 在它之上实现 Raft 共识，演进为**多节点、可自动选主、可故障切换**的集群。
 
 ## 当前能力（M1）
 
@@ -16,6 +16,14 @@
 - 线程池服务端（accept 线程 + N 个 worker），SIGINT/SIGTERM 优雅退出
 - 命令行客户端 + 顺序压测（QPS / avg / p50 / p99）
 - 单元测试（存储 / WAL 重放 / 编解码）+ `scripts/e2e.sh` 端到端冒烟与崩溃恢复测试
+
+## 当前能力（M2：Raft 集群）
+
+- 3 节点集群：Leader 选举（随机超时、心跳续任、任期规则）、日志复制与冲突截断
+- §5.4.2 提交规则（只提交当前 term 的多数派）、`KvStateMachine` 幂等 apply
+- `FileLogStore` 持久化（meta.dat 原子写 + raft.log CRC + torn-tail 截断），Raft log 为唯一持久化真相源
+- 节点进程 `raftkv_raft_node`、集群客户端 `raftkv_raft_cli`（NotLeader 重定向 + 交互 REPL）
+- 测试：`raftkv_raft_tests` 14/14；`scripts/raft_e2e.sh`；`scripts/raft_fault.sh --repeat 50`
 
 ## 目录结构
 
@@ -54,6 +62,29 @@ cmake --build build -j
 # 单元测试 + 端到端冒烟
 ./build/bin/raftkv_tests
 ./scripts/e2e.sh
+```
+
+## Raft 集群（M2）快速开始
+
+```bash
+PEERS="1=127.0.0.1:19601,2=127.0.0.1:19602,3=127.0.0.1:19603"
+
+# 三个终端（或后台）各启动一个节点
+./build/bin/raftkv_raft_node --id 1 --port 19601 --peers "$PEERS" --data-dir /tmp/raft1
+./build/bin/raftkv_raft_node --id 2 --port 19602 --peers "$PEERS" --data-dir /tmp/raft2
+./build/bin/raftkv_raft_node --id 3 --port 19603 --peers "$PEERS" --data-dir /tmp/raft3
+
+# 集群客户端：连任意节点即可（自动重定向到 Leader）
+./build/bin/raftkv_raft_cli --peers "$PEERS" --host 127.0.0.1 --port 19601 put user:42 alice
+./build/bin/raftkv_raft_cli --peers "$PEERS" --host 127.0.0.1 --port 19602 get user:42
+./build/bin/raftkv_raft_cli --peers "$PEERS" status
+
+# 不带命令进入交互模式（REPL）：put/get/del/status/quit
+./build/bin/raftkv_raft_cli --peers "$PEERS" --host 127.0.0.1 --port 19601
+
+# 集群端到端 + 故障注入稳定性
+./scripts/raft_e2e.sh
+./scripts/raft_fault.sh --repeat 50
 ```
 
 压测（注意：默认每次写都 fsync，压测请加 `--no-sync` 对比）：
