@@ -62,6 +62,18 @@ wait_leader() {
   return 1
 }
 
+# find_leader() can transiently see no leader while a re-election is in flight;
+# under 'set -e' a bare $(find_leader) assignment would then exit silently.
+require_leader() {
+  for _ in $(seq 1 200); do
+    local l
+    if l="$(find_leader)"; then echo "$l"; return 0; fi
+    sleep 0.1
+  done
+  echo "no leader within 20s" >&2
+  return 1
+}
+
 last_applied() {
   cli --host 127.0.0.1 --port "$(node_port "$1")" status 2>/dev/null \
     | tr ' ' '\n' | sed -n 's/^last_applied=//p'
@@ -82,7 +94,7 @@ for id in 1 2 3; do start_node "$id"; done
 wait_leader
 
 for i in $(seq 1 "$REPEAT"); do
-  LEADER="$(find_leader)"
+  LEADER="$(require_leader)"
   FOLLOWER_A=""
   FOLLOWER_B=""
   for id in 1 2 3; do

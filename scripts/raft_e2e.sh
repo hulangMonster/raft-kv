@@ -63,6 +63,18 @@ wait_leader() {
   return 1
 }
 
+# find_leader() can transiently see no leader while a re-election is in flight;
+# under 'set -e' a bare $(find_leader) assignment would then exit silently.
+require_leader() {
+  for _ in $(seq 1 200); do
+    local l
+    if l="$(find_leader)"; then echo "$l"; return 0; fi
+    sleep 0.1
+  done
+  echo "no leader within 20s" >&2
+  return 1
+}
+
 expect() {
   if [[ "$1" != "$2" ]]; then
     echo "FAIL: $3: expected '$2', got '$1'" >&2
@@ -82,11 +94,11 @@ out=$(cli --host 127.0.0.1 --port "$PORT3" get hello);   expect "$out" "NOT_FOUN
 
 # ---- durability: kill -9 the leader -----------------------------------------
 cli --host 127.0.0.1 --port "$PORT1" put durable yes >/dev/null
-LEADER="$(find_leader)"
+LEADER="$(require_leader)"
 kill -9 "${PIDS[$LEADER]}" 2>/dev/null || true
 PIDS[$LEADER]=""
 wait_leader
-NEW_LEADER="$(find_leader)"
+NEW_LEADER="$(require_leader)"
 # The new leader commits a no-op entry, which also applies `durable`.
 # Poll briefly for it to become visible.
 out=""
@@ -98,7 +110,7 @@ done
 expect "$out" "yes" "replay after kill -9"
 
 # ---- no majority: kill both followers ---------------------------------------
-LEADER="$(find_leader)"
+LEADER="$(require_leader)"
 for id in 1 2 3; do
   if [[ "$id" != "$LEADER" ]]; then
     [[ -n "${PIDS[$id]:-}" ]] && kill -9 "${PIDS[$id]}" 2>/dev/null || true
