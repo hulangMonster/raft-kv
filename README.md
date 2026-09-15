@@ -1,6 +1,6 @@
 # raftkv —— Raft-based Distributed Key-Value Store
 
-> 里程碑：M1 ✅ 单机版 KV + WAL；M2 ✅ Raft 选主 + 日志复制。Roadmap 见
+> 里程碑：M1 ✅ 单机版 KV + WAL；M2 ✅ Raft 选主 + 日志复制；M3 ✅ 快照与日志压缩（含 group commit，已按 #4 评审加固）。Roadmap 见
 > [docs/roadmap.md](docs/roadmap.md)。
 
 一个从零实现、面向简历与生产场景的分布式 KV 存储项目：
@@ -24,6 +24,30 @@ M2 在它之上实现 Raft 共识，演进为**多节点、可自动选主、可
 - `FileLogStore` 持久化（meta.dat 原子写 + raft.log CRC + torn-tail 截断），Raft log 为唯一持久化真相源
 - 节点进程 `raftkv_raft_node`、集群客户端 `raftkv_raft_cli`（NotLeader 重定向 + 交互 REPL）
 - 测试：`raftkv_raft_tests` 14/14；`scripts/raft_e2e.sh`；`scripts/raft_fault.sh --repeat 50`
+
+## 当前能力（M3：快照与日志压缩 + 组提交）
+
+- **快照**：按 `lastApplied` 两段式生成（锁内取一致视图、锁外序列化+落盘）；`SnapshotStore` seam = `MemorySnapshotStore` / `FileSnapshotStore`（`RKS1` 格式、tmp+fsync+rename+fsync(dir)、CRC、torn-snapshot 丢弃）
+- **日志压缩**：`LogStore::compact` 前缀物理删除 + **基址模型**（压缩后 `firstIndex = lastIncluded+1`、边界感知 `termAt/slice/lastIndex/lastTerm`）；**10w+ 条后 `raft.log` 有界**
+- **InstallSnapshot**（msgType 5/6，分块传输）：落后 / 空节点经快照快速追平
+- **启动恢复**：先加载快照，再重放 `raft.log` 尾部（`setBoundary` 先于 `load`）
+- **group commit**：`appendNoSync()` + `sync()`，一次 fsync 摊一批；`buildAppendEntries` 只复制已持久化条目；fsync 失败绝不记为已持久（I5）
+- **#4 评审加固**（15 个阻断项，见 `docs/m3-design.md` §12）：单节点组提交提交点、`LogStore` fd 锁下沉（L9）、
+  `SnapshotStore` 边界不回退 + 并发安装串行、InstallSnapshot 幂等续传（丢回复不卡死）、后缀 term 校验、
+  `commitIndex` 按"最后一条与本 leader 匹配的条目"推进、恢复路径失败即拒绝启动、压缩区守卫
+- 客户端：`fill <N> --pipeline K`（K 条并发连接，**每个 worker 独立 clientId**）、`verify <N>`（写回校验）、`snapshot`（手动触发）
+- 测试：`raftkv_raft_tests` **35/35**（含 ASan 全绿）；`scripts/raft_snapshot_e2e.sh`；`scripts/raft_snapshot_fault.sh --repeat 50`；`scripts/bench_group_commit.sh`
+- 实测吞吐（3 节点，`bench_group_commit.sh`，**每次 `fill` 后用 `verify` 校验零丢写**）：
+  `--pipeline 1` → **129 qps**；`--pipeline 8` → **746 qps**；`--pipeline 64` → **2840 qps（≈22×）**，三次均 `missing 0`
+  （旧记录的 2623 qps 是在"`--pipeline` 共享 clientId 会静默丢写"的 bug 下测得的，不计入）
+
+```bash
+# 小阈值触发快照 + 压缩；批量写 10w 条（K 条并发连接）
+./build/bin/raftkv_raft_node --id 1 --port 19601 --peers "$PEERS" --data-dir /tmp/r1 --snapshot-threshold 2000
+./build/bin/raftkv_raft_cli --peers "$PEERS" --host 127.0.0.1 --port 19601 fill 100000 --pipeline 64
+./build/bin/raftkv_raft_cli --peers "$PEERS" --host 127.0.0.1 --port 19601 status   # snapshot_index/term
+./build/bin/raftkv_raft_cli --peers "$PEERS" --host 127.0.0.1 --port 19601 snapshot # 手动触发
+```
 
 ## 目录结构
 
