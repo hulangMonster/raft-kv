@@ -52,6 +52,22 @@ struct AppendEntriesReply {
   Term conflictTerm = kNoTerm;
 };
 
+// ---- M3: InstallSnapshot (msgType 5/6) ----
+struct InstallSnapshotArgs {
+  Term term = kNoTerm;
+  int leaderId = 0;
+  Index lastIncludedIndex = kNoIndex;
+  Term lastIncludedTerm = kNoTerm;
+  uint64_t offset = 0;   // this chunk's offset in the snapshot file
+  bool done = false;
+  Bytes data;            // raw snapshot bytes [offset, offset+len)
+};
+struct InstallSnapshotReply {
+  Term term = kNoTerm;
+  bool success = false;
+  uint64_t nextOffset = 0;  // reserved for M5 resume; always 0 in M3
+};
+
 struct ClientRequest {
   raftkv::OpCode op = raftkv::OpCode::kGet;
   std::string key;
@@ -81,6 +97,9 @@ struct RaftConfig {
   size_t maxEntriesPerAppend = 128;
   size_t maxBytesPerAppend = 1u << 20;
   bool appendNoop = true;  // leader appends+commits a no-op entry on election
+  // M3 snapshot knobs
+  size_t snapshotThresholdEntries = 10000;  // trigger compaction threshold
+  size_t snapshotChunkBytes = 1u << 20;     // InstallSnapshot chunk size
 };
 
 }  // namespace raftkv::raft

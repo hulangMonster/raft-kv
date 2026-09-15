@@ -167,6 +167,53 @@ bool decodeAppendEntriesReply(const Byte* d, size_t n, AppendEntriesReply& out) 
   return true;
 }
 
+// InstallSnapshot: term(8) leaderId(4) index(8) term(8) offset(8) dataLen(4)
+//                  done(1) data[dataLen]   -> 41 + dataLen
+Bytes encodeInstallSnapshot(const InstallSnapshotArgs& a) {
+  Bytes p;
+  p.reserve(41 + a.data.size());
+  putU64(p, a.term);
+  putU32(p, static_cast<uint32_t>(a.leaderId));
+  putU64(p, a.lastIncludedIndex);
+  putU64(p, a.lastIncludedTerm);
+  putU64(p, a.offset);
+  putU32(p, static_cast<uint32_t>(a.data.size()));
+  p.push_back(a.done ? 1 : 0);
+  p.insert(p.end(), a.data.begin(), a.data.end());
+  return p;
+}
+bool decodeInstallSnapshot(const Byte* d, size_t n, InstallSnapshotArgs& out) {
+  if (n < 41) return false;
+  out.term = getU64(d);
+  out.leaderId = static_cast<int>(getU32(d + 8));
+  out.lastIncludedIndex = getU64(d + 12);
+  out.lastIncludedTerm = getU64(d + 20);
+  out.offset = getU64(d + 28);
+  const uint32_t dataLen = getU32(d + 36);
+  out.done = (d[40] != 0);
+  if (41 + dataLen != n) return false;
+  out.data.assign(d + 41, d + n);
+  return true;
+}
+
+// InstallSnapshotReply: term(8) success(1) nextOffset(8) -> 17
+Bytes encodeInstallSnapshotReply(const InstallSnapshotReply& r) {
+  Bytes p;
+  p.reserve(17);
+  putU64(p, r.term);
+  p.push_back(r.success ? 1 : 0);
+  putU64(p, r.nextOffset);
+  return p;
+}
+bool decodeInstallSnapshotReply(const Byte* d, size_t n,
+                                InstallSnapshotReply& out) {
+  if (n != 17) return false;
+  out.term = getU64(d);
+  out.success = (d[8] != 0);
+  out.nextOffset = getU64(d + 9);
+  return true;
+}
+
 Bytes encodeClientRequest(const ClientRequest& r) {
   Bytes p;
   p.reserve(25 + r.key.size() + r.value.size());

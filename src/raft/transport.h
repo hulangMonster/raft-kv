@@ -15,12 +15,16 @@ class Transport {
  public:
   using VoteCb = std::function<void(const RequestVoteReply&)>;
   using AppendCb = std::function<void(const AppendEntriesReply&)>;
+  using InstallCb = std::function<void(const InstallSnapshotReply&)>;
 
   virtual ~Transport() = default;
   virtual void sendRequestVote(int peerId, const RequestVoteArgs& args,
                                VoteCb cb) = 0;
   virtual void sendAppendEntries(int peerId, const AppendEntriesArgs& args,
                                  AppendCb cb) = 0;
+  // M3.3 (D4): InstallSnapshot chunk transfer.
+  virtual void sendInstallSnapshot(int peerId, const InstallSnapshotArgs& args,
+                                   InstallCb cb) = 0;
 };
 
 // Synchronous in-memory adapter for unit tests. Delivers directly to the
@@ -36,6 +40,8 @@ class MemoryTransport : public Transport {
                        VoteCb cb) override;
   void sendAppendEntries(int peerId, const AppendEntriesArgs& args,
                          AppendCb cb) override;
+  void sendInstallSnapshot(int peerId, const InstallSnapshotArgs& args,
+                           InstallCb cb) override;
 
  private:
   std::vector<RaftNode*> nodes_;   // indexed by id (id >= 1)

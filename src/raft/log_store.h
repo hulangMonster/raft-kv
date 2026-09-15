@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -26,6 +27,15 @@ class LogStore {
   // Append entries; returns true only after they are durable (fsync'd).
   virtual bool append(const std::vector<LogEntry>& entries) = 0;
 
+  // M5 group commit: write entries WITHOUT fsync, then flush a whole batch
+  // once with sync(). appendNoSync() must still make the entries visible to
+  // slice()/lastIndex() and must be serialized by the caller (RaftNode::mu_).
+  // sync() may be called WITHOUT RaftNode::mu_ (it is the only operation that
+  // runs outside it), so every implementation must make sync() safe against
+  // concurrent fd/structural mutation internally.
+  virtual bool appendNoSync(const std::vector<LogEntry>& entries) = 0;
+  virtual bool sync() = 0;
+
   // Drop [fromIndex, lastIndex] (conflict overwrite).
   virtual bool truncateSuffix(Index fromIndex) = 0;
 
@@ -35,6 +45,13 @@ class LogStore {
   virtual Index lastIndex() const = 0;
   virtual Term lastTerm() const = 0;              // kNoTerm when empty
   virtual Term termAt(Index index) const = 0;     // kNoTerm when out of range
+
+  // ---- M3: prefix compaction (m3-design.md v1.1 §4.3, D3) ----
+  virtual void setBoundary(Index lastIncludedIndex, Term lastIncludedTerm) = 0;
+  virtual bool compact(Index upTo, Term termAtUpTo) = 0;
+  virtual Index firstIndex() const = 0;  // lastIncludedIndex + 1
+  virtual Index lastIncludedIndex() const = 0;
+  virtual Term lastIncludedTerm() const = 0;
 };
 
 // In-memory adapter used by deterministic unit tests (no I/O).
@@ -43,12 +60,21 @@ class MemoryLogStore : public LogStore {
   bool load(Term& term, int& votedFor, Index& lastIndex) override;
   bool persistMeta(Term term, int votedFor) override;
   bool append(const std::vector<LogEntry>& entries) override;
+  bool appendNoSync(const std::vector<LogEntry>& entries) override;
+  bool sync() override;
   bool truncateSuffix(Index fromIndex) override;
   std::vector<LogEntry> slice(Index from, size_t maxEntries,
                               size_t maxBytes) const override;
   Index lastIndex() const override;
   Term lastTerm() const override;
   Term termAt(Index index) const override;
+
+  // M3 (stubs in Phase #2; real logic in M3.1)
+  void setBoundary(Index lastIncludedIndex, Term lastIncludedTerm) override;
+  bool compact(Index upTo, Term termAtUpTo) override;
+  Index firstIndex() const override;
+  Index lastIncludedIndex() const override;
+  Term lastIncludedTerm() const override;
 
   // Test helper: the whole log, entries_[i-1] == index i.
   const std::vector<LogEntry>& all() const { return entries_; }
@@ -57,6 +83,9 @@ class MemoryLogStore : public LogStore {
   Term term_ = kNoTerm;
   int votedFor_ = -1;
   std::vector<LogEntry> entries_;
+  // M3 (D3): compaction boundary. firstIndex() == lastIncluded_ + 1.
+  Index lastIncluded_ = kNoIndex;
+  Term lastIncludedTerm_ = kNoTerm;
 };
 
 // File-backed adapter: `<dir>/raft/meta.dat` + `<dir>/raft/raft.log`.
@@ -71,6 +100,8 @@ class FileLogStore : public LogStore {
   bool load(Term& term, int& votedFor, Index& lastIndex) override;
   bool persistMeta(Term term, int votedFor) override;
   bool append(const std::vector<LogEntry>& entries) override;
+  bool appendNoSync(const std::vector<LogEntry>& entries) override;
+  bool sync() override;
   bool truncateSuffix(Index fromIndex) override;
   std::vector<LogEntry> slice(Index from, size_t maxEntries,
                               size_t maxBytes) const override;
@@ -78,16 +109,31 @@ class FileLogStore : public LogStore {
   Term lastTerm() const override;
   Term termAt(Index index) const override;
 
+  // M3 (stubs in Phase #2; real logic in M3.1/M3.4)
+  void setBoundary(Index lastIncludedIndex, Term lastIncludedTerm) override;
+  bool compact(Index upTo, Term termAtUpTo) override;
+  Index firstIndex() const override;
+  Index lastIncludedIndex() const override;
+  Term lastIncludedTerm() const override;
+
  private:
   std::string dir_;
   std::string metaPath_;
   std::string logPath_;
   int logFd_ = -1;
+  // B4: sync() runs outside RaftNode::mu_ (group commit), so every operation
+  // that recreates/renames the log file or touches logFd_ takes this lock.
+  // appendNoSync() deliberately does not: it is only called under
+  // RaftNode::mu_, which also serialises compact()/truncateSuffix().
+  mutable std::mutex mu_;
 
   Term term_ = kNoTerm;
   int votedFor_ = -1;
   std::vector<LogEntry> entries_;                 // entries_[i-1] == index i
   std::unordered_map<Index, int64_t> offsetOf_;   // index -> record start offset
+  // M3 (D3): compaction boundary. firstIndex() == lastIncluded_ + 1.
+  Index lastIncluded_ = kNoIndex;
+  Term lastIncludedTerm_ = kNoTerm;
 };
 
 }  // namespace raftkv::raft

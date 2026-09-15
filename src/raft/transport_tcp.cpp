@@ -82,7 +82,9 @@ int connectPeer(const std::string& hostport, uint64_t timeoutMs) {
 
 TcpTransport::TcpTransport(std::unordered_map<int, std::string> peers,
                            uint64_t rpcTimeoutMs)
-    : peers_(std::move(peers)), rpcTimeoutMs_(rpcTimeoutMs) {}
+    : peers_(std::move(peers)),
+      rpcTimeoutMs_(rpcTimeoutMs),
+      installTimeoutMs_(2000) {}
 
 TcpTransport::~TcpTransport() {
   for (auto& [id, fd] : conns_) {
@@ -112,10 +114,18 @@ void TcpTransport::dropConnection(int peerId) {
 
 bool TcpTransport::roundTrip(int peerId, MsgType reqType,
                              const Bytes& reqPayload, MsgType& replyType,
-                             Bytes& replyPayload) {
+                             Bytes& replyPayload, uint64_t timeoutMs) {
   std::lock_guard<std::mutex> lock(mu_);
   const int fd = getConnection(peerId);
   if (fd < 0) return false;
+
+  // Per-call timeout: InstallSnapshot makes the peer do disk I/O (write +
+  // fsync + compact), which takes far longer than a heartbeat.
+  timeval tv{};
+  tv.tv_sec = static_cast<time_t>(timeoutMs / 1000);
+  tv.tv_usec = static_cast<suseconds_t>((timeoutMs % 1000) * 1000);
+  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
   const Bytes frame = encodeFrame(reqType, reqPayload);
   if (!writeFull(fd, frame.data(), frame.size())) {
@@ -156,7 +166,7 @@ void TcpTransport::sendRequestVote(int peerId, const RequestVoteArgs& args,
   MsgType replyType = MsgType::kRequestVoteReply;
   Bytes replyPayload;
   if (!roundTrip(peerId, MsgType::kRequestVote, encodeRequestVote(args),
-                 replyType, replyPayload)) {
+                 replyType, replyPayload, rpcTimeoutMs_)) {
     return;  // dropped / timed out: no callback (sender treats as timeout)
   }
   RequestVoteReply reply;
@@ -171,12 +181,30 @@ void TcpTransport::sendAppendEntries(int peerId, const AppendEntriesArgs& args,
   MsgType replyType = MsgType::kAppendEntriesReply;
   Bytes replyPayload;
   if (!roundTrip(peerId, MsgType::kAppendEntries, encodeAppendEntries(args),
-                 replyType, replyPayload)) {
+                 replyType, replyPayload, rpcTimeoutMs_)) {
     return;  // dropped / timed out
   }
   AppendEntriesReply reply;
   if (replyType == MsgType::kAppendEntriesReply &&
       decodeAppendEntriesReply(replyPayload.data(), replyPayload.size(), reply)) {
+    cb(reply);
+  }
+}
+
+void TcpTransport::sendInstallSnapshot(int peerId,
+                                       const InstallSnapshotArgs& args,
+                                       InstallCb cb) {
+  MsgType replyType = MsgType::kInstallSnapshotReply;
+  Bytes replyPayload;
+  if (!roundTrip(peerId, MsgType::kInstallSnapshot,
+                 encodeInstallSnapshot(args), replyType, replyPayload,
+                 installTimeoutMs_)) {
+    return;  // dropped / timed out
+  }
+  InstallSnapshotReply reply;
+  if (replyType == MsgType::kInstallSnapshotReply &&
+      decodeInstallSnapshotReply(replyPayload.data(), replyPayload.size(),
+                                 reply)) {
     cb(reply);
   }
 }

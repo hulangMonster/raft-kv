@@ -46,6 +46,8 @@ add_library(raftkv_raft STATIC
   src/raft/file_log_store.cpp
   src/raft/message.cpp
   src/raft/transport_tcp.cpp
+  src/raft/memory_snapshot_store.cpp
+  src/raft/file_snapshot_store.cpp
   src/kv/kv_state_machine.cpp
 )
 target_include_directories(raftkv_raft PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -70,6 +72,7 @@ if(GTEST_INCLUDE_DIR AND GTEST_LIBRARY)
     tests/raft_commit_test.cpp
     tests/raft_idempotent_test.cpp
     tests/raft_restart_test.cpp
+    tests/raft_snapshot_test.cpp
   )
   target_include_directories(raftkv_raft_tests PRIVATE
     ${GTEST_INCLUDE_DIR}

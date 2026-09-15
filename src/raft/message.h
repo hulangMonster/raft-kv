@@ -12,9 +12,12 @@ enum class MsgType : uint8_t {
   kRequestVoteReply = 2,
   kAppendEntries = 3,
   kAppendEntriesReply = 4,
+  kInstallSnapshot = 5,
+  kInstallSnapshotReply = 6,
   kClientRequest = 10,
   kClientReply = 11,
   kStatusRequest = 12,
+  kSnapshotTrigger = 13,
 };
 
 Bytes encodeFrame(MsgType type, const Bytes& payload);
@@ -31,6 +34,13 @@ bool decodeAppendEntries(const Byte* data, size_t n, AppendEntriesArgs& out);
 
 Bytes encodeAppendEntriesReply(const AppendEntriesReply& reply);
 bool decodeAppendEntriesReply(const Byte* data, size_t n, AppendEntriesReply& out);
+
+Bytes encodeInstallSnapshot(const InstallSnapshotArgs& args);
+bool decodeInstallSnapshot(const Byte* data, size_t n, InstallSnapshotArgs& out);
+
+Bytes encodeInstallSnapshotReply(const InstallSnapshotReply& reply);
+bool decodeInstallSnapshotReply(const Byte* data, size_t n,
+                                InstallSnapshotReply& out);
 
 Bytes encodeClientRequest(const ClientRequest& req);
 bool decodeClientRequest(const Byte* data, size_t n, ClientRequest& out);

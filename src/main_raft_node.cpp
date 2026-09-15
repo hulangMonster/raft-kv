@@ -25,6 +25,7 @@
 #include "raft/log_store.h"
 #include "raft/message.h"
 #include "raft/raft_node.h"
+#include "raft/snapshot_store.h"
 #include "raft/transport_tcp.h"
 
 using namespace raftkv;
@@ -113,6 +114,14 @@ void handleConnection(int fd, RaftNode& node) {
                                     encodeAppendEntriesReply(reply));
         if (!writeFull(fd, f.data(), f.size())) break;
       }
+    } else if (type == MsgType::kInstallSnapshot) {
+      InstallSnapshotArgs args;
+      if (decodeInstallSnapshot(payload.data(), payload.size(), args)) {
+        const InstallSnapshotReply reply = node.onInstallSnapshot(args);
+        const Bytes f = encodeFrame(MsgType::kInstallSnapshotReply,
+                                    encodeInstallSnapshotReply(reply));
+        if (!writeFull(fd, f.data(), f.size())) break;
+      }
     } else if (type == MsgType::kClientRequest) {
       ClientRequest req;
       if (decodeClientRequest(payload.data(), payload.size(), req)) {
@@ -130,11 +139,21 @@ void handleConnection(int fd, RaftNode& node) {
       ss << "role=" << roleName(node.role()) << " term=" << node.currentTerm()
          << " leader_id=" << node.leaderId()
          << " commit_index=" << node.commitIndex()
-         << " last_applied=" << node.lastApplied();
+         << " last_applied=" << node.lastApplied()
+         << " snapshot_index=" << node.lastIncludedIndex()
+         << " snapshot_term=" << node.lastIncludedTerm();
       ClientReply r;
       r.status = ClientStatus::kOk;
       r.value = ss.str();
       r.leaderHint = node.leaderId();
+      const Bytes f = encodeFrame(MsgType::kClientReply, encodeClientReply(r));
+      if (!writeFull(fd, f.data(), f.size())) break;
+    } else if (type == MsgType::kSnapshotTrigger) {
+      node.triggerSnapshot();
+      ClientReply r;
+      r.status = ClientStatus::kOk;
+      r.value = "snapshot triggered";
+      r.leaderHint = -1;
       const Bytes f = encodeFrame(MsgType::kClientReply, encodeClientReply(r));
       if (!writeFull(fd, f.data(), f.size())) break;
     } else {
@@ -175,6 +194,7 @@ int main(int argc, char** argv) {
 
   int id = 1;
   int port = 19601;
+  size_t snapshotThreshold = 10000;
   std::string peersArg;
   std::string dataDir;
 
@@ -195,6 +215,8 @@ int main(int argc, char** argv) {
       peersArg = next("--peers");
     } else if (a == "--data-dir") {
       dataDir = next("--data-dir");
+    } else if (a == "--snapshot-threshold") {
+      snapshotThreshold = std::stoul(next("--snapshot-threshold"));
     } else {
       usage(argv[0]);
       return 2;
@@ -221,15 +243,17 @@ int main(int argc, char** argv) {
     RaftConfig cfg;
     cfg.selfId = id;
     cfg.peerIds = std::move(peerIds);
+    cfg.snapshotThresholdEntries = snapshotThreshold;
 
     FileLogStore log(dataDir);
+    FileSnapshotStore snapshots(dataDir);  // M3.4: durable snapshots
     KvStateMachine sm;
     SteadyClock clock;
     // Short RPC timeout: a hung peer (e.g. SIGSTOP'd) must not block the
     // ticker long enough to starve live peers of heartbeats. Proper async
     // sends are a listed M5 improvement.
     TcpTransport transport(transportPeers, /*rpcTimeoutMs=*/30);
-    RaftNode node(cfg, log, sm, transport, clock);
+    RaftNode node(cfg, log, sm, transport, clock, &snapshots);
 
     struct sigaction sa {};
     sa.sa_handler = onSignal;

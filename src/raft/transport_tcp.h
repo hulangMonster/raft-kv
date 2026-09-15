@@ -25,15 +25,18 @@ class TcpTransport : public Transport {
                        VoteCb cb) override;
   void sendAppendEntries(int peerId, const AppendEntriesArgs& args,
                          AppendCb cb) override;
+  void sendInstallSnapshot(int peerId, const InstallSnapshotArgs& args,
+                           InstallCb cb) override;
 
  private:
   bool roundTrip(int peerId, MsgType reqType, const Bytes& reqPayload,
-                 MsgType& replyType, Bytes& replyPayload);
+                 MsgType& replyType, Bytes& replyPayload, uint64_t timeoutMs);
   int getConnection(int peerId);
   void dropConnection(int peerId);
 
   std::unordered_map<int, std::string> peers_;
   uint64_t rpcTimeoutMs_;
+  uint64_t installTimeoutMs_;  // longer: the peer does disk I/O on install
   std::mutex mu_;
   std::unordered_map<int, int> conns_;
 };

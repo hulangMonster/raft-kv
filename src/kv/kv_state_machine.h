@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -16,6 +17,11 @@ class KvStateMachine : public raft::StateMachine {
   void apply(const raft::LogEntry& entry) override;
   bool get(const std::string& key, std::string& out) const override;
   raft::Index lastApplied() const override;
+
+  // M3: consistent view (copies data_ + lastRequest_ + lastApplied_) and
+  // wholesale restore. Both include the idempotency table.
+  std::shared_ptr<const raft::SnapshotView> snapshotView() const override;
+  bool restore(const Bytes& payload) override;
 
  private:
   std::unordered_map<std::string, std::string> data_;
