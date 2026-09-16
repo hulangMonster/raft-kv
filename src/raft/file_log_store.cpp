@@ -272,21 +272,31 @@ bool FileLogStore::persistMeta(Term term, int votedFor) {
 }
 
 bool FileLogStore::append(const std::vector<LogEntry>& entries) {
-  return appendNoSync(entries) && sync();
+  std::lock_guard<std::mutex> lock(mu_);
+  return appendNoSyncLocked(entries) && syncLocked();
 }
 
 bool FileLogStore::sync() {
   std::lock_guard<std::mutex> lock(mu_);
+  return syncLocked();
+}
+
+bool FileLogStore::syncLocked() {
   if (logFd_ < 0) return false;
   return ::fsync(logFd_) == 0;
 }
 
 bool FileLogStore::appendNoSync(const std::vector<LogEntry>& entries) {
+  std::lock_guard<std::mutex> lock(mu_);
+  return appendNoSyncLocked(entries);
+}
+
+bool FileLogStore::appendNoSyncLocked(const std::vector<LogEntry>& entries) {
   if (logFd_ < 0) return false;  // store is broken (failed compact reopen)
   for (const LogEntry& e : entries) {
     if (e.index <= lastIndex()) {
       if (termAt(e.index) == e.term) continue;  // already present
-      if (!truncateSuffix(e.index)) return false;
+      if (!truncateSuffixLocked(e.index)) return false;
     }
     if (e.index != lastIndex() + 1) return false;  // must be contiguous (D3)
     const int64_t off = static_cast<int64_t>(::lseek(logFd_, 0, SEEK_END));
@@ -308,6 +318,10 @@ bool FileLogStore::appendNoSync(const std::vector<LogEntry>& entries) {
 
 bool FileLogStore::truncateSuffix(Index fromIndex) {
   std::lock_guard<std::mutex> lock(mu_);
+  return truncateSuffixLocked(fromIndex);
+}
+
+bool FileLogStore::truncateSuffixLocked(Index fromIndex) {
   if (fromIndex == kNoIndex) return true;
   if (fromIndex <= lastIncluded_) return false;  // cannot cut below boundary
   if (fromIndex > lastIndex() + 1) return false;

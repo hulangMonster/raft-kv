@@ -121,11 +121,16 @@ class FileLogStore : public LogStore {
   std::string metaPath_;
   std::string logPath_;
   int logFd_ = -1;
-  // B4: sync() runs outside RaftNode::mu_ (group commit), so every operation
-  // that recreates/renames the log file or touches logFd_ takes this lock.
-  // appendNoSync() deliberately does not: it is only called under
-  // RaftNode::mu_, which also serialises compact()/truncateSuffix().
+  // B4 + M5.2: every operation that recreates/renames the log file, touches
+  // logFd_, or mutates entries_/offsetOf_ takes this lock —— including
+  // appendNoSync()。M5.2 起 compact() 在 RaftNode::mu_ **之外**执行（I9：锁内不做
+  // fsync），所以 appendNoSync() 不能再依赖 RaftNode::mu_ 来与 compact()/rename
+  // 互斥，否则会在 compact 关闭/重开 logFd_ 的同时往旧 fd 上写。
   mutable std::mutex mu_;
+  // 以下三个是公共入口的内部实现：调用方必须已持有 mu_。
+  bool appendNoSyncLocked(const std::vector<LogEntry>& entries);
+  bool syncLocked();
+  bool truncateSuffixLocked(Index fromIndex);
 
   Term term_ = kNoTerm;
   int votedFor_ = -1;
