@@ -30,6 +30,8 @@ class TransportReactor : public Transport {
 
   void stop();  // 必须在 RaftNode 析构之前调用（L15）
 
+  bool isAsync() const override { return true; }
+
   void sendRequestVote(int peerId, const RequestVoteArgs& args,
                        VoteCb cb) override;
   void sendAppendEntries(int peerId, const AppendEntriesArgs& args,

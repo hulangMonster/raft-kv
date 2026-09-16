@@ -36,6 +36,11 @@ class Transport {
     (void)cb;
   }
 
+  // M5.3：该引擎是否**异步投递**（sendX 入队即返回、回调稍后触发）。
+  // 异步引擎下同一 peer 可能有多批在途，而应答没有序号 -> RaftNode 必须限制
+  // "每 peer 单批在途"（见 raft_node.h 的 appendSentMs_ 说明）；同步引擎天然满足，无需门控。
+  virtual bool isAsync() const { return false; }
+
   // M4 (L10): 地址簿动态更新；只在锁外作业中调用。
   // 默认空实现 -> MemoryTransport 之外的测试桩零改动即可编译。
   virtual void addPeer(int id, const std::string& addr) {

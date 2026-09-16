@@ -89,6 +89,7 @@ class RaftNode {
 
   // ---- M4.2: membership plumbing ----
   struct PeerJob {                    // 给某个 peer 的复制作业（追加 or 快照块）
+    bool skip = false;                // M5.3：该 peer 已有在途发送 -> 本 tick 跳过
     bool isSnapshot = false;
     AppendEntriesArgs append;
     InstallSnapshotArgs snapshot;
@@ -105,6 +106,8 @@ class RaftNode {
                          bool computeDraining);
   void recomputeConfigLocked();   // 日志截断后的配置回滚（设计 §5.2）
   PeerJob buildPeerJobLocked(int peer);
+  // M5.3：该 peer 当前是否允许再发一批（无在途，或在途已超时）
+  bool peerSendAllowedLocked(int peer) const;
   // M4 评审 B6：把「追加日志条目」与「等待提交」拆开，使成员变更能在同一个 mu_
   // 临界区内完成「J1 复查 + 构造配置 + 追加条目」（version 直接用真实条目 index）。
   bool appendEntryLocked(const LogEntry& e);                        // 调用方持锁
@@ -189,6 +192,12 @@ class RaftNode {
   std::unordered_map<int, Index> nextIndex_;
   std::unordered_map<int, Index> matchIndex_;
   std::unordered_map<int, Index> lastSentEndIndex_;  // ack context per peer
+  // M5.3（异步 transport 的必要约束）：同一 peer 同时只能有**一批**在途。
+  // 原因：应答没有序号，`onAppendEntriesReply` 用 `lastSentEndIndex_[peer]` 归因；
+  // 若多批在途，后一批的范围会被算到前一批的 ack 上 -> over-count -> 已 ack 的写丢失
+  // （A/B 实测：pipeline=64 出现 missing 59）。超时（2*rpcTimeoutMs）后允许重发。
+  std::unordered_map<int, uint64_t> appendSentMs_;
+  std::unordered_map<int, uint64_t> snapshotSentMs_;
   // M4：peer 在本任期是否成功应答过 AppendEntries（设计 §5.4 步骤 5 追平判据）
   std::unordered_map<int, Term> ackedTerm_;
 

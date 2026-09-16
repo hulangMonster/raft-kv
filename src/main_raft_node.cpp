@@ -274,7 +274,9 @@ int main(int argc, char** argv) {
   std::string peersArg;
   std::string dataDir;
   bool lockWaitMetrics = false;  // M5.1: 打开锁等待计时（默认关，零开销）
-  bool useReactor = false;       // M5.3: 异步 Reactor transport 引擎（默认仍是同步版）
+  // M5.3：默认使用 Reactor 异步引擎（设计决策③）。实测其通过了全部 e2e + fault --repeat 50，
+  // 且修掉了同步引擎在成员变更收尾步骤的超时错配；--transport=sync 保留为回退路径。
+  bool useReactor = true;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];

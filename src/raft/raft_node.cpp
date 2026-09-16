@@ -133,6 +133,8 @@ void RaftNode::becomeFollower(Term newTerm) {
   matchIndex_.clear();
   lastSentEndIndex_.clear();
   ackedTerm_.clear();  // 新任期/新角色：旧的应答不作数
+  appendSentMs_.clear();     // M5.3：旧任期的在途归因全部作废
+  snapshotSentMs_.clear();
   snapshotSendOffset_.clear();
   snapshotChunkEnd_.clear();
   cv_.notify_all();
@@ -377,6 +379,7 @@ void RaftNode::tick() {
       lastHeartbeatSentMs_ = now;
       for (const int peer : replicationTargetsLocked()) {
         PeerJob job = buildPeerJobLocked(peer);
+        if (job.skip) continue;  // 该 peer 已有在途发送
         if (job.isSnapshot) {
           snapJobs.emplace_back(peer, std::move(job.snapshot));
         } else {
@@ -619,6 +622,7 @@ void RaftNode::onAppendEntriesReply(int peerId, const AppendEntriesReply& reply)
   }
   if (reply.term < currentTerm_) return;  // stale ack
 
+  appendSentMs_.erase(peerId);  // M5.3：释放该 peer 的发送槽位（下一批可以发了）
   if (reply.success) {
     const Index end = lastSentEndIndex_[peerId];
     if (end > matchIndex_[peerId]) matchIndex_[peerId] = end;
@@ -750,6 +754,7 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
           advanceCommitAndApply();
           for (const int peer : replicationTargetsLocked()) {
             PeerJob job = buildPeerJobLocked(peer);
+            if (job.skip) continue;  // 该 peer 已有在途发送
             if (job.isSnapshot) {
               snapJobs.emplace_back(peer, std::move(job.snapshot));
             } else {
@@ -1260,8 +1265,28 @@ void RaftNode::recomputeConfigLocked() {
 
 // 给某个 peer 的复制作业：落后于快照边界 -> 一个快照块；否则 AppendEntries。
 // tick / propose / CatchUp 共用（M3 评审 B13：组提交路径不得绕过快照路由）。
+// M5.3：异步 transport 下同一 peer 只能有一批在途（见 header 说明）。
+bool RaftNode::peerSendAllowedLocked(int peer) const {
+  // 注意：这里用**真实时间**（steady_clock），不用注入的 clock_。
+  // 单测里 clock_ 是 FakeClock：catch-up 循环只做 2ms 真实 sleep 而不推进 fake 时间，
+  // 若用 clock_ 判断"在途是否超时"，槽位将永不释放，catch-up 会空转到超时。
+  const uint64_t now = lockprobe::nowUs() / 1000ULL;
+  const uint64_t gap = cfg_.rpcTimeoutMs == 0 ? 30 : cfg_.rpcTimeoutMs * 2;
+  const auto a = appendSentMs_.find(peer);
+  if (a != appendSentMs_.end() && now - a->second < gap) return false;
+  const auto s = snapshotSentMs_.find(peer);
+  if (s != snapshotSentMs_.end() && now - s->second < gap) return false;
+  return true;
+}
+
 RaftNode::PeerJob RaftNode::buildPeerJobLocked(int peer) {
   PeerJob job;
+  // 只有**异步引擎**才需要"每 peer 单批在途"门控：同步引擎在 sendX 返回时已拿到应答，
+  // 天然只有一批在途（且既有单测大量依赖"丢包后立刻重试"的同步语义，不能门控）。
+  if (transport_.isAsync() && !peerSendAllowedLocked(peer)) {
+    job.skip = true;  // 已有在途：本 tick 不重复发送（避免 ack 归因错配）
+    return job;
+  }
   if (lastIncluded_ != kNoIndex && !snapshotBytes_.empty() &&
       nextIndex_[peer] <= lastIncluded_) {
     const uint64_t total = snapshotBytes_.size();
@@ -1279,8 +1304,10 @@ RaftNode::PeerJob RaftNode::buildPeerJobLocked(int peer) {
     job.snapshot.data.assign(snapshotBytes_.begin() + start,
                              snapshotBytes_.begin() + start + take);
     snapshotChunkEnd_[peer] = start + take;
+    snapshotSentMs_[peer] = lockprobe::nowUs() / 1000ULL;
   } else {
     job.append = buildAppendEntries(peer);
+    appendSentMs_[peer] = lockprobe::nowUs() / 1000ULL;
   }
   return job;
 }
@@ -1339,6 +1366,12 @@ bool RaftNode::catchUpPeer(int peerId, uint64_t timeoutMs) {
         return true;  // 已追平
       }
       job = buildPeerJobLocked(peerId);
+      if (job.skip) {
+        // M5.3：已有在途 -> 退避重试（避免 ack 归因错配）
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        continue;
+      }
     }
     if (job.isSnapshot) {
       transport_.sendInstallSnapshot(
@@ -1630,6 +1663,7 @@ void RaftNode::onReadProbeReply(int peerId, const ReadProbeReply& reply) {
 void RaftNode::onInstallSnapshotReply(int peerId,
                                       const InstallSnapshotReply& reply) {
   std::lock_guard<ProbedMutex> lock(mu_);
+  snapshotSentMs_.erase(peerId);  // M5.3：释放快照发送槽位
   if (role_ != Role::kLeader) return;
   if (reply.term > currentTerm_) {
     becomeFollower(reply.term);
