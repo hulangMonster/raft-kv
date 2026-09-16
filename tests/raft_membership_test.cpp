@@ -8,11 +8,15 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
@@ -137,6 +141,47 @@ class ConfigReplyDropper : public MemoryTransport {
 
  private:
   std::vector<int> dropIds_;
+};
+
+// 可以在指定 peer 上"闸住" AppendEntries 的传输：用于确定性地把成员变更卡在
+// CatchUp 阶段（B6 的 check-then-act 窗口）。被闸住的发送直接丢弃，catchUpPeer
+// 会按自己的退避节奏重试，闸门一开就正常投递。
+class GatedTransport : public MemoryTransport {
+ public:
+  void gate(const std::vector<int>& ids) {
+    std::lock_guard<std::mutex> lk(mu_);
+    gated_ = ids;
+    open_ = false;
+    blocked_.clear();
+  }
+  void openGate() {
+    std::lock_guard<std::mutex> lk(mu_);
+    open_ = true;
+  }
+  // 有多少个不同的 peer 曾被闸住（= 有多少个成员变更真的进入了 CatchUp）
+  size_t blockedDistinctPeers() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return blocked_.size();
+  }
+
+  void sendAppendEntries(int peerId, const AppendEntriesArgs& args,
+                         AppendCb cb) override {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (!open_ && std::find(gated_.begin(), gated_.end(), peerId) !=
+                        gated_.end()) {
+        blocked_.insert(peerId);
+        return;  // 丢弃：调用方超时/重试
+      }
+    }
+    MemoryTransport::sendAppendEntries(peerId, args, std::move(cb));
+  }
+
+ private:
+  mutable std::mutex mu_;
+  std::vector<int> gated_;
+  std::set<int> blocked_;
+  bool open_ = false;
 };
 
 // ---- 评审批 1 新增测试桩 ----
@@ -1291,6 +1336,75 @@ TEST(RaftMembership, A26_InstalledSnapshotReseatsConfigBaseline) {
   EXPECT_EQ(node.configVersion(), static_cast<uint64_t>(0));  // 基线被重置
   EXPECT_TRUE(node.clusterConfig().contains(3));
   EXPECT_FALSE(node.retired());
+}
+
+TEST(RaftMembership, A27_ConcurrentMembershipChangesAreSerialized) {
+  // 评审 B6：changeMembership 是 check-then-act —— 两个并发的变更都能通过
+  // in-flight 检查、都进入 CatchUp，最后后一次覆盖 inFlightConfigIndex_，让前一条
+  // 配置条目被隐式提交（无 C_old 多数派）；version 还是"猜出来的 index"。
+  // 正确实现：整个变更串行化，第二个变更立刻被拒绝、绝不进入 CatchUp。
+  auto transport = std::make_shared<GatedTransport>();
+  auto c = test::makeMembershipClusterWith(3, /*appendNoop=*/true, 1000000, 64,
+                                           transport);
+  test::driveTicks(*c, 60, 10);
+  RaftNode* leader = test::findLeader(*c);
+  ASSERT_NE(leader, nullptr);
+  const int lid = leader->leaderId();
+  test::TestNode& ltn = c->nodes[static_cast<size_t>(lid - 1)];
+
+  ExtraNode n4;
+  ExtraNode n5;
+  attachExtraNode(*c, 4, n4, test::makeSeedConfig(3));
+  attachExtraNode(*c, 5, n5, test::makeSeedConfig(3));
+
+  std::atomic<int> ok{0};
+  std::atomic<int> rejected{0};
+  transport->gate({4, 5});
+
+  auto job = [&](int targetId) {
+    const auto r = leader->changeMembership(
+        MembershipOp::kAdd, targetId,
+        "127.0.0.1:700" + std::to_string(targetId), 2000);
+    if (r.status == ClientStatus::kOk) {
+      ok.fetch_add(1);
+    } else {
+      rejected.fetch_add(1);
+    }
+  };
+
+  std::thread t1(job, 4);
+  for (int i = 0; i < 500 && transport->blockedDistinctPeers() < 1; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  ASSERT_EQ(transport->blockedDistinctPeers(), 1u);  // 第一个变更已在 CatchUp 中
+
+  std::thread t2(job, 5);
+  // 给第二个变更足够时间：正确实现里它会被立即拒绝，不会进入 CatchUp
+  for (int i = 0; i < 150 && transport->blockedDistinctPeers() < 2; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  const size_t blocked = transport->blockedDistinctPeers();
+  transport->openGate();
+  t1.join();
+  t2.join();
+  test::driveTicks(*c, 200, 10);
+
+  EXPECT_EQ(blocked, 1u) << "第二个成员变更不得同时进入 CatchUp（J1 串行化）";
+  EXPECT_EQ(ok.load(), 1);
+  EXPECT_EQ(rejected.load(), 1);
+
+  // 日志里只能有一条配置条目，且 version 恒等于它自己的 index（设计不变量）
+  int configs = 0;
+  const auto all = ltn.log->slice(ltn.log->firstIndex(), 100000, 1u << 30);
+  for (const LogEntry& e : all) {
+    if (e.op != OpCode::kConfig) continue;
+    ++configs;
+    ClusterConfig cc;
+    ASSERT_TRUE(decodeClusterConfig(
+        reinterpret_cast<const Byte*>(e.value.data()), e.value.size(), cc));
+    EXPECT_EQ(cc.version, e.index);
+  }
+  EXPECT_EQ(configs, 1);
 }
 
 // ================================ B 组 ================================

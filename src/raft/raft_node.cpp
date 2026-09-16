@@ -524,13 +524,25 @@ ClientReply RaftNode::propose(const ClientRequest& req, uint64_t timeoutMs) {
     e.clientId = req.clientId;
     e.requestId = req.requestId;
     // Group commit (M5): write immediately, fsync once per flush batch.
-    if (!log_.appendNoSync({e})) {
+    if (!appendEntryLocked(e)) {
       return {ClientStatus::kErr, "log append failed", -1};
     }
-    // M4：配置条目在追加时生效（决策③）；J2 的提交判定在 advanceCommitAndApply
-    applyAppendedConfigLocked({e});
   }
 
+  return awaitCommit(e.index, e.term, timeoutMs);
+}
+
+// 追加一条已填好 index/term/op/payload 的条目（调用方必须持有 mu_）。
+// Group commit：只 appendNoSync，fsync 由 awaitCommit 的 flusher 合并执行。
+// 配置条目"追加即生效"（决策③），J2 的提交判定在 advanceCommitAndApply。
+bool RaftNode::appendEntryLocked(const LogEntry& e) {
+  if (!log_.appendNoSync({e})) return false;
+  applyAppendedConfigLocked({e});
+  return true;
+}
+
+// 等待条目提交。propose 与 changeMembership 共用（M4 评审 B6）。
+ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(timeoutMs);
   for (;;) {
@@ -540,11 +552,11 @@ ClientReply RaftNode::propose(const ClientRequest& req, uint64_t timeoutMs) {
       std::lock_guard<std::mutex> lock(mu_);
       // 已提交即成功：Leader 自我移除（§5.7）会在配置条目提交的同一锁段内降级，
       // 此时请求其实已经生效，不能报 NotLeader。
-      if (e.index <= commitIndex_) return {ClientStatus::kOk, "", -1};
-      if (role_ != Role::kLeader || currentTerm_ != e.term) {
+      if (index <= commitIndex_) return {ClientStatus::kOk, "", -1};
+      if (role_ != Role::kLeader || currentTerm_ != term) {
         return {ClientStatus::kNotLeader, "", leaderId_};
       }
-      if (!syncInFlight_ && syncedIndex_ < e.index) {
+      if (!syncInFlight_ && syncedIndex_ < index) {
         syncInFlight_ = true;
         flushTarget = log_.lastIndex();  // captured under the lock
         iAmFlusher = true;
@@ -568,7 +580,7 @@ ClientReply RaftNode::propose(const ClientRequest& req, uint64_t timeoutMs) {
         // A failed fsync must never be reported as durable (I5); leave
         // syncInFlight_ clear so another proposer retries.
         syncInFlight_ = false;
-        if (syncOk && role_ == Role::kLeader && currentTerm_ == e.term) {
+        if (syncOk && role_ == Role::kLeader && currentTerm_ == term) {
           // Single-node clusters commit here (no peer jobs below).
           advanceCommitAndApply();
           for (const int peer : replicationTargetsLocked()) {
@@ -604,11 +616,11 @@ ClientReply RaftNode::propose(const ClientRequest& req, uint64_t timeoutMs) {
 
     std::unique_lock<std::mutex> lock(mu_);
     cv_.wait_until(lock, deadline, [&] {
-      return e.index <= commitIndex_ || role_ != Role::kLeader ||
-             currentTerm_ != e.term;
+      return index <= commitIndex_ || role_ != Role::kLeader ||
+             currentTerm_ != term;
     });
-    if (e.index <= commitIndex_) return {ClientStatus::kOk, "", -1};
-    if (role_ != Role::kLeader || currentTerm_ != e.term) {
+    if (index <= commitIndex_) return {ClientStatus::kOk, "", -1};
+    if (role_ != Role::kLeader || currentTerm_ != term) {
       return {ClientStatus::kNotLeader, "", leaderId_};
     }
     if (std::chrono::steady_clock::now() >= deadline) {
@@ -1129,6 +1141,12 @@ ClientReply RaftNode::changeMembership(MembershipOp op, int targetId,
                                        const std::string& targetAddr,
                                        uint64_t timeoutMs) {
   const bool add = (op == MembershipOp::kAdd);
+  // M4 评审 B6：整个成员变更（校验 -> CatchUp -> 追加配置条目 -> 等提交）串行化。
+  // 并发的第二次变更立即被拒绝——不做无谓的 CatchUp，也不可能"两个变更同时进入"。
+  std::unique_lock<std::mutex> changeLock(membershipMu_, std::try_to_lock);
+  if (!changeLock.owns_lock()) {
+    return {ClientStatus::kErr, "membership change already in progress", -1};
+  }
   {
     std::lock_guard<std::mutex> lock(mu_);
     if (role_ != Role::kLeader) return {ClientStatus::kNotLeader, "", leaderId_};
@@ -1181,14 +1199,18 @@ ClientReply RaftNode::changeMembership(MembershipOp op, int targetId,
     }
   }
 
-  ClusterConfig next;
+  // M4 评审 B6：条目 index/term 与配置 version 必须在同一个 mu_ 临界区内确定并立刻
+  // 追加。旧实现先算出 next.version = lastIndex()+1、解锁后再走 propose()，两次加锁
+  // 之间可能被别的客户端 PUT 插队，导致 version != 条目 index（设计不变量），进而让
+  // maybeSnapshot 的边界保护与重启期的 J3 校验同时失真。
+  LogEntry ce;
   {
     std::lock_guard<std::mutex> lock(mu_);
     if (role_ != Role::kLeader) return {ClientStatus::kNotLeader, "", leaderId_};
     if (inFlightConfigIndex_ != kNoIndex) {
       return {ClientStatus::kErr, "membership change already in flight", -1};
     }
-    next = currConfig_;
+    ClusterConfig next = currConfig_;
     if (add) {
       Member m;
       m.id = targetId;
@@ -1205,17 +1227,24 @@ ClientReply RaftNode::changeMembership(MembershipOp op, int targetId,
     }
     std::sort(next.members.begin(), next.members.end(),
               [](const Member& a, const Member& b) { return a.id < b.id; });
-    next.version = log_.lastIndex() + 1;  // 配置条目的 index（J3 单调）
+
+    ce.index = log_.lastIndex() + 1;
+    ce.term = currentTerm_;
+    next.version = ce.index;  // 设计：version == 产生它的配置条目 index
+    ce.op = OpCode::kConfig;
+    const Bytes payload = encodeClusterConfig(next);
+    ce.value.assign(reinterpret_cast<const char*>(payload.data()),
+                    payload.size());
+    ce.clientId = 0;
+    ce.requestId = 0;
+    // 追加即生效（决策③）；J2 的提交判定在 advanceCommitAndApply
+    if (!appendEntryLocked(ce)) {
+      return {ClientStatus::kErr, "log append failed", -1};
+    }
   }
+  drainPeerQueues();  // 新成员地址 / 离开节点的清理在锁外执行（L10）
 
-  ClientRequest req;
-  req.op = OpCode::kConfig;
-  const Bytes payload = encodeClusterConfig(next);
-  req.value.assign(reinterpret_cast<const char*>(payload.data()), payload.size());
-  req.clientId = 0;
-  req.requestId = 0;
-
-  const ClientReply reply = propose(req, timeoutMs);
+  const ClientReply reply = awaitCommit(ce.index, ce.term, timeoutMs);
   if (reply.status != ClientStatus::kOk && add) {
     std::lock_guard<std::mutex> lock(mu_);
     pendingPeers_.erase(targetId);

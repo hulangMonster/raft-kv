@@ -99,6 +99,10 @@ class RaftNode {
                          bool computeDraining);
   void recomputeConfigLocked();   // 日志截断后的配置回滚（设计 §5.2）
   PeerJob buildPeerJobLocked(int peer);
+  // M4 评审 B6：把「追加日志条目」与「等待提交」拆开，使成员变更能在同一个 mu_
+  // 临界区内完成「J1 复查 + 构造配置 + 追加条目」（version 直接用真实条目 index）。
+  bool appendEntryLocked(const LogEntry& e);                        // 调用方持锁
+  ClientReply awaitCommit(Index index, Term term, uint64_t timeoutMs);
   bool catchUpPeer(int peerId, uint64_t timeoutMs);
   void drainPeerQueues();                          // L10：锁外执行地址簿更新
   bool readQuorumLocked(uint64_t seq) const;       // ReadIndex 多数派（M4.4）
@@ -120,6 +124,8 @@ class RaftNode {
   std::vector<std::pair<int, std::string>> peerAddQueue_;  // M4: 待注册地址（锁外执行）
   std::vector<int> peerRemoveQueue_;                       // M4: 待摘除节点（锁外执行）
   std::vector<int> drainingPeers_;      // M4: C_old 有、C_new 无的节点；配置条目提交前仍要送达
+  // M4 评审 B6：成员变更串行化（覆盖 CatchUp 阶段，见 changeMembership）
+  std::mutex membershipMu_;
   uint64_t readSeq_ = 0;                            // M4.4: ReadIndex 探针序号（单调）
   std::unordered_map<int, uint64_t> readAcks_;      // M4.4: peer -> 已确认的最大探针序号
 
