@@ -237,6 +237,7 @@ void RaftNode::advanceCommitAndApply() {
   if (inFlightConfigIndex_ != kNoIndex && commitIndex_ >= inFlightConfigIndex_) {
     inFlightConfigIndex_ = kNoIndex;
     prevConfig_ = currConfig_;
+    baseConfig_ = currConfig_;  // 已提交 -> 成为新的回滚基线
     drainingPeers_.clear();
     if (role_ == Role::kLeader && !currConfig_.isVoting(cfg_.selfId)) {
       becomeFollower(currentTerm_);
@@ -385,6 +386,8 @@ AppendEntriesReply RaftNode::onAppendEntries(const AppendEntriesArgs& args) {
         return {currentTerm_, false, kNoIndex, kNoTerm};
       }
       if (syncedIndex_ > log_.lastIndex()) syncedIndex_ = log_.lastIndex();
+      // M4.5（设计 §5.2 回滚）：被截断的配置条目不得继续生效
+      recomputeConfigLocked();
     }
     toAppend.push_back(e);
   }
@@ -753,6 +756,7 @@ InstallSnapshotReply RaftNode::onInstallSnapshot(const InstallSnapshotArgs& args
                               sc) &&
           sc.version > currConfig_.version) {
         adoptConfigLocked(sc, kNoIndex, /*computeDraining=*/false);
+        baseConfig_ = currConfig_;  // 快照是持久的 -> 成为回滚基线
       }
     }
     lastIncluded_ = installed.lastIncludedIndex;
@@ -794,6 +798,8 @@ void RaftNode::rebuildConfigFromSeedAndLog() {
     std::sort(currConfig_.members.begin(), currConfig_.members.end(),
               [](const Member& a, const Member& b) { return a.id < b.id; });
   }
+
+  baseConfig_ = currConfig_;  // 回滚基线：快照携带的配置，或 seed/peerIds 退化配置
 
   const Index first = log_.firstIndex();
   const Index last = log_.lastIndex();
@@ -939,6 +945,47 @@ void RaftNode::adoptConfigLocked(const ClusterConfig& sc, Index inFlightIndex,
     erasePeerStateLocked(id);
     peerRemoveQueue_.push_back(id);
   }
+}
+
+// 配置回滚（设计 §5.2）：日志后缀被截断后，把配置退回
+// "已持久基线（快照 / 已提交配置）+ 剩余日志中的配置条目" 重算的结果。
+void RaftNode::recomputeConfigLocked() {
+  currConfig_ = baseConfig_;
+  prevConfig_ = currConfig_;
+  inFlightConfigIndex_ = kNoIndex;
+
+  const Index first = log_.firstIndex();
+  const Index last = log_.lastIndex();
+  if (last >= first) {
+    const auto entries = log_.slice(
+        first, static_cast<size_t>(last - first + 1),
+        std::numeric_limits<size_t>::max());
+    for (const LogEntry& e : entries) {
+      if (e.op != OpCode::kConfig) continue;
+      ClusterConfig c;
+      if (!decodeClusterConfig(reinterpret_cast<const Byte*>(e.value.data()),
+                               e.value.size(), c)) {
+        continue;
+      }
+      if (c.version <= currConfig_.version) continue;  // J3：只推进
+      currConfig_ = c;
+      inFlightConfigIndex_ = e.index;  // 保守：视为仍未提交
+    }
+  }
+  // 回滚后重新属于配置的成员：地址重新登记（锁外执行，L10）
+  for (const Member& m : currConfig_.members) {
+    if (m.id != cfg_.selfId && !m.addr.empty()) {
+      peerAddQueue_.emplace_back(m.id, m.addr);
+    }
+  }
+  for (auto it = pendingPeers_.begin(); it != pendingPeers_.end();) {
+    if (currConfig_.contains(it->first)) {
+      it = pendingPeers_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  drainingPeers_.clear();
 }
 
 // 给某个 peer 的复制作业：落后于快照边界 -> 一个快照块；否则 AppendEntries。

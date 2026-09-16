@@ -70,11 +70,23 @@
 - 遗留（见 #4 评审，已明确推迟到 M5）：异步/每 peer 连接 transport、快照流式序列化、tick no-op 绕组提交、
   `main_raft_node` 线程池化
 
-## M4 成员变更 + 客户端路由
+## M4 ✅ 成员变更 + 客户端路由（已完成）
 
-- 单节点增减（Joint Consensus 简化版：先只支持一次加/减一个）
-- 客户端从任意节点路由到 Leader；GET 默认读 Leader（线性一致）
-- 验收：5 节点集群在线增删节点，压测期间无长时间不可用
+> 详细设计见 [m4-design.md](m4-design.md)（**v1.4**，含 4 次修订），前置校验见 [m4-prerequisites.md](m4-prerequisites.md)。
+
+- ClusterConfig/Member + 配置条目（复用 M2 entry 布局，OpCode::kConfig）+ 启动配置重建（seed → 快照配置 → 日志条目，版本严格单调）
+- 成员变更：一次一个（J1）、新节点 CatchUp 后加入、提交需双多数派（J2）、移除的送达与退役、Leader 自我移除（§5.7）
+- 快照携带配置（RKS1 **v2**，兼容 v1）；InstallSnapshot 安装即继承配置；配置条目被截断时**回滚**到基线重算（§5.2）
+- 线性一致读：ReadIndex（探针 msgType 9/14）+ 客户端 config / add / remove 与重定向路由
+- 验收（均实测通过）：
+  - raftkv_raft_tests **58/58**（M2 14 + M3 14 + M4 A1–A19 / B1–B4）
+  - scripts/raft_membership_e2e.sh **PASS**（3 节点压测 → 第 4 节点 seed 启动 → add → 4 节点压测 + 线性一致读 → remove → 退役校验）
+  - scripts/raft_membership_fault.sh --repeat 50 **PASS**（5 节点；每轮轮换 follower 注入 kill -9 / SIGSTOP、每 4 轮额外杀 Leader，并在窗口内做成员变更；每轮校验配置收敛 + 追平 + 压测可继续 + 线性一致读）
+  - 既有 M2/M3 脚本与 e2e.sh 全部保持 PASS
+- M4 期间修掉的真实缺陷：op 白名单两处漏加 kConfig（TCP 复制 / 重启恢复会静默丢配置条目）、
+  TcpTransport::addPeer/removePeer 未实现（CatchUp 永远连不上新节点）、配置回滚缺失（A19）
+- 吞吐：同一机器状态下 M3 收尾版与 M4 的 fill 200 --pipeline 1 均为 13.2 ms/写（**无可测回归**）；
+  bench 的绝对数字受机器状态与 --snapshot-threshold 影响很大，跨会话不可直接比较
 
 ## M5 性能与可观测性（压测故事 + 优化）
 

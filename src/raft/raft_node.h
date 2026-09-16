@@ -97,6 +97,7 @@ class RaftNode {
   void applyAppendedConfigLocked(const std::vector<LogEntry>& appended);
   void adoptConfigLocked(const ClusterConfig& sc, Index inFlightIndex,
                          bool computeDraining);
+  void recomputeConfigLocked();   // 日志截断后的配置回滚（设计 §5.2）
   PeerJob buildPeerJobLocked(int peer);
   bool catchUpPeer(int peerId, uint64_t timeoutMs);
   void drainPeerQueues();                          // L10：锁外执行地址簿更新
@@ -111,6 +112,7 @@ class RaftNode {
   ClusterConfig seedConfig_;            // M4: 启动种子配置（--peers），version = 0
   ClusterConfig currConfig_;            // M4: 当前配置（seed -> 日志配置条目；快照配置见 M4.3）
   ClusterConfig prevConfig_;            // M4: 在途配置条目的 C_old（J2 双重多数派用）
+  ClusterConfig baseConfig_;            // M4.5: 已持久基线（快照 / 已提交配置）；回滚基准
   Index inFlightConfigIndex_ = kNoIndex;  // M4: 在途配置条目 index（kNoIndex = 无）
   std::unordered_map<int, std::string> pendingPeers_;  // M4: CatchUp 目标（非投票、不计多数派）
   std::vector<std::pair<int, std::string>> peerAddQueue_;  // M4: 待注册地址（锁外执行）

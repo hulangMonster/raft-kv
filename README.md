@@ -1,6 +1,6 @@
 # raftkv —— Raft-based Distributed Key-Value Store
 
-> 里程碑：M1 ✅ 单机版 KV + WAL；M2 ✅ Raft 选主 + 日志复制；M3 ✅ 快照与日志压缩（含 group commit，已按 #4 评审加固）。Roadmap 见
+> 里程碑：M1 ✅ 单机版 KV + WAL；M2 ✅ Raft 选主 + 日志复制；M3 ✅ 快照与日志压缩（含 group commit，已按 #4 评审加固）；M4 ✅ 成员变更 + 客户端路由 / 线性一致读。Roadmap 见
 > [docs/roadmap.md](docs/roadmap.md)。
 
 一个从零实现、面向简历与生产场景的分布式 KV 存储项目：
@@ -48,6 +48,26 @@ M2 在它之上实现 Raft 共识，演进为**多节点、可自动选主、可
 ./build/bin/raftkv_raft_cli --peers "$PEERS" --host 127.0.0.1 --port 19601 status   # snapshot_index/term
 ./build/bin/raftkv_raft_cli --peers "$PEERS" --host 127.0.0.1 --port 19601 snapshot # 手动触发
 ```
+
+## 当前能力（M4：成员变更 + 客户端路由 / 线性一致读）
+
+- **在线成员变更**：one-at-a-time + 新节点先 **CatchUp**（非投票、不计多数派）追平后才写入配置；配置条目进 raft.log（延续 D1，无独立配置存储），**追加即生效**（决策③）且提交需 **C_old 与 C_new 双多数派**（J2）
+- **配置持久化**：快照携带配置（RKS1 **v2**，尾部追加 config 段，**兼容 v1**）；启动按「快照配置 → 日志配置条目」重建，**版本回退即拒绝启动**（J3）；配置条目被截断时按基线**回滚**（A19）
+- **移除语义**：被移除节点在配置条目提交前仍收到该条目（drainingPeers_），提交后清理并从 transport 摘除；被移除 / 未入配置的节点进入**退役态**（不竞选、不接受写，但继续接收复制）
+- **线性一致读**：GET 走 **ReadIndex**（探针 msgType 9/14 + quorum 确认 + 等 lastApplied >= readIndex），失败即报错，**绝不退化为读本地状态机**
+- **客户端路由**：可连任意节点；新增 config / add <id> <host:port> / remove <id> 子命令，非 Leader 按 leaderHint 重定向
+- 测试：raftkv_raft_tests **58/58**；scripts/raft_membership_e2e.sh（3→4 节点在线增删 + 线性一致读）；scripts/raft_membership_fault.sh --repeat 50（5 节点，变更窗口内 kill -9 / SIGSTOP）
+
+      # 任意节点接入即可（自动重定向到 Leader）
+      ./build/bin/raftkv_raft_cli --peers "$PEERS" --host 127.0.0.1 --port 19601 config
+      ... add 4 127.0.0.1:19604   # 第 4 个节点用 --peers 现有成员启动（非投票），追平后加入
+      ... remove 4
+      ... status                  # config_version / members / retired / read_index
+
+- **吞吐测量条件（重要）**：同一机器状态下同一探针 fill 200 --pipeline 1 = **13.2 ms/写**，
+  且 M3 收尾版（b747c70）与 M4 当前版**完全一致** ⇒ M4 无可测回归；
+  bench_group_commit.sh（threshold=5000，会频繁触发压缩）本次测得 34 / 175 / 814 qps，
+  历史记录的 129 / 746 / 2840 qps 是当时较空闲机器状态下所测，**跨会话不可直接比较**。
 
 ## 目录结构
 

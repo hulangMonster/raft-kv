@@ -755,6 +755,57 @@ TEST(RaftMembership, A18_InstalledSnapshotCarriesConfig) {
   EXPECT_TRUE(lag->clusterConfig().isVoting(4));
 }
 
+TEST(RaftMembership, A19_ConfigEntryTruncationRollsBackConfig) {
+  // 设计 §5.2「回滚」：未提交的配置条目被截断后，节点必须把配置退回
+  // 「快照/seed 基线 + 剩余日志」重算的结果，绝不保留日志里已不存在的配置。
+  auto c = test::makeMembershipCluster(3, /*appendNoop=*/false);
+  test::driveTicks(*c, 60, 10);
+  RaftNode* l1 = test::findLeader(*c);
+  ASSERT_NE(l1, nullptr);
+  const int lid = l1->leaderId();
+  int victim = 0;
+  for (int id = 1; id <= 3; ++id) {
+    if (id != lid) { victim = id; break; }
+  }
+  ASSERT_NE(victim, 0);
+
+  // 1) 隔离其余节点：变更条目只能"追加即生效"，永远提交不了
+  for (int id = 1; id <= 3; ++id) {
+    if (id != lid) c->transport->isolate(id);
+  }
+  const Index before = c->nodes[static_cast<size_t>(lid - 1)].log->lastIndex();
+  EXPECT_EQ(l1->changeMembership(MembershipOp::kRemove, victim, "", 300).status,
+            ClientStatus::kErr);
+  const Index cfgIdx = c->nodes[static_cast<size_t>(lid - 1)].log->lastIndex();
+  ASSERT_GT(cfgIdx, before);                       // 条目已追加（在途）
+  EXPECT_FALSE(l1->clusterConfig().contains(victim));  // 追加即生效
+  const uint64_t staleVer = l1->configVersion();
+  ASSERT_GE(staleVer, static_cast<uint64_t>(cfgIdx));
+
+  // 2) 恢复网络，让"没有这条条目的节点"在更高任期当选
+  for (int id = 1; id <= 3; ++id) c->transport->heal(id);
+  RaftNode* nl = c->nodes[static_cast<size_t>(victim - 1)].node.get();
+  RequestVoteArgs stepDown;
+  stepDown.term = l1->currentTerm() + 1;
+  stepDown.candidateId = victim;
+  stepDown.lastLogIndex = c->nodes[static_cast<size_t>(victim - 1)].log->lastIndex();
+  stepDown.lastLogTerm = c->nodes[static_cast<size_t>(victim - 1)].log->lastTerm();
+  l1->onRequestVote(stepDown);
+  for (int i = 0; i < 200 && nl->role() != Role::kLeader; ++i) {
+    c->clock->advance(10);
+    nl->tick();
+  }
+  ASSERT_EQ(nl->role(), Role::kLeader);
+
+  // 3) 新 Leader 在 cfgIdx 处写入冲突条目 -> 旧 Leader 必须截断并回滚配置
+  ASSERT_EQ(nl->propose(putReq(1, "k", "v"), 1000).status, ClientStatus::kOk);
+  test::tickNodesOnly(*c, {nl->leaderId()}, 200, 10);
+
+  EXPECT_LT(l1->configVersion(), staleVer);            // 回滚（版本下降）
+  EXPECT_EQ(l1->configVersion(), nl->configVersion());  // 与当前 Leader 一致
+  EXPECT_TRUE(l1->clusterConfig().contains(victim));    // victim 不再是"已移除"
+}
+
 // ================================ B 组 ================================
 
 TEST(RaftMembershipDisk, B1_ConfigPersistsAcrossRestart) {
