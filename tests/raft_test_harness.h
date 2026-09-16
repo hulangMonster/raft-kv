@@ -191,27 +191,27 @@ class SpyMemoryLogStore : public MemoryLogStore {
 class SpyLogStore : public MemoryLogStore {
  public:
   bool append(const std::vector<LogEntry>& entries) override {
-    if (lockprobe::held()) ++lockedAppends;
+    if (lockprobe::consensusHeld()) ++lockedAppends;
     ++appends;
     return MemoryLogStore::append(entries);
   }
   bool sync() override {
-    if (lockprobe::held()) ++lockedSyncs;
+    if (lockprobe::consensusHeld()) ++lockedSyncs;
     ++syncs;
     return MemoryLogStore::sync();
   }
   bool persistMeta(Term term, int votedFor) override {
-    if (lockprobe::held()) ++lockedMetaPersists;
+    if (lockprobe::consensusHeld()) ++lockedMetaPersists;
     ++metaPersists;
     return MemoryLogStore::persistMeta(term, votedFor);
   }
   bool compact(Index upTo, Term termAtUpTo) override {
-    if (lockprobe::held()) ++lockedCompacts;
+    if (lockprobe::consensusHeld()) ++lockedCompacts;
     ++compacts;
     return MemoryLogStore::compact(upTo, termAtUpTo);
   }
   bool appendNoSync(const std::vector<LogEntry>& entries) override {
-    if (lockprobe::held()) ++lockedAppendNoSyncs;  // 允许（I9：锁内只 write）
+    if (lockprobe::consensusHeld()) ++lockedAppendNoSyncs;  // 允许（I9：锁内只 write）
     return MemoryLogStore::appendNoSync(entries);
   }
 
@@ -235,7 +235,7 @@ class BlockingLogStore : public MemoryLogStore {
       {
         std::lock_guard<std::mutex> lk(mu_);
         inSync_ = true;
-        holdWhileLocked_ = lockprobe::held();
+        holdWhileLocked_ = lockprobe::consensusHeld();
       }
       cv_.notify_all();
       std::unique_lock<std::mutex> lk(mu_);
@@ -250,7 +250,7 @@ class BlockingLogStore : public MemoryLogStore {
       {
         std::lock_guard<std::mutex> lk(mu_);
         inMeta_ = true;
-        holdWhileMetaLocked_ = lockprobe::held();
+        holdWhileMetaLocked_ = lockprobe::consensusHeld();
       }
       cv_.notify_all();
       std::unique_lock<std::mutex> lk(mu_);
@@ -297,25 +297,25 @@ class SpyTransport : public MemoryTransport {
  public:
   void sendRequestVote(int peerId, const RequestVoteArgs& a, VoteCb cb) override {
     ++sends;
-    if (lockprobe::held()) ++lockedSends;
+    if (lockprobe::consensusHeld()) ++lockedSends;
     MemoryTransport::sendRequestVote(peerId, a, std::move(cb));
   }
   void sendAppendEntries(int peerId, const AppendEntriesArgs& a,
                          AppendCb cb) override {
     ++sends;
-    if (lockprobe::held()) ++lockedSends;
+    if (lockprobe::consensusHeld()) ++lockedSends;
     MemoryTransport::sendAppendEntries(peerId, a, std::move(cb));
   }
   void sendInstallSnapshot(int peerId, const InstallSnapshotArgs& a,
                            InstallCb cb) override {
     ++sends;
-    if (lockprobe::held()) ++lockedSends;
+    if (lockprobe::consensusHeld()) ++lockedSends;
     MemoryTransport::sendInstallSnapshot(peerId, a, std::move(cb));
   }
   void sendReadProbe(int peerId, const ReadProbeArgs& a,
                      ReadProbeCb cb) override {
     ++sends;
-    if (lockprobe::held()) ++lockedSends;
+    if (lockprobe::consensusHeld()) ++lockedSends;
     MemoryTransport::sendReadProbe(peerId, a, std::move(cb));
   }
   int sends = 0;

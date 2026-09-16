@@ -112,6 +112,9 @@ class RaftNode {
   bool catchUpPeer(int peerId, uint64_t timeoutMs);
   void drainPeerQueues();                          // L10：锁外执行地址簿更新
   void purgeDrainsLocked();                        // 送达目标：确认完成/预算到期 -> 回收
+  // M5.2（I5/I9）：把当前 term/votedFor 在**锁外**落盘。内部持 metaPersistMu_ 串行化
+  // "读取当前值 + 落盘"，保证磁盘 meta 版本单调；metaDirty_ 用于 becomeFollower 的延迟落盘。
+  bool flushMetaOutsideLock();
   bool readQuorumLocked(uint64_t seq) const;       // ReadIndex 多数派（M4.4）
   // M4 评审 B5：§8 读屏障——commitIndex_ 处的条目是否属于当前任期
   bool hasCurrentTermCommitLocked() const;
@@ -140,7 +143,10 @@ class RaftNode {
   };
   std::unordered_map<int, DrainState> drainingPeers_;
   // M4 评审 B6：成员变更串行化（覆盖 CatchUp 阶段，见 changeMembership）
-  ProbedMutex membershipMu_;
+  MembershipMutex membershipMu_;
+  // M5.2：串行化 meta 落盘（叶子锁，锁序 metaPersistMu_ -> mu_）；metaDirty_ 受 mu_ 保护。
+  MetaMutex metaPersistMu_;
+  bool metaDirty_ = false;
   uint64_t readSeq_ = 0;                            // M4.4: ReadIndex 探针序号（单调）
   std::unordered_map<int, uint64_t> readAcks_;      // M4.4: peer -> 已确认的最大探针序号
 
@@ -153,6 +159,10 @@ class RaftNode {
   // maybeSnapshot() is discarded if this changed while it was being persisted
   // (the installed snapshot is newer and must win).
   uint64_t installEpoch_ = 0;
+  // M5.2：InstallSnapshot 的 compact 搬到锁外执行（I9），这里暂存待压缩边界。
+  bool pendingInstallCompact_ = false;
+  Index pendingInstallIndex_ = kNoIndex;
+  Term pendingInstallTerm_ = kNoTerm;
   std::unordered_map<int, uint64_t> snapshotSendOffset_;  // per-peer progress
   std::unordered_map<int, uint64_t> snapshotChunkEnd_;    // per-peer last chunk
 

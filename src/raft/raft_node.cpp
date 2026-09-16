@@ -119,7 +119,10 @@ void RaftNode::becomeFollower(Term newTerm) {
   if (newTerm > currentTerm_) {
     currentTerm_ = newTerm;
     votedFor_ = -1;
-    log_.persistMeta(currentTerm_, votedFor_);
+    // M5.2（I9）：这里不再在持锁状态落盘。term/votedFor 由 tick 的
+    // flushMetaOutsideLock() 在锁外落盘（~10ms 内 durable）；真正要求
+    // "回复前必须 durable" 的是授权投票与自投票（见 onRequestVote/startElection）。
+    metaDirty_ = true;
   }
   leaderId_ = -1;
   votesGranted_ = 0;
@@ -163,11 +166,12 @@ void RaftNode::startElection(
     uint64_t now, std::vector<std::pair<int, RequestVoteArgs>>& voteJobs) {
   role_ = Role::kCandidate;
   ++currentTerm_;
-  if (metrics_ != nullptr) metrics_->onElection();
   votedFor_ = cfg_.selfId;
   leaderId_ = -1;
   votesGranted_ = 0;
-  log_.persistMeta(currentTerm_, votedFor_);  // I5: durable before requesting votes
+  // M5.2（I5/I9）：term/votedFor 的落盘移到 tick 的锁外阶段——**必须落盘成功后才发
+  // 投票请求**（否则崩溃后可能重复投票，违反 I3）。这里只标记。
+  metaDirty_ = true;
   lastHeartbeatMs_ = now;
   electionTimeoutMs_ = electionTimeoutMs(cfg_, cfg_.selfId, currentTerm_);
 
@@ -286,6 +290,9 @@ void RaftNode::tick() {
   std::vector<std::pair<int, RequestVoteArgs>> voteJobs;
   std::vector<std::pair<int, AppendEntriesArgs>> appendJobs;
   std::vector<std::pair<int, InstallSnapshotArgs>> snapJobs;
+  Index noopPending = kNoIndex;
+  Term electionTerm = kNoTerm;
+  bool metaFlushNeeded = false;
   {
     std::lock_guard<ProbedMutex> lock(mu_);
     const uint64_t now = clock_.nowMs();
@@ -294,7 +301,6 @@ void RaftNode::tick() {
       purgeDrainsLocked();  // 送达目标确认完成/预算到期 -> 回收（O2 + 设计 v1.4(a)）
       // Raft §8: a leader must commit an entry from its own term before it
       // may advance the commit point over prior-term entries (and serve reads).
-      // Append a no-op GET entry (never produced by a client) for that.
       if (cfg_.appendNoop && log_.lastTerm() != currentTerm_) {
         LogEntry noop;
         noop.index = log_.lastIndex() + 1;
@@ -302,27 +308,61 @@ void RaftNode::tick() {
         noop.op = OpCode::kGet;
         noop.clientId = 0;
         noop.requestId = noop.index;  // unique; not a client request
-        if (log_.append({noop})) {
+        // M5.2（I9）：锁内只追加（write），fsync 在锁外做（否则 §8 屏障要等下一次
+        // 客户端写才可能满足，线性一致读会整体失败）。
+        if (log_.appendNoSync({noop})) {
           matchIndex_[cfg_.selfId] = noop.index;
-          if (noop.index > syncedIndex_) syncedIndex_ = noop.index;
-          advanceCommitAndApply();  // single-node cluster commits immediately
-        }
-      }
-      if (now - lastHeartbeatSentMs_ >= cfg_.heartbeatMs) {
-        lastHeartbeatSentMs_ = now;
-        // 每个 peer 一条作业：落后于快照边界 -> 一个快照块；否则 AppendEntries。
-        // tick / propose / CatchUp 共用同一路由（M3 评审 B13 的建议）。
-        for (const int peer : replicationTargetsLocked()) {
-          PeerJob job = buildPeerJobLocked(peer);
-          if (job.isSnapshot) {
-            snapJobs.emplace_back(peer, std::move(job.snapshot));
-          } else {
-            appendJobs.emplace_back(peer, std::move(job.append));
-          }
+          noopPending = noop.index;
         }
       }
     } else if (!retiredLocked() && now - lastHeartbeatMs_ >= electionTimeoutMs_) {
       startElection(now, voteJobs);
+      electionTerm = currentTerm_;
+    }
+    metaFlushNeeded = metaDirty_ || (electionTerm != kNoTerm);
+  }
+
+  // 锁外 1：no-op 的 fsync（让 syncedIndex_ 门控在同一 tick 内放行）
+  if (noopPending != kNoIndex) {
+    const uint64_t fsyncT0Us = lockprobe::nowUs();
+    const bool syncOk = log_.sync();
+    if (metrics_ != nullptr) {
+      metrics_->onFsync(lockprobe::nowUs() - fsyncT0Us);
+    }
+    std::lock_guard<ProbedMutex> lock(mu_);
+    if (syncOk) {
+      Index durable = noopPending;
+      if (durable > log_.lastIndex()) durable = log_.lastIndex();
+      if (durable > syncedIndex_) syncedIndex_ = durable;
+      advanceCommitAndApply();  // single-node cluster commits immediately
+    }
+  }
+
+  // 锁外 2：term/votedFor 落盘（I5）。选举场景下**未 durable 就绝不发投票请求**。
+  if (metaFlushNeeded) {
+    const bool ok = flushMetaOutsideLock();
+    if (!ok) {
+      voteJobs.clear();
+    } else if (electionTerm != kNoTerm) {
+      std::lock_guard<ProbedMutex> lock(mu_);
+      if (currentTerm_ != electionTerm) voteJobs.clear();  // 窗口内被取代
+    }
+  }
+
+  // 锁段 2：心跳/复制作业（每个 peer 一条；落后于快照边界 -> 一个快照块）
+  {
+    std::lock_guard<ProbedMutex> lock(mu_);
+    const uint64_t now = clock_.nowMs();
+    if (role_ == Role::kLeader && now - lastHeartbeatSentMs_ >= cfg_.heartbeatMs) {
+      lastHeartbeatSentMs_ = now;
+      for (const int peer : replicationTargetsLocked()) {
+        PeerJob job = buildPeerJobLocked(peer);
+        if (job.isSnapshot) {
+          snapJobs.emplace_back(peer, std::move(job.snapshot));
+        } else {
+          appendJobs.emplace_back(peer, std::move(job.append));
+        }
+      }
     }
   }
 
@@ -351,39 +391,81 @@ void RaftNode::tick() {
   }
 }
 
+// M5.2（I5/I9）：锁外落盘 term/votedFor。持 metaPersistMu_ 串行化"读当前值 + 落盘"，
+// 保证磁盘版本单调；不持 mu_ 做 IO。返回 false 表示落盘失败（调用方不得据此对外回复）。
+bool RaftNode::flushMetaOutsideLock() {
+  std::lock_guard<MetaMutex> metaLock(metaPersistMu_);
+  Term t = kNoTerm;
+  int v = -1;
+  {
+    std::lock_guard<ProbedMutex> lock(mu_);
+    t = currentTerm_;
+    v = votedFor_;
+  }
+  if (t == kNoTerm) return true;  // 尚未参与任何任期：无需落盘
+  const uint64_t metaT0Us = lockprobe::nowUs();
+  const bool ok = log_.persistMeta(t, v);
+  if (metrics_ != nullptr) {
+    metrics_->onFsync(lockprobe::nowUs() - metaT0Us);
+  }
+  {
+    std::lock_guard<ProbedMutex> lock(mu_);
+    if (ok && currentTerm_ == t) metaDirty_ = false;
+  }
+  return ok;
+}
+
 RequestVoteReply RaftNode::onRequestVote(const RequestVoteArgs& args) {
-  std::lock_guard<ProbedMutex> lock(mu_);
-  if (args.term < currentTerm_) {
-    return {currentTerm_, false};
-  }
-  if (args.term > currentTerm_) {
-    becomeFollower(args.term);
-  }
+  // M5.2（I5）：整个"决定授权 -> 落盘 -> 回锁校验 -> 回复"在 metaPersistMu_ 下串行，
+  // 既保证"回复授权前 votedFor 已 durable"，也保证磁盘 meta 版本单调（叶子锁，锁序
+  // metaPersistMu_ -> mu_）。
+  std::lock_guard<MetaMutex> metaLock(metaPersistMu_);
+  Term grantedTerm = kNoTerm;
+  {
+    std::lock_guard<ProbedMutex> lock(mu_);
+    if (args.term < currentTerm_) {
+      return {currentTerm_, false};
+    }
+    if (args.term > currentTerm_) {
+      becomeFollower(args.term);
+    }
 
-  // J4（评审 B1）：只给"当前配置里的投票成员"投票。非成员（CatchUp 中的新节点、
-  // 已废弃的节点）与自己的退役态都不得投票。否则一个已被移除、但还没收到移除
-  // 条目的分区节点可以拿到 C_old 多数派当选，再用更高任期截断已提交条目。
-  if (retiredLocked() || !currConfig_.isVoting(args.candidateId)) {
-    return {currentTerm_, false};
-  }
+    // J4（评审 B1）：只给"当前配置里的投票成员"投票。非成员（CatchUp 中的新节点、
+    // 已废弃的节点）与自己的退役态都不得投票。
+    if (retiredLocked() || !currConfig_.isVoting(args.candidateId)) {
+      return {currentTerm_, false};
+    }
 
-  const Term lastLogTerm = log_.lastTerm();
-  const Index lastLogIndex = log_.lastIndex();
-  const bool upToDate =
-      (args.lastLogTerm > lastLogTerm) ||
-      (args.lastLogTerm == lastLogTerm && args.lastLogIndex >= lastLogIndex);
-
-  if ((votedFor_ == -1 || votedFor_ == args.candidateId) && upToDate) {
+    const Term lastLogTerm = log_.lastTerm();
+    const Index lastLogIndex = log_.lastIndex();
+    const bool upToDate =
+        (args.lastLogTerm > lastLogTerm) ||
+        (args.lastLogTerm == lastLogTerm && args.lastLogIndex >= lastLogIndex);
+    if (!((votedFor_ == -1 || votedFor_ == args.candidateId) && upToDate)) {
+      return {currentTerm_, false};
+    }
     votedFor_ = args.candidateId;
-    log_.persistMeta(currentTerm_, votedFor_);  // I5: durable before granting
-    lastHeartbeatMs_ = clock_.nowMs();          // granting a vote resets timer
-    return {currentTerm_, true};
+    metaDirty_ = true;
+    grantedTerm = currentTerm_;
+    lastHeartbeatMs_ = clock_.nowMs();  // granting a vote resets timer
   }
-  return {currentTerm_, false};
+
+  // 锁外落盘：I5 —— 没有 durable 就绝不授权
+  const uint64_t metaT0Us = lockprobe::nowUs();
+  const bool durable = log_.persistMeta(grantedTerm, args.candidateId);
+  if (metrics_ != nullptr) {
+    metrics_->onFsync(lockprobe::nowUs() - metaT0Us);
+  }
+
+  std::lock_guard<ProbedMutex> lock(mu_);
+  if (!durable) return {currentTerm_, false};
+  if (currentTerm_ != grantedTerm) return {currentTerm_, false};  // 窗口内已被更高 term 取代
+  metaDirty_ = false;
+  return {currentTerm_, true};
 }
 
 AppendEntriesReply RaftNode::onAppendEntries(const AppendEntriesArgs& args) {
-  std::lock_guard<ProbedMutex> lock(mu_);
+  std::unique_lock<ProbedMutex> lock(mu_);
   if (args.term < currentTerm_) {
     return {currentTerm_, false, kNoIndex, kNoTerm};
   }
@@ -397,9 +479,7 @@ AppendEntriesReply RaftNode::onAppendEntries(const AppendEntriesArgs& args) {
   lastHeartbeatMs_ = clock_.nowMs();  // heartbeat resets the election timer
 
   // m3-design.md §5.5: an entry strictly BELOW our compacted boundary is gone,
-  // so prevLogTerm cannot be verified here. Point the leader at our first index
-  // instead of pretending the logs match. (prevLogIndex == lastIncluded_ is
-  // fine: termAt() answers with the boundary term.)
+  // so prevLogTerm cannot be verified here.
   if (args.prevLogIndex > kNoIndex &&
       args.prevLogIndex < log_.lastIncludedIndex()) {
     return {currentTerm_, false, log_.firstIndex(), log_.lastIncludedTerm()};
@@ -432,31 +512,48 @@ AppendEntriesReply RaftNode::onAppendEntries(const AppendEntriesArgs& args) {
     toAppend.push_back(e);
   }
   if (!toAppend.empty()) {
-    // One fsync for the whole batch (follower-side group commit too).
-    if (!log_.append(toAppend)) {
+    // M5.2（I9）：锁内只 write（page-cache），fsync 在锁外
+    if (!log_.appendNoSync(toAppend)) {
       return {currentTerm_, false, kNoIndex, kNoTerm};
     }
-    if (toAppend.back().index > syncedIndex_) {
-      syncedIndex_ = toAppend.back().index;
-    }
-    // M4：配置条目在追加时生效（决策③）
-    applyAppendedConfigLocked(toAppend);
   }
 
   // The last entry this leader has actually shown us is the most we may ever
   // consider committed: anything beyond it is our own (unverified) suffix.
   const Index lastMatched =
       args.entries.empty() ? args.prevLogIndex : args.entries.back().index;
-  if (lastMatched > syncedIndex_) {
-    // Entries that were already present were not necessarily durable (they may
-    // have been written by appendNoSync before we stepped down), so never ack
-    // them as durable until they hit the disk.
-    if (!log_.sync()) return {currentTerm_, false, kNoIndex, kNoTerm};
-    syncedIndex_ = log_.lastIndex();
-  }
+  const Term term0 = currentTerm_;
+  const bool needSync = lastMatched > syncedIndex_;
 
+  lock.unlock();
+  bool syncOk = true;
+  if (needSync) {
+    const uint64_t fsyncT0Us = lockprobe::nowUs();
+    syncOk = log_.sync();  // M5.2（I9）：fsync 在锁外执行
+    if (metrics_ != nullptr) {
+      metrics_->onFsync(lockprobe::nowUs() - fsyncT0Us);
+    }
+  }
+  lock.lock();
+
+  // 回锁复核：窗口内可能已被更高 term 取代 / 日志被截断或压缩
+  if (currentTerm_ != term0) {
+    return {currentTerm_, false, kNoIndex, kNoTerm};
+  }
+  if (!syncOk) {
+    return {currentTerm_, false, kNoIndex, kNoTerm};  // I10：fsync 失败绝不 ack
+  }
+  if (needSync) {
+    Index durable = lastMatched;
+    if (durable > log_.lastIndex()) durable = log_.lastIndex();  // M3 B3 夹紧
+    if (durable > syncedIndex_) syncedIndex_ = durable;
+  }
+  // I5/I11：到这里本批已 durable，才可以"生效配置条目 / 推进 commit / 回 success"
+  if (!toAppend.empty() &&
+      log_.termAt(toAppend.back().index) == toAppend.back().term) {
+    applyAppendedConfigLocked(toAppend);
+  }
   if (args.leaderCommit > commitIndex_) {
-    // commitIndex = min(leaderCommit, index of last new entry), never backwards.
     const Index newCommit = std::min(args.leaderCommit, lastMatched);
     if (newCommit > commitIndex_) {
       commitIndex_ = newCommit;
@@ -753,11 +850,18 @@ void RaftNode::maybeSnapshot() {
     // must win — never move the boundary (or the log) backwards.
     if (epoch != installEpoch_) return;
     if (!(snapIndex <= commitIndex_ && snapIndex > lastIncluded_)) return;
-    // B12: only advance the boundary once compaction really succeeded; a false
-    // return means the on-disk log no longer matches our in-memory state.
-    if (!log_.compact(snapIndex, snapTerm)) {
-      throw std::runtime_error("raft: log compaction failed");
-    }
+  }
+  // M5.2（I9）：compact 内含 fsync + rename + fsyncDir，必须在锁外执行。
+  // B12: only advance the boundary once compaction really succeeded; a false
+  // return means the on-disk log no longer matches our in-memory state.
+  if (!log_.compact(snapIndex, snapTerm)) {
+    throw std::runtime_error("raft: log compaction failed");
+  }
+  {
+    std::lock_guard<ProbedMutex> lock(mu_);
+    // 期间可能有更新的 InstallSnapshot 落地：那种情况下本次 compact 结果保留，
+    // 但边界/快照字节让位给更新的快照（绝不回退）。
+    if (epoch != installEpoch_) return;
     lastIncluded_ = snapIndex;
     lastIncludedTerm_ = snapTerm;
     if (metrics_ != nullptr) metrics_->onSnapshot(encoded.size());
@@ -829,9 +933,23 @@ InstallSnapshotReply RaftNode::onInstallSnapshot(const InstallSnapshotArgs& args
       }
     }
     if (!sm_.restore(installed.payload)) return {currentTerm_, false, 0};
+    // M5.2（I9）：compact（fsync + rename + fsyncDir）在锁外执行；状态机 restore 仍在
+    // 锁内（状态机读路径受 mu_ 保护）。
+    pendingInstallCompact_ = true;
+    pendingInstallIndex_ = installed.lastIncludedIndex;
+    pendingInstallTerm_ = installed.lastIncludedTerm;
+  }
+  if (pendingInstallCompact_) {
     // B12: compaction must succeed before the boundary is advanced.
-    if (!log_.compact(installed.lastIncludedIndex, installed.lastIncludedTerm)) {
+    if (!log_.compact(pendingInstallIndex_, pendingInstallTerm_)) {
       throw std::runtime_error("raft: log compaction failed (InstallSnapshot)");
+    }
+    pendingInstallCompact_ = false;
+  }
+  {
+    std::lock_guard<ProbedMutex> lock(mu_);
+    if (installed.lastIncludedIndex <= lastIncluded_) {
+      return {currentTerm(), true, 0};  // raced with a newer install
     }
     ++installEpoch_;  // B5: invalidates any in-flight maybeSnapshot() save
     // M4.3 / M4 评审 B4：安装快照即继承其配置。日志前缀刚被 compact，快照里的
@@ -1223,7 +1341,7 @@ ClientReply RaftNode::changeMembership(MembershipOp op, int targetId,
   const bool add = (op == MembershipOp::kAdd);
   // M4 评审 B6：整个成员变更（校验 -> CatchUp -> 追加配置条目 -> 等提交）串行化。
   // 并发的第二次变更立即被拒绝——不做无谓的 CatchUp，也不可能"两个变更同时进入"。
-  std::unique_lock<ProbedMutex> changeLock(membershipMu_, std::try_to_lock);
+  std::unique_lock<MembershipMutex> changeLock(membershipMu_, std::try_to_lock);
   if (!changeLock.owns_lock()) {
     return {ClientStatus::kErr, "membership change already in progress", -1};
   }
