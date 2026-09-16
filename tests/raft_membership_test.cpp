@@ -139,6 +139,50 @@ class ConfigReplyDropper : public MemoryTransport {
   std::vector<int> dropIds_;
 };
 
+// ---- 评审批 1 新增测试桩 ----
+
+// 丢掉来自指定 peer 的所有 AppendEntries 回包：目标节点仍会收到并落盘日志（心跳也
+// 照收，因此不会超时竞选），但永远不被计为 ack。用于精确构造"某个多数派集合缺席"。
+class ReplyDropper : public MemoryTransport {
+ public:
+  void dropRepliesFrom(const std::vector<int>& ids) { dropIds_ = ids; }
+  void healReplies() { dropIds_.clear(); }
+
+  void sendAppendEntries(int peerId, const AppendEntriesArgs& args,
+                         AppendCb cb) override {
+    if (std::find(dropIds_.begin(), dropIds_.end(), peerId) == dropIds_.end()) {
+      MemoryTransport::sendAppendEntries(peerId, args, std::move(cb));
+      return;
+    }
+    MemoryTransport::sendAppendEntries(peerId, args,
+                                       [](const AppendEntriesReply&) {});
+  }
+
+ private:
+  std::vector<int> dropIds_;
+};
+
+// 把发给指定 peer 的 AppendEntries 的 leaderCommit 抹成 0：该 peer 会持有条目，
+// 但 commitIndex 永远不推进（复现"新 Leader 尚未学到旧 Leader 的提交点"）。
+class CommitNoticeSuppressor : public MemoryTransport {
+ public:
+  void suppressFor(const std::vector<int>& ids) { ids_ = ids; }
+
+  void sendAppendEntries(int peerId, const AppendEntriesArgs& args,
+                         AppendCb cb) override {
+    if (std::find(ids_.begin(), ids_.end(), peerId) == ids_.end()) {
+      MemoryTransport::sendAppendEntries(peerId, args, std::move(cb));
+      return;
+    }
+    AppendEntriesArgs a = args;
+    a.leaderCommit = kNoIndex;
+    MemoryTransport::sendAppendEntries(peerId, a, std::move(cb));
+  }
+
+ private:
+  std::vector<int> ids_;
+};
+
 // ---------------- B 组：真实磁盘集群 ----------------
 
 struct DiskNode {
@@ -804,6 +848,195 @@ TEST(RaftMembership, A19_ConfigEntryTruncationRollsBackConfig) {
   EXPECT_LT(l1->configVersion(), staleVer);            // 回滚（版本下降）
   EXPECT_EQ(l1->configVersion(), nl->configVersion());  // 与当前 Leader 一致
   EXPECT_TRUE(l1->clusterConfig().contains(victim));    // victim 不再是"已移除"
+}
+
+TEST(RaftMembership, A20_J2IsNotBypassedByLaterEntry) {
+  // 评审 B2（安全性）：配置条目在途时，后一条普通条目哪怕先拿到 C_new 多数派，
+  // 也绝不能让 commitIndex_ 越过配置条目。6 -> 5 的偶数旧配置下 C_old 多数派(4)
+  // 严格大于 C_new 多数派(3)：一旦越过，J2 被完全绕过，已提交配置/条目可能被
+  // 新 Leader 覆盖（§5.4.2 反例）。
+  auto transport = std::make_shared<ReplyDropper>();
+  auto c = test::makeMembershipClusterWith(6, /*appendNoop=*/false, 1000000, 64,
+                                           transport);
+  test::driveTicks(*c, 80, 10);
+  RaftNode* leader = test::findLeader(*c);
+  ASSERT_NE(leader, nullptr);
+  const int lid = leader->leaderId();
+  const int victim = (lid == 6) ? 5 : 6;
+
+  // 只保留 2 个 peer 的应答（self + 2 = 3）：满足 C_new 多数派，不满足 C_old 多数派
+  std::vector<int> keep;
+  for (int id = 1; id <= 6; ++id) {
+    if (id != lid && id != victim && keep.size() < 2) keep.push_back(id);
+  }
+  ASSERT_EQ(keep.size(), 2u);
+  std::vector<int> drop;
+  for (int id = 1; id <= 6; ++id) {
+    if (id != lid && std::find(keep.begin(), keep.end(), id) == keep.end()) {
+      drop.push_back(id);
+    }
+  }
+  transport->dropRepliesFrom(drop);
+  test::driveTicks(*c, 200, 10);
+
+  test::TestNode& ltn = c->nodes[static_cast<size_t>(lid - 1)];
+  const Index before = ltn.log->lastIndex();
+  const auto r =
+      leader->changeMembership(MembershipOp::kRemove, victim, "", 300);
+  EXPECT_EQ(r.status, ClientStatus::kErr);  // C_old 多数派缺席 -> 不能提交
+  const Index cfgIdx = ltn.log->lastIndex();
+  ASSERT_GT(cfgIdx, before);
+  EXPECT_LT(leader->commitIndex(), cfgIdx);
+  EXPECT_FALSE(leader->clusterConfig().contains(victim));  // 追加即生效
+
+  // 关键断言：后一条普通条目先拿到 C_new 多数派，也不得把 commitIndex_ 带过 cfgIdx
+  const auto w = leader->propose(putReq(1, "k", "v"), 300);
+  EXPECT_EQ(w.status, ClientStatus::kErr);
+  EXPECT_LT(leader->commitIndex(), cfgIdx);
+  std::string v;
+  EXPECT_FALSE(ltn.sm->get("k", v));  // 未提交 -> 状态机里没有这个 key
+
+  // 恢复应答：C_old 与 C_new 多数派都到位后，配置条目与后续条目才可以提交
+  transport->healReplies();
+  test::driveTicks(*c, 200, 10);
+  EXPECT_GE(leader->commitIndex(), cfgIdx);
+  EXPECT_TRUE(ltn.sm->get("k", v));
+}
+
+TEST(RaftMembership, A21_NewLeaderWithStaleCommitIndexMustNotServeStaleRead) {
+  // 评审 B5（线性一致读）：新 Leader 可能已持有已提交条目、却还没学到 commitIndex。
+  // 在它提交本任期条目之前按陈旧 commitIndex 做 ReadIndex，会返回 NOT_FOUND/旧值。
+  auto transport = std::make_shared<CommitNoticeSuppressor>();
+  auto c = test::makeMembershipClusterWith(3, /*appendNoop=*/false, 1000000, 64,
+                                           transport);
+  test::driveTicks(*c, 60, 10);
+  RaftNode* leader = test::findLeader(*c);
+  ASSERT_NE(leader, nullptr);
+  const int lid = leader->leaderId();
+  std::vector<int> followers;
+  for (int id = 1; id <= 3; ++id) {
+    if (id != lid) followers.push_back(id);
+  }
+  ASSERT_EQ(followers.size(), 2u);
+
+  // 两个 follower 都收到条目，但 leaderCommit 被抹成 0 -> 它们持有条目却 applied=0
+  transport->suppressFor(followers);
+  ASSERT_EQ(leader->propose(putReq(1, "k", "v"), 1000).status,
+            ClientStatus::kOk);
+  for (const int f : followers) {
+    test::TestNode& ftn = c->nodes[static_cast<size_t>(f - 1)];
+    EXPECT_EQ(ftn.log->lastIndex(), static_cast<Index>(1));  // 条目已持有
+    EXPECT_EQ(ftn.node->commitIndex(), kNoIndex);            // 但未提交
+    EXPECT_EQ(ftn.node->lastApplied(), kNoIndex);
+  }
+
+  // 隔离旧 Leader：剩下两个 follower 选出新 Leader（它的 commitIndex 是陈旧的 0）
+  c->transport->isolate(lid);
+  test::tickNodesOnly(*c, followers, 200, 10);
+  RaftNode* nl = nullptr;
+  for (const int f : followers) {
+    if (c->nodes[static_cast<size_t>(f - 1)].node->role() == Role::kLeader) {
+      nl = c->nodes[static_cast<size_t>(f - 1)].node.get();
+    }
+  }
+  ASSERT_NE(nl, nullptr);
+  EXPECT_NE(nl->leaderId(), lid);
+  EXPECT_EQ(nl->commitIndex(), kNoIndex);  // 陈旧提交点
+
+  // 宁可报错/超时，也绝不能返回陈旧值（NOT_FOUND / 旧值）
+  const auto rd = nl->linearizableGet("k", 300);
+  EXPECT_NE(rd.status, ClientStatus::kNotFound);
+  EXPECT_NE(rd.status, ClientStatus::kOk);
+  EXPECT_EQ(rd.status, ClientStatus::kErr);
+}
+
+TEST(RaftMembership, A22_CodecRejectsMaliciousInput) {
+  // 评审 B7/O8：恶意/边界帧必须被干净拒绝，既不抛异常也不做天量分配。
+  {
+    // AppendEntries：40 字节帧 + count = 0xFFFFFFFF（旧实现 reserve 几百 GB）
+    Bytes payload(40, 0);
+    payload[36] = 0xFF;
+    payload[37] = 0xFF;
+    payload[38] = 0xFF;
+    payload[39] = 0xFF;
+    AppendEntriesArgs out;
+    EXPECT_NO_THROW({
+      EXPECT_FALSE(decodeAppendEntries(payload.data(), payload.size(), out));
+    });
+  }
+  {
+    // AppendEntries：count=1 但条目的 keyLen 声明远超剩余字节
+    Bytes payload(81, 0);
+    payload[36] = 0x00;
+    payload[37] = 0x00;
+    payload[38] = 0x00;
+    payload[39] = 0x01;  // count = 1
+    payload[40 + 16] = 0x02;  // op = kGet（合法）
+    payload[40 + 17] = 0xFF;  // keyLen = 0xFFFFFF00
+    payload[40 + 18] = 0xFF;
+    payload[40 + 19] = 0xFF;
+    payload[40 + 20] = 0x00;
+    AppendEntriesArgs out;
+    EXPECT_NO_THROW({
+      EXPECT_FALSE(decodeAppendEntries(payload.data(), payload.size(), out));
+    });
+  }
+  {
+    // 配置请求：未知 action 必须被拒绝（否则会落进 remove 分支）
+    Bytes p;
+    p.push_back(9);  // action
+    p.push_back(0); p.push_back(0); p.push_back(0); p.push_back(1);
+    p.push_back(0); p.push_back(0);
+    ConfigRequestArgs out;
+    EXPECT_FALSE(decodeConfigRequest(p.data(), p.size(), out));
+
+    // addrLen 超出剩余字节
+    Bytes q;
+    q.push_back(0);
+    q.push_back(0); q.push_back(0); q.push_back(0); q.push_back(1);
+    q.push_back(0); q.push_back(5);
+    q.push_back('a');
+    EXPECT_FALSE(decodeConfigRequest(q.data(), q.size(), out));
+  }
+  {
+    // 编码器：超长地址必须写出"addrLen 与字节数一致"的帧，而不是自相矛盾的帧
+    ConfigRequestArgs req;
+    req.action = 1;
+    req.targetId = 2;
+    req.addr.assign(70000, 'x');
+    const Bytes e = encodeConfigRequest(req);
+    ASSERT_FALSE(e.empty());
+    ConfigRequestArgs out;
+    ASSERT_TRUE(decodeConfigRequest(e.data(), e.size(), out));
+    EXPECT_EQ(out.addr.size(), static_cast<size_t>(0xFFFF));
+  }
+  {
+    // 重复 id 的配置：votingIds()/多数派会对同一节点重复计数 -> 必须拒绝
+    ClusterConfig dup;
+    dup.version = 1;
+    dup.members = {Member{1, "127.0.0.1:1", true},
+                   Member{1, "127.0.0.1:2", true}};
+    const Bytes ce = encodeClusterConfig(dup);
+    ClusterConfig cout;
+    EXPECT_FALSE(decodeClusterConfig(ce.data(), ce.size(), cout));
+
+    ConfigReplyArgs rep;
+    rep.config = dup;
+    const Bytes pe = encodeConfigReply(rep);
+    ConfigReplyArgs repOut;
+    EXPECT_FALSE(decodeConfigReply(pe.data(), pe.size(), repOut));
+  }
+  {
+    // 配置 payload 的 count 上界：解码前必须先与剩余字节核对（防超大分配）
+    Bytes p;
+    p.push_back(1);  // cfgVer
+    for (int i = 0; i < 8; ++i) p.push_back(0);
+    p.push_back(0xFF); p.push_back(0xFF); p.push_back(0xFF); p.push_back(0xFF);
+    ClusterConfig out;
+    EXPECT_NO_THROW({
+      EXPECT_FALSE(decodeClusterConfig(p.data(), p.size(), out));
+    });
+  }
 }
 
 // ================================ B 组 ================================

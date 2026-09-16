@@ -115,6 +115,12 @@ bool decodeClusterConfig(const Byte* p, size_t n, ClusterConfig& out) {
     ms.push_back(std::move(m));
   }
   if (off != n) return false;  // 尾部垃圾
+  // 评审 O8：重复 id 会破坏多数派计票（同一节点被重复计数）-> 拒绝解码
+  for (size_t i = 0; i < ms.size(); ++i) {
+    for (size_t j = i + 1; j < ms.size(); ++j) {
+      if (ms[i].id == ms[j].id) return false;
+    }
+  }
 
   out.version = version;
   out.members = std::move(ms);

@@ -92,10 +92,9 @@ std::string roleName(Role r) {
   return "unknown";
 }
 
-void handleConnection(int fd, RaftNode& node) {
-  const int connClientId = g_connClientId.fetch_add(1);
-  uint64_t connRequestId = 0;
-
+// 评审 B7：单条连接的请求处理循环抽出来，异常只允许影响这条连接。
+void serveConnection(int fd, RaftNode& node, int connClientId,
+                     uint64_t& connRequestId) {
   MsgType type;
   Bytes payload;
   while (g_running && readFrame(fd, type, payload)) {
@@ -178,7 +177,8 @@ void handleConnection(int fd, RaftNode& node) {
         reply.config = node.clusterConfig();
         if (args.action == 0) {
           reply.ok = true;  // get：任何节点都可回答自己的配置视图
-        } else {
+        } else if (args.action == 1 || args.action == 2) {
+          // 评审 O8：未知 action 绝不能落进 remove 分支（decode 已拒绝，双保险）
           const MembershipOp op = (args.action == 1) ? MembershipOp::kAdd
                                                      : MembershipOp::kRemove;
           const ClientReply cr =
@@ -186,6 +186,8 @@ void handleConnection(int fd, RaftNode& node) {
           reply.ok = (cr.status == ClientStatus::kOk);
           reply.leaderHint = cr.leaderHint;
           reply.config = node.clusterConfig();
+        } else {
+          reply.ok = false;  // 未知 action
         }
         const Bytes f =
             encodeFrame(MsgType::kConfigReply, encodeConfigReply(reply));
@@ -202,6 +204,20 @@ void handleConnection(int fd, RaftNode& node) {
     } else {
       break;  // unknown frame type
     }
+  }
+}
+
+void handleConnection(int fd, RaftNode& node) {
+  const int connClientId = g_connClientId.fetch_add(1);
+  uint64_t connRequestId = 0;
+  // 评审 B7：解码/处理抛出的异常（如恶意帧触发的 bad_alloc）绝不能 terminate
+  // 整个节点进程——只关闭这一条连接。
+  try {
+    serveConnection(fd, node, connClientId, connRequestId);
+  } catch (const std::exception& e) {
+    std::cerr << "[raftkv-node] conn dropped after error: " << e.what() << "\n";
+  } catch (...) {
+    std::cerr << "[raftkv-node] conn dropped after unknown error\n";
   }
   ::close(fd);
 }

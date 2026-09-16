@@ -1,5 +1,6 @@
 #include "raft/message.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace raftkv::raft {
@@ -130,6 +131,10 @@ bool decodeAppendEntries(const Byte* d, size_t n, AppendEntriesArgs& out) {
   out.prevLogTerm = getU64(d + 20);
   out.leaderCommit = getU64(d + 28);
   const uint32_t count = getU32(d + 36);
+  // 评审 B7：count 必须先与剩余字节数核对。否则 40 字节的恶意帧（count 填
+  // 0xFFFFFFFF）会让 reserve() 尝试分配几百 GB -> std::bad_alloc；连接线程
+  // 一旦不捕获就会 std::terminate 整个节点。每条条目最小 41 字节。
+  if (count > (n - 40) / 41) return false;
 
   size_t off = 40;
   out.entries.clear();
@@ -275,10 +280,13 @@ Bytes encodeConfigRequest(const ConfigRequestArgs& args) {
   p.reserve(7 + args.addr.size());
   p.push_back(args.action);
   putU32(p, static_cast<uint32_t>(args.targetId));
-  const uint16_t alen = static_cast<uint16_t>(args.addr.size());
+  // 评审 O8：addrLen 只有 16 位 -> 插入的字节数必须与声明的长度一致，否则帧
+  // 自相矛盾（解码端会以"长度不匹配"整帧丢弃）。超长地址在 changeMembership
+  // 入口已被拒绝，这里只是保证编码器永不写出畸形帧。
+  const size_t alen = std::min<size_t>(args.addr.size(), 0xFFFFu);
   p.push_back(static_cast<Byte>((alen >> 8) & 0xff));
   p.push_back(static_cast<Byte>(alen & 0xff));
-  p.insert(p.end(), args.addr.begin(), args.addr.end());
+  p.insert(p.end(), args.addr.begin(), args.addr.begin() + alen);
   return p;
 }
 bool decodeConfigRequest(const Byte* data, size_t n, ConfigRequestArgs& out) {
@@ -286,6 +294,7 @@ bool decodeConfigRequest(const Byte* data, size_t n, ConfigRequestArgs& out) {
   const uint16_t alen =
       static_cast<uint16_t>((static_cast<uint16_t>(data[5]) << 8) | data[6]);
   if (n != static_cast<size_t>(7) + alen) return false;
+  if (data[0] > 2) return false;  // 评审 O8：action 只能是 0=get/1=add/2=remove
   out.action = data[0];
   out.targetId = static_cast<int>(getU32(data + 1));
   out.addr.assign(reinterpret_cast<const char*>(data + 7), alen);
@@ -303,10 +312,11 @@ Bytes encodeConfigReply(const ConfigReplyArgs& reply) {
   for (const Member& m : reply.config.members) {
     putU32(p, static_cast<uint32_t>(m.id));
     p.push_back(m.voting ? 1 : 0);
-    const uint16_t alen = static_cast<uint16_t>(m.addr.size());
+    // 评审 O8：同 encodeConfigRequest，addrLen 与插入字节数必须一致
+    const size_t alen = std::min<size_t>(m.addr.size(), 0xFFFFu);
     p.push_back(static_cast<Byte>((alen >> 8) & 0xff));
     p.push_back(static_cast<Byte>(alen & 0xff));
-    p.insert(p.end(), m.addr.begin(), m.addr.end());
+    p.insert(p.end(), m.addr.begin(), m.addr.begin() + alen);
   }
   return p;
 }
@@ -335,6 +345,13 @@ bool decodeConfigReply(const Byte* data, size_t n, ConfigReplyArgs& out) {
     ms.push_back(std::move(m));
   }
   if (off != n) return false;
+  // 评审 O8：重复 id 会让 votingIds()/hasMajorityLocked/readQuorumLocked 对同一个
+  // 节点重复计数，实际 quorum 低于设计值 -> 拒绝解码。
+  for (size_t i = 0; i < ms.size(); ++i) {
+    for (size_t j = i + 1; j < ms.size(); ++j) {
+      if (ms[i].id == ms[j].id) return false;
+    }
+  }
   out.config.members = std::move(ms);
   return true;
 }

@@ -125,6 +125,7 @@ void RaftNode::becomeFollower(Term newTerm) {
   nextIndex_.clear();
   matchIndex_.clear();
   lastSentEndIndex_.clear();
+  ackedTerm_.clear();  // 新任期/新角色：旧的应答不作数
   snapshotSendOffset_.clear();
   snapshotChunkEnd_.clear();
   cv_.notify_all();
@@ -150,6 +151,7 @@ void RaftNode::becomeLeader() {
     }
   }
   matchIndex_[cfg_.selfId] = log_.lastIndex();
+  ackedTerm_.clear();  // 本任期尚无任何应答（追平判据要求本任期应答）
   cv_.notify_all();
 }
 
@@ -212,15 +214,17 @@ void RaftNode::advanceCommitAndApply() {
   if (role_ == Role::kLeader) {
     for (Index n = log_.lastIndex(); n > commitIndex_; --n) {
       if (log_.termAt(n) != currentTerm_) continue;  // §5.4.2: only current term
-      bool committed = hasMajorityLocked(currConfig_, n);
-      if (committed && n == inFlightConfigIndex_) {
-        // J2：在途配置条目还必须拿到 C_old 的多数派
-        committed = hasMajorityLocked(prevConfig_, n);
+      if (!hasMajorityLocked(currConfig_, n)) continue;
+      // J2（评审 B2）：只要 commitIndex_ 会触及或越过在途配置条目，就必须同时拿到
+      // C_old 对该条目的多数派。只判断 n == inFlightConfigIndex_ 会让"后一条普通
+      // 条目先提交"绕过 J2（偶数旧配置下 C_new 多数派可以不含 C_old 多数派），
+      // 从而把已提交的配置/条目暴露给 §5.4.2 反例。
+      if (inFlightConfigIndex_ != kNoIndex && n >= inFlightConfigIndex_ &&
+          !hasMajorityLocked(prevConfig_, inFlightConfigIndex_)) {
+        continue;
       }
-      if (committed) {
-        commitIndex_ = n;
-        break;
-      }
+      commitIndex_ = n;
+      break;
     }
   }
 
@@ -229,7 +233,9 @@ void RaftNode::advanceCommitAndApply() {
     const Index next = lastApplied_ + 1;
     auto entries = log_.slice(next, 1, std::numeric_limits<size_t>::max());
     if (entries.empty() || entries[0].index != next) break;
-    if (entries[0].op != OpCode::kConfig) sm_.apply(entries[0]);
+    // M4（评审 O9）：配置条目同样交给状态机——KvStateMachine 把它当作"推进
+    // applied 的 no-op"，这样 SM 的 applied 与 Raft 的 lastApplied_ 始终一致。
+    sm_.apply(entries[0]);
     lastApplied_ = next;
   }
 
@@ -460,6 +466,7 @@ void RaftNode::onAppendEntriesReply(int peerId, const AppendEntriesReply& reply)
   if (reply.success) {
     const Index end = lastSentEndIndex_[peerId];
     if (end > matchIndex_[peerId]) matchIndex_[peerId] = end;
+    ackedTerm_[peerId] = currentTerm_;  // 追平判据：本任期已应答
     if (end != kNoIndex && end + 1 > nextIndex_[peerId]) {
       nextIndex_[peerId] = end + 1;
     }
@@ -1037,8 +1044,13 @@ bool RaftNode::catchUpPeer(int peerId, uint64_t timeoutMs) {
     {
       std::lock_guard<std::mutex> lock(mu_);
       if (role_ != Role::kLeader) return false;
-      const auto it = matchIndex_.find(peerId);
-      if (it != matchIndex_.end() && it->second >= log_.lastIndex()) {
+      // 设计 §5.4 步骤 5（冻结判据）：matchIndex >= commitIndex **且** 本任期
+      // 至少应答过一次 AppendEntries（评审 O7：原实现用的是 log_.lastIndex()，
+      // 在持续写入/组提交下会把"追平"判得比设计更严，add 可能反复超时）。
+      const auto mit = matchIndex_.find(peerId);
+      const auto ait = ackedTerm_.find(peerId);
+      if (mit != matchIndex_.end() && mit->second >= commitIndex_ &&
+          ait != ackedTerm_.end() && ait->second == currentTerm_) {
         return true;  // 已追平
       }
       job = buildPeerJobLocked(peerId);
@@ -1086,10 +1098,14 @@ ClientReply RaftNode::changeMembership(MembershipOp op, int targetId,
       if (targetAddr.empty()) {
         return {ClientStatus::kErr, "address required for add", -1};
       }
+      if (targetAddr.size() > 0xFFFFu) {  // 评审 O8：wire 的 addrLen 只有 16 位
+        return {ClientStatus::kErr, "address too long", -1};
+      }
       pendingPeers_[targetId] = targetAddr;
       peerAddQueue_.emplace_back(targetId, targetAddr);
       nextIndex_[targetId] = log_.lastIndex() + 1;
       matchIndex_[targetId] = kNoIndex;
+      ackedTerm_.erase(targetId);  // 追平判据要求"本任期"的新应答
       lastSentEndIndex_[targetId] = kNoIndex;
       snapshotSendOffset_[targetId] = 0;
       snapshotChunkEnd_[targetId] = 0;
@@ -1166,22 +1182,65 @@ bool RaftNode::readQuorumLocked(uint64_t seq) const {
     const auto it = readAcks_.find(peer);
     if (it != readAcks_.end() && it->second >= seq) ++acks;
   }
-  return acks >= maj;
+  if (acks < maj) return false;
+  // 设计 §5.8（评审 O1）：变更在途时读探针同 J2 双重判定——C_old 多数派也必须
+  // 确认过本任期领导权，否则未来放宽"一次一个"时会留下线性一致读的口子。
+  if (inFlightConfigIndex_ != kNoIndex) {
+    const size_t oldMaj = prevConfig_.majority();
+    if (oldMaj == 0) return false;
+    size_t oldAcks = 0;
+    for (const int peer : prevConfig_.votingIds()) {
+      const auto it = readAcks_.find(peer);
+      if (it != readAcks_.end() && it->second >= seq) ++oldAcks;
+    }
+    if (oldAcks < oldMaj) return false;
+  }
+  return true;
+}
+
+// M4 评审 B5（§8 读屏障）：commitIndex_ 处的条目属于当前任期，才说明本 Leader
+// 已经提交过自己任期的条目，commitIndex_ 才覆盖了"上一任 Leader 已提交的全部
+// 条目"。否则新 Leader 的 commitIndex_ 可能落后于真实提交点，按它做 ReadIndex
+// 会读到陈旧值（旧值 / NOT_FOUND）。
+bool RaftNode::hasCurrentTermCommitLocked() const {
+  return commitIndex_ != kNoIndex && log_.termAt(commitIndex_) == currentTerm_;
 }
 
 // 线性一致读（m4-design v1.2 §5.8）：记录 readIndex -> quorum 探针确认同任期领导权
 // -> 等 lastApplied >= readIndex -> 读状态机。任一步失败都返回错误，绝不返回可能陈旧的值。
 ClientReply RaftNode::linearizableGet(const std::string& key,
                                       uint64_t timeoutMs) {
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+  const auto start = std::chrono::steady_clock::now();
+  const auto deadline = start + std::chrono::milliseconds(timeoutMs);
+  // 探针阶段预算：设计 §4.3 的 readIndexTimeoutMs（默认 500ms），但绝不放宽
+  // 调用方给的总预算（评审 O6：该配置项此前完全没被使用）。
+  const auto probeDeadline =
+      start + std::chrono::milliseconds(
+                  std::min<uint64_t>(timeoutMs, cfg_.readIndexTimeoutMs));
   Index readIndex = kNoIndex;
   Term term = kNoTerm;
   uint64_t seq = 0;
   std::vector<std::pair<int, ReadProbeArgs>> jobs;
   {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::unique_lock<std::mutex> lock(mu_);
     if (role_ != Role::kLeader) return {ClientStatus::kNotLeader, "", leaderId_};
+    const Term term0 = currentTerm_;
+    // §8 屏障（评审 B5）：先等到"本任期有条目已提交"，否则 readIndex 可能是
+    // 陈旧提交点。生产默认 appendNoop=true，tick() 会补一条本任期 no-op 并提交。
+    if (!hasCurrentTermCommitLocked()) {
+      cv_.wait_until(lock, probeDeadline, [&] {
+        return hasCurrentTermCommitLocked() || role_ != Role::kLeader ||
+               currentTerm_ != term0;
+      });
+    }
+    if (role_ != Role::kLeader || currentTerm_ != term0) {
+      return {ClientStatus::kNotLeader, "", leaderId_};
+    }
+    if (!hasCurrentTermCommitLocked()) {
+      // 宁可失败也不返回可能陈旧的值
+      return {ClientStatus::kErr, "read index timeout (no current-term commit)",
+              -1};
+    }
     readIndex = commitIndex_;
     term = currentTerm_;
     seq = ++readSeq_;
@@ -1206,7 +1265,7 @@ ClientReply RaftNode::linearizableGet(const std::string& key,
 
   std::unique_lock<std::mutex> lock(mu_);
   if (!readQuorumLocked(seq)) {
-    cv_.wait_until(lock, deadline, [&] {
+    cv_.wait_until(lock, probeDeadline, [&] {
       return readQuorumLocked(seq) || role_ != Role::kLeader ||
              currentTerm_ != term;
     });

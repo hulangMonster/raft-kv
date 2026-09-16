@@ -70,6 +70,15 @@ void KvStateMachine::apply(const raft::LogEntry& e) {
     return;
   }
 
+  // M4（m4-prerequisites §5.1-21，评审 O9）：配置条目对 KV 数据是 no-op，但必须
+  // 推进 lastApplied_，否则 SM 的 applied 会落后于 Raft 的快照边界（边界处
+  // 生成/恢复的快照就会出现"状态机 lastApplied < Raft lastApplied"的不一致）。
+  // 必须在幂等去重之前返回：配置条目的 clientId/requestId 都是 0。
+  if (e.op == OpCode::kConfig) {
+    lastApplied_ = e.index;
+    return;
+  }
+
   // Idempotency per (clientId, requestId): replay / duplicate is dropped.
   const auto it = lastRequest_.find(e.clientId);
   if (it != lastRequest_.end() && e.requestId <= it->second) {

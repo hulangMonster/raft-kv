@@ -102,6 +102,8 @@ class RaftNode {
   bool catchUpPeer(int peerId, uint64_t timeoutMs);
   void drainPeerQueues();                          // L10：锁外执行地址簿更新
   bool readQuorumLocked(uint64_t seq) const;       // ReadIndex 多数派（M4.4）
+  // M4 评审 B5：§8 读屏障——commitIndex_ 处的条目是否属于当前任期
+  bool hasCurrentTermCommitLocked() const;
 
   RaftConfig cfg_;
   LogStore& log_;
@@ -153,6 +155,8 @@ class RaftNode {
   std::unordered_map<int, Index> nextIndex_;
   std::unordered_map<int, Index> matchIndex_;
   std::unordered_map<int, Index> lastSentEndIndex_;  // ack context per peer
+  // M4：peer 在本任期是否成功应答过 AppendEntries（设计 §5.4 步骤 5 追平判据）
+  std::unordered_map<int, Term> ackedTerm_;
 
   mutable std::mutex mu_;
   std::condition_variable cv_;
