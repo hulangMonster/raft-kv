@@ -36,19 +36,20 @@ class FrameServer {
   ~FrameServer() { stop(); }
 
   bool start() {
-    lfd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (lfd_ < 0) return false;
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    lfd_.store(fd);
     int one = 1;
-    ::setsockopt(lfd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;  // 让内核选端口
-    if (::bind(lfd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) return false;
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) return false;
     socklen_t len = sizeof(addr);
-    if (::getsockname(lfd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return false;
-    port_ = ntohs(addr.sin_port);
-    if (::listen(lfd_, 16) != 0) return false;
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return false;
+    port_.store(ntohs(addr.sin_port));
+    if (::listen(fd, 16) != 0) return false;
     run_ = true;
     th_ = std::thread([this] { loop(); });
     return true;
@@ -56,21 +57,35 @@ class FrameServer {
 
   void stop() {
     if (!run_.exchange(false)) return;
-    if (lfd_ >= 0) { ::shutdown(lfd_, SHUT_RDWR); ::close(lfd_); lfd_ = -1; }
+    const int fd = lfd_.exchange(-1);
+    if (fd >= 0) { ::shutdown(fd, SHUT_RDWR); ::close(fd); }
     if (th_.joinable()) th_.join();
+    // TSan：先 shutdown（唤醒阻塞的 recv）再 join 连接线程，最后才 close —— 避免
+    // "测试线程 close 同一个 fd" 与 "连接线程 recv" 的竞争。
+    std::vector<std::thread> conns;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      for (int c : conns_) ::shutdown(c, SHUT_RDWR);
+      conns.swap(connThreads_);
+    }
+    for (auto& t : conns) {
+      if (t.joinable()) t.join();
+    }
     std::lock_guard<std::mutex> lk(mu_);
-    for (int fd : conns_) ::close(fd);
+    for (int c : conns_) ::close(c);
     conns_.clear();
   }
 
-  uint16_t port() const { return port_; }
-  std::string addr() const { return "127.0.0.1:" + std::to_string(port_); }
+  uint16_t port() const { return port_.load(); }
+  std::string addr() const { return "127.0.0.1:" + std::to_string(port_.load()); }
   int accepted() const { return accepted_.load(); }
 
  private:
   void loop() {
-    while (run_.load()) {
-      const int c = ::accept(lfd_, nullptr, nullptr);
+    while (run_.load(std::memory_order_relaxed)) {
+      const int listenFd = lfd_.load();
+      if (listenFd < 0) break;
+      const int c = ::accept(listenFd, nullptr, nullptr);
       if (c < 0) break;
       accepted_.fetch_add(1);
       {
@@ -78,7 +93,7 @@ class FrameServer {
         conns_.push_back(c);
       }
       if (!echo_) continue;  // 收下连接但永不回复
-      std::thread([this, c] {
+      std::thread worker([this, c] {
         for (;;) {
           Byte hdr[4];
           if (!readFull(c, hdr, 4)) return;
@@ -93,7 +108,11 @@ class FrameServer {
           whole.insert(whole.end(), body.begin(), body.end());
           if (!writeFull(c, whole.data(), whole.size())) return;
         }
-      }).detach();
+      });
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        connThreads_.push_back(std::move(worker));
+      }
     }
   }
 
@@ -118,14 +137,15 @@ class FrameServer {
     return true;
   }
 
-  int lfd_ = -1;
-  uint16_t port_ = 0;
+  std::atomic<int> lfd_{-1};
+  std::atomic<uint16_t> port_{0};
   std::atomic<bool> run_{false};
   std::atomic<int> accepted_{0};
   bool echo_ = true;
   std::thread th_;
   mutable std::mutex mu_;
   std::vector<int> conns_;
+  std::vector<std::thread> connThreads_;
 };
 
 // 一个最小合法帧：[len:4]=1 [type:1]=0xAA

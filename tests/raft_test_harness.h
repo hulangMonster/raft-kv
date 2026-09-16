@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "kv/kv_state_machine.h"
@@ -227,69 +228,62 @@ class SpyLogStore : public MemoryLogStore {
 // 用于断言"锁外落盘"（进入阻塞点时必须没有持锁）。
 class BlockingLogStore : public MemoryLogStore {
  public:
-  void blockOnSync(bool block) { blockSync_ = block; }
-  void blockOnMeta(bool block) { blockMeta_ = block; }
+  void blockOnSync(bool block) { blockSync_.store(block); }
+  void blockOnMeta(bool block) { blockMeta_.store(block); }
 
+  // 说明：刻意**不用 mutex/condition_variable** —— 该桩工作在"节点线程里阻塞、测试线程放行"
+  // 的模式下，用 mutex+cv 会被 TSan 报 double-lock/data-race（都是桩自身的簿记问题，不是
+  // 被测代码）。全部字段用原子 + 1ms 轮询，语义不变（测试本就带 2-3s 超时）。
   bool sync() override {
-    if (blockSync_) {
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        inSync_ = true;
-        holdWhileLocked_ = lockprobe::consensusHeld();
+    if (blockSync_.load()) {
+      inSync_.store(true);
+      holdWhileLocked_.store(lockprobe::consensusHeld());
+      while (!released_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
-      cv_.notify_all();
-      std::unique_lock<std::mutex> lk(mu_);
-      cv_.wait(lk, [&] { return released_; });  // released_ 粘性：放行后不再阻塞
-      inSync_ = false;
+      inSync_.store(false);
     }
     return MemoryLogStore::sync();
   }
 
   bool persistMeta(Term term, int votedFor) override {
-    if (blockMeta_) {
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        inMeta_ = true;
-        holdWhileMetaLocked_ = lockprobe::consensusHeld();
+    if (blockMeta_.load()) {
+      inMeta_.store(true);
+      holdWhileMetaLocked_.store(lockprobe::consensusHeld());
+      while (!released_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
-      cv_.notify_all();
-      std::unique_lock<std::mutex> lk(mu_);
-      cv_.wait(lk, [&] { return released_; });  // released_ 粘性
-      inMeta_ = false;
+      inMeta_.store(false);
     }
     return MemoryLogStore::persistMeta(term, votedFor);
   }
 
   bool waitInsideSync(uint64_t timeoutMs) {
-    std::unique_lock<std::mutex> lk(mu_);
-    return cv_.wait_for(lk, std::chrono::milliseconds(timeoutMs),
-                        [&] { return inSync_; });
+    for (uint64_t waited = 0; waited < timeoutMs; waited += 2) {
+      if (inSync_.load()) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return inSync_.load();
   }
   bool waitInsideMeta(uint64_t timeoutMs) {
-    std::unique_lock<std::mutex> lk(mu_);
-    return cv_.wait_for(lk, std::chrono::milliseconds(timeoutMs),
-                        [&] { return inMeta_; });
-  }
-  void release() {
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      released_ = true;
+    for (uint64_t waited = 0; waited < timeoutMs; waited += 2) {
+      if (inMeta_.load()) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    cv_.notify_all();
+    return inMeta_.load();
   }
-  bool heldWhileSyncEntered() const { return holdWhileLocked_; }
-  bool heldWhileMetaEntered() const { return holdWhileMetaLocked_; }
+  void release() { released_.store(true); }  // 粘性：放行后不再阻塞
+  bool heldWhileSyncEntered() const { return holdWhileLocked_.load(); }
+  bool heldWhileMetaEntered() const { return holdWhileMetaLocked_.load(); }
 
  private:
-  std::mutex mu_;
-  std::condition_variable cv_;
-  bool blockSync_ = false;
-  bool blockMeta_ = false;
-  bool inSync_ = false;
-  bool inMeta_ = false;
-  bool released_ = false;
-  bool holdWhileLocked_ = false;
-  bool holdWhileMetaLocked_ = false;
+  std::atomic<bool> blockSync_{false};
+  std::atomic<bool> blockMeta_{false};
+  std::atomic<bool> inSync_{false};
+  std::atomic<bool> inMeta_{false};
+  std::atomic<bool> released_{false};
+  std::atomic<bool> holdWhileLocked_{false};
+  std::atomic<bool> holdWhileMetaLocked_{false};
 };
 
 // SpyTransport：记录"持 Raft 锁期间"发生的网络发送（I9 的第二半）。

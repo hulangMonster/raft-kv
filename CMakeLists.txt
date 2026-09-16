@@ -11,6 +11,18 @@ endif()
 
 add_compile_options(-Wall -Wextra)
 
+# M5：并发正确性门禁（M2/M3 只跑过 ASan）。TSan 需要关闭 ASLR：setarch $(uname -m) -R ./bin/...
+option(ENABLE_TSAN "Build with ThreadSanitizer" OFF)
+option(ENABLE_ASAN "Build with AddressSanitizer" OFF)
+if(ENABLE_TSAN)
+  add_compile_options(-fsanitize=thread -g -O1)
+  add_link_options(-fsanitize=thread)
+endif()
+if(ENABLE_ASAN)
+  add_compile_options(-fsanitize=address -g -O1)
+  add_link_options(-fsanitize=address)
+endif()
+
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 find_package(Threads REQUIRED)

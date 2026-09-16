@@ -1,0 +1,2 @@
+/usr/bin/ar qc libraftkv_core.a CMakeFiles/raftkv_core.dir/src/codec.cpp.o CMakeFiles/raftkv_core.dir/src/wal.cpp.o CMakeFiles/raftkv_core.dir/src/store.cpp.o CMakeFiles/raftkv_core.dir/src/server.cpp.o
+/usr/bin/ranlib libraftkv_core.a
