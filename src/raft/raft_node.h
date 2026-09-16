@@ -93,7 +93,10 @@ class RaftNode {
   bool retiredLocked() const;                      // 调用方持锁
   bool hasMajorityLocked(const ClusterConfig& c, Index index) const;
   std::vector<int> replicationTargetsLocked() const;   // 配置成员 ∪ CatchUp 目标
-  void erasePeerStateLocked(int peerId);
+  void erasePeerStateLocked(int peerId);            // 含 readAcks_ 清理（评审 O4）
+  // 已彻底离开配置的 peer（不在 currConfig_/CatchUp/送达集合）：调用方负责
+  // erasePeerStateLocked + 锁外 transport_.removePeer（L10）。
+  std::vector<int> removablePeersLocked() const;
   void applyAppendedConfigLocked(const std::vector<LogEntry>& appended);
   void adoptConfigLocked(const ClusterConfig& sc, Index inFlightIndex,
                          bool computeDraining);

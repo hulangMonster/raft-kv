@@ -245,6 +245,14 @@ void RaftNode::advanceCommitAndApply() {
     prevConfig_ = currConfig_;
     baseConfig_ = currConfig_;  // 已提交 -> 成为新的回滚基线
     drainingPeers_.clear();
+    // 评审 O2：提交后"被移除的节点"已经不需要再送达，必须在这里把它的每 peer 状态
+    // （nextIndex_/matchIndex_/快照发送进度）和地址簿条目一起清掉；否则这些状态要
+    // 等到下一次配置变更或 InstallSnapshot 才可能被回收（连接/内存泄漏）。
+    const std::vector<int> gone = removablePeersLocked();
+    for (const int id : gone) {
+      erasePeerStateLocked(id);
+      peerRemoveQueue_.push_back(id);  // 锁外执行 transport_.removePeer（L10）
+    }
     if (role_ == Role::kLeader && !currConfig_.isVoting(cfg_.selfId)) {
       becomeFollower(currentTerm_);
     }
@@ -940,6 +948,24 @@ void RaftNode::erasePeerStateLocked(int peerId) {
   lastSentEndIndex_.erase(peerId);
   snapshotSendOffset_.erase(peerId);
   snapshotChunkEnd_.erase(peerId);
+  readAcks_.erase(peerId);  // 评审 O4：ReadIndex 应答表也要回收
+}
+
+// 已彻底离开配置的 peer（评审 O2 抽出的单一入口，adoptConfigLocked 与
+// advanceCommitAndApply 共用）。
+std::vector<int> RaftNode::removablePeersLocked() const {
+  std::vector<int> gone;
+  for (const auto& kv : nextIndex_) {
+    const int id = kv.first;
+    if (id == cfg_.selfId || currConfig_.contains(id)) continue;
+    if (pendingPeers_.count(id) != 0) continue;  // CatchUp 目标：保留
+    if (std::find(drainingPeers_.begin(), drainingPeers_.end(), id) !=
+        drainingPeers_.end()) {
+      continue;  // 配置条目提交前仍要送达
+    }
+    gone.push_back(id);
+  }
+  return gone;
 }
 
 // 配置条目"追加即生效"（决策③）：切换 currConfig_、记录在途标记与送达集合。
@@ -986,17 +1012,7 @@ void RaftNode::adoptConfigLocked(const ClusterConfig& sc, Index inFlightIndex,
       peerAddQueue_.emplace_back(m.id, m.addr);
     }
   }
-  std::vector<int> gone;
-  for (const auto& kv : nextIndex_) {
-    const int id = kv.first;
-    if (id == cfg_.selfId || currConfig_.contains(id)) continue;
-    if (pendingPeers_.count(id) != 0) continue;
-    if (std::find(drainingPeers_.begin(), drainingPeers_.end(), id) !=
-        drainingPeers_.end()) {
-      continue;
-    }
-    gone.push_back(id);
-  }
+  const std::vector<int> gone = removablePeersLocked();
   for (const int id : gone) {
     erasePeerStateLocked(id);
     peerRemoveQueue_.push_back(id);

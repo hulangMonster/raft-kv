@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -182,6 +183,43 @@ class GatedTransport : public MemoryTransport {
   std::vector<int> gated_;
   std::set<int> blocked_;
   bool open_ = false;
+};
+
+// 记录每个 peer 的 AppendEntries 次数与 transport_.removePeer 调用，用于验证
+// "配置条目提交后被移除的节点真的被回收了"（评审 O2）。
+class PeerBookTransport : public MemoryTransport {
+ public:
+  void removePeer(int id) override {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      removed_.insert(id);
+    }
+    MemoryTransport::removePeer(id);
+  }
+
+  void sendAppendEntries(int peerId, const AppendEntriesArgs& args,
+                         AppendCb cb) override {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      ++sends_[peerId];
+    }
+    MemoryTransport::sendAppendEntries(peerId, args, std::move(cb));
+  }
+
+  bool wasRemoved(int id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return removed_.count(id) != 0;
+  }
+  int sendsTo(int id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto it = sends_.find(id);
+    return it == sends_.end() ? 0 : it->second;
+  }
+
+ private:
+  mutable std::mutex mu_;
+  std::set<int> removed_;
+  std::map<int, int> sends_;
 };
 
 // ---- 评审批 1 新增测试桩 ----
@@ -1405,6 +1443,42 @@ TEST(RaftMembership, A27_ConcurrentMembershipChangesAreSerialized) {
     EXPECT_EQ(cc.version, e.index);
   }
   EXPECT_EQ(configs, 1);
+}
+
+TEST(RaftMembership, A28_RemovedPeerIsReclaimedAfterCommit) {
+  // 评审 O2/O4：配置条目提交后被移除的节点不再需要送达，它的每 peer 状态
+  // （nextIndex_/matchIndex_/快照进度/readAcks_）与地址簿条目必须被回收，
+  // 而不是拖到下一次配置变更。提交前（在途）则必须继续送达。
+  auto transport = std::make_shared<PeerBookTransport>();
+  auto c = test::makeMembershipClusterWith(3, /*appendNoop=*/true, 1000000, 64,
+                                           transport);
+  test::driveTicks(*c, 60, 10);
+  RaftNode* leader = test::findLeader(*c);
+  ASSERT_NE(leader, nullptr);
+  const int lid = leader->leaderId();
+  const int victim = (lid == 3) ? 2 : 3;
+
+  ASSERT_EQ(leader->changeMembership(MembershipOp::kRemove, victim, "", 2000)
+                .status,
+            ClientStatus::kOk);
+  test::driveTicks(*c, 5, 10);
+
+  // 提交后：地址簿里的条目必须已经被摘掉
+  EXPECT_TRUE(transport->wasRemoved(victim));
+  // 提交后不再给被移除节点发任何 RPC（复制目标里已经没有它）
+  const int sendsAfterCommit = transport->sendsTo(victim);
+  test::driveTicks(*c, 200, 10);
+  EXPECT_EQ(transport->sendsTo(victim), sendsAfterCommit);
+
+  // 仍然在配置里的节点当然不受影响（注意排除 Leader 自己：它不给自己发 RPC）
+  int alive = 0;
+  for (int id = 1; id <= 3; ++id) {
+    if (id != victim && id != lid) alive = id;
+  }
+  ASSERT_NE(alive, 0);
+  EXPECT_GT(transport->sendsTo(alive), 0);
+  EXPECT_FALSE(transport->wasRemoved(alive));
+  EXPECT_FALSE(leader->clusterConfig().contains(victim));
 }
 
 // ================================ B 组 ================================
