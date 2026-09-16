@@ -1,11 +1,16 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "kv/kv_state_machine.h"
 #include "raft/cluster_config.h"
 #include "raft/clock.h"
+#include "raft/lock_probe.h"
 #include "raft/log_store.h"
 #include "raft/raft_node.h"
 #include "raft/snapshot_store.h"
@@ -176,6 +181,145 @@ class SpyMemoryLogStore : public MemoryLogStore {
 
  private:
   int persistMetaCalls = 0;
+};
+
+
+// ============================ M5 新增（仅追加，不改既有桩） ============================
+
+// SpyLogStore：记录"持 Raft 锁期间"发生的 durable 调用（I9 的断言载体）。
+// MemoryLogStore 语义完全不变（M2/M3/M4 用例零影响）。
+class SpyLogStore : public MemoryLogStore {
+ public:
+  bool append(const std::vector<LogEntry>& entries) override {
+    if (lockprobe::held()) ++lockedAppends;
+    ++appends;
+    return MemoryLogStore::append(entries);
+  }
+  bool sync() override {
+    if (lockprobe::held()) ++lockedSyncs;
+    ++syncs;
+    return MemoryLogStore::sync();
+  }
+  bool persistMeta(Term term, int votedFor) override {
+    if (lockprobe::held()) ++lockedMetaPersists;
+    ++metaPersists;
+    return MemoryLogStore::persistMeta(term, votedFor);
+  }
+  bool compact(Index upTo, Term termAtUpTo) override {
+    if (lockprobe::held()) ++lockedCompacts;
+    ++compacts;
+    return MemoryLogStore::compact(upTo, termAtUpTo);
+  }
+  bool appendNoSync(const std::vector<LogEntry>& entries) override {
+    if (lockprobe::held()) ++lockedAppendNoSyncs;  // 允许（I9：锁内只 write）
+    return MemoryLogStore::appendNoSync(entries);
+  }
+
+  int lockedDurableCalls() const {
+    return lockedAppends + lockedSyncs + lockedMetaPersists + lockedCompacts;
+  }
+  int appends = 0, syncs = 0, metaPersists = 0, compacts = 0;
+  int lockedAppends = 0, lockedSyncs = 0, lockedMetaPersists = 0,
+      lockedCompacts = 0, lockedAppendNoSyncs = 0;
+};
+
+// BlockingLogStore：在 sync()/persistMeta() 上升起"已进入"信号并阻塞，直到测试放行。
+// 用于断言"锁外落盘"（进入阻塞点时必须没有持锁）。
+class BlockingLogStore : public MemoryLogStore {
+ public:
+  void blockOnSync(bool block) { blockSync_ = block; }
+  void blockOnMeta(bool block) { blockMeta_ = block; }
+
+  bool sync() override {
+    if (blockSync_) {
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        inSync_ = true;
+        holdWhileLocked_ = lockprobe::held();
+      }
+      cv_.notify_all();
+      std::unique_lock<std::mutex> lk(mu_);
+      cv_.wait(lk, [&] { return released_; });  // released_ 粘性：放行后不再阻塞
+      inSync_ = false;
+    }
+    return MemoryLogStore::sync();
+  }
+
+  bool persistMeta(Term term, int votedFor) override {
+    if (blockMeta_) {
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        inMeta_ = true;
+        holdWhileMetaLocked_ = lockprobe::held();
+      }
+      cv_.notify_all();
+      std::unique_lock<std::mutex> lk(mu_);
+      cv_.wait(lk, [&] { return released_; });  // released_ 粘性
+      inMeta_ = false;
+    }
+    return MemoryLogStore::persistMeta(term, votedFor);
+  }
+
+  bool waitInsideSync(uint64_t timeoutMs) {
+    std::unique_lock<std::mutex> lk(mu_);
+    return cv_.wait_for(lk, std::chrono::milliseconds(timeoutMs),
+                        [&] { return inSync_; });
+  }
+  bool waitInsideMeta(uint64_t timeoutMs) {
+    std::unique_lock<std::mutex> lk(mu_);
+    return cv_.wait_for(lk, std::chrono::milliseconds(timeoutMs),
+                        [&] { return inMeta_; });
+  }
+  void release() {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      released_ = true;
+    }
+    cv_.notify_all();
+  }
+  bool heldWhileSyncEntered() const { return holdWhileLocked_; }
+  bool heldWhileMetaEntered() const { return holdWhileMetaLocked_; }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool blockSync_ = false;
+  bool blockMeta_ = false;
+  bool inSync_ = false;
+  bool inMeta_ = false;
+  bool released_ = false;
+  bool holdWhileLocked_ = false;
+  bool holdWhileMetaLocked_ = false;
+};
+
+// SpyTransport：记录"持 Raft 锁期间"发生的网络发送（I9 的第二半）。
+class SpyTransport : public MemoryTransport {
+ public:
+  void sendRequestVote(int peerId, const RequestVoteArgs& a, VoteCb cb) override {
+    ++sends;
+    if (lockprobe::held()) ++lockedSends;
+    MemoryTransport::sendRequestVote(peerId, a, std::move(cb));
+  }
+  void sendAppendEntries(int peerId, const AppendEntriesArgs& a,
+                         AppendCb cb) override {
+    ++sends;
+    if (lockprobe::held()) ++lockedSends;
+    MemoryTransport::sendAppendEntries(peerId, a, std::move(cb));
+  }
+  void sendInstallSnapshot(int peerId, const InstallSnapshotArgs& a,
+                           InstallCb cb) override {
+    ++sends;
+    if (lockprobe::held()) ++lockedSends;
+    MemoryTransport::sendInstallSnapshot(peerId, a, std::move(cb));
+  }
+  void sendReadProbe(int peerId, const ReadProbeArgs& a,
+                     ReadProbeCb cb) override {
+    ++sends;
+    if (lockprobe::held()) ++lockedSends;
+    MemoryTransport::sendReadProbe(peerId, a, std::move(cb));
+  }
+  int sends = 0;
+  int lockedSends = 0;
 };
 
 }  // namespace raftkv::raft::test

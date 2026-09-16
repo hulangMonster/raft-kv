@@ -282,7 +282,7 @@ void RaftNode::tick() {
   std::vector<std::pair<int, AppendEntriesArgs>> appendJobs;
   std::vector<std::pair<int, InstallSnapshotArgs>> snapJobs;
   {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::lock_guard<ProbedMutex> lock(mu_);
     const uint64_t now = clock_.nowMs();
 
     if (role_ == Role::kLeader) {
@@ -347,7 +347,7 @@ void RaftNode::tick() {
 }
 
 RequestVoteReply RaftNode::onRequestVote(const RequestVoteArgs& args) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   if (args.term < currentTerm_) {
     return {currentTerm_, false};
   }
@@ -378,7 +378,7 @@ RequestVoteReply RaftNode::onRequestVote(const RequestVoteArgs& args) {
 }
 
 AppendEntriesReply RaftNode::onAppendEntries(const AppendEntriesArgs& args) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   if (args.term < currentTerm_) {
     return {currentTerm_, false, kNoIndex, kNoTerm};
   }
@@ -462,7 +462,7 @@ AppendEntriesReply RaftNode::onAppendEntries(const AppendEntriesArgs& args) {
 }
 
 void RaftNode::onRequestVoteReply(int peerId, const RequestVoteReply& reply) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   if (reply.term > currentTerm_) {
     becomeFollower(reply.term);
     return;
@@ -484,7 +484,7 @@ void RaftNode::onRequestVoteReply(int peerId, const RequestVoteReply& reply) {
 }
 
 void RaftNode::onAppendEntriesReply(int peerId, const AppendEntriesReply& reply) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   if (role_ != Role::kLeader) return;
   if (reply.term > currentTerm_) {
     becomeFollower(reply.term);
@@ -533,7 +533,7 @@ ClientReply RaftNode::propose(const ClientRequest& req, uint64_t timeoutMs) {
   }
   LogEntry e;
   {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::lock_guard<ProbedMutex> lock(mu_);
     if (role_ != Role::kLeader) {
       return {ClientStatus::kNotLeader, "", leaderId_};
     }
@@ -571,7 +571,7 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
     bool iAmFlusher = false;
     Index flushTarget = kNoIndex;
     {
-      std::lock_guard<std::mutex> lock(mu_);
+      std::lock_guard<ProbedMutex> lock(mu_);
       // 已提交即成功：Leader 自我移除（§5.7）会在配置条目提交的同一锁段内降级，
       // 此时请求其实已经生效，不能报 NotLeader。
       if (index <= commitIndex_) return {ClientStatus::kOk, "", -1};
@@ -590,7 +590,7 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
       std::vector<std::pair<int, AppendEntriesArgs>> jobs;
       std::vector<std::pair<int, InstallSnapshotArgs>> snapJobs;
       {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::lock_guard<ProbedMutex> lock(mu_);
         if (syncOk) {
           // Only claim durability for entries that are still in the log: a
           // concurrent truncateSuffix()/compact() may have shrunk it meanwhile
@@ -636,7 +636,7 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
       continue;
     }
 
-    std::unique_lock<std::mutex> lock(mu_);
+    std::unique_lock<ProbedMutex> lock(mu_);
     cv_.wait_until(lock, deadline, [&] {
       return index <= commitIndex_ || role_ != Role::kLeader ||
              currentTerm_ != term;
@@ -653,23 +653,23 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
 }
 
 Role RaftNode::role() const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   return role_;
 }
 Term RaftNode::currentTerm() const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   return currentTerm_;
 }
 int RaftNode::leaderId() const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   return leaderId_;
 }
 Index RaftNode::commitIndex() const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   return commitIndex_;
 }
 Index RaftNode::lastApplied() const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   return lastApplied_;
 }
 
@@ -683,7 +683,7 @@ void RaftNode::maybeSnapshot() {
   uint64_t epoch = 0;
 
   {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::lock_guard<ProbedMutex> lock(mu_);
     if (snapshots_ == nullptr) return;
 
     const bool due =
@@ -722,7 +722,7 @@ void RaftNode::maybeSnapshot() {
   Bytes encoded = encodeSnapshotFile(data);  // outside the lock (L8)
 
   {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::lock_guard<ProbedMutex> lock(mu_);
     // B5: an InstallSnapshot that landed while we were persisting is newer and
     // must win — never move the boundary (or the log) backwards.
     if (epoch != installEpoch_) return;
@@ -741,23 +741,23 @@ void RaftNode::maybeSnapshot() {
 }
 
 void RaftNode::triggerSnapshot() {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   snapshotRequested_ = true;
 }
 
 Index RaftNode::lastIncludedIndex() const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   return lastIncluded_;
 }
 
 Term RaftNode::lastIncludedTerm() const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   return lastIncludedTerm_;
 }
 
 InstallSnapshotReply RaftNode::onInstallSnapshot(const InstallSnapshotArgs& args) {
   {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::lock_guard<ProbedMutex> lock(mu_);
     if (args.term < currentTerm_) return {currentTerm_, false, 0};
     if (args.term > currentTerm_) {
       becomeFollower(args.term);
@@ -790,7 +790,7 @@ InstallSnapshotReply RaftNode::onInstallSnapshot(const InstallSnapshotArgs& args
   Bytes encoded = encodeSnapshotFile(installed);  // outside the lock (L8)
 
   {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::lock_guard<ProbedMutex> lock(mu_);
     if (installed.lastIncludedIndex <= lastIncluded_) {
       return {currentTerm_, true, 0};  // raced with a newer install
     }
@@ -906,7 +906,7 @@ void RaftNode::rebuildConfigFromSeedAndLog() {
 }
 
 ClusterConfig RaftNode::clusterConfig() const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   return currConfig_;
 }
 
@@ -916,7 +916,7 @@ uint64_t RaftNode::configVersion() const { return clusterConfig().version; }
 bool RaftNode::retiredLocked() const { return !currConfig_.isVoting(cfg_.selfId); }
 
 bool RaftNode::retired() const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   return retiredLocked();
 }
 
@@ -1120,7 +1120,7 @@ void RaftNode::drainPeerQueues() {
   std::vector<std::pair<int, std::string>> adds;
   std::vector<int> removes;
   {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::lock_guard<ProbedMutex> lock(mu_);
     adds.swap(peerAddQueue_);
     removes.swap(peerRemoveQueue_);
   }
@@ -1157,7 +1157,7 @@ bool RaftNode::catchUpPeer(int peerId, uint64_t timeoutMs) {
   for (;;) {
     PeerJob job;
     {
-      std::lock_guard<std::mutex> lock(mu_);
+      std::lock_guard<ProbedMutex> lock(mu_);
       if (role_ != Role::kLeader) return false;
       // 设计 §5.4 步骤 5（冻结判据）：matchIndex >= commitIndex **且** 本任期
       // 至少应答过一次 AppendEntries（评审 O7：原实现用的是 log_.lastIndex()，
@@ -1196,12 +1196,12 @@ ClientReply RaftNode::changeMembership(MembershipOp op, int targetId,
   const bool add = (op == MembershipOp::kAdd);
   // M4 评审 B6：整个成员变更（校验 -> CatchUp -> 追加配置条目 -> 等提交）串行化。
   // 并发的第二次变更立即被拒绝——不做无谓的 CatchUp，也不可能"两个变更同时进入"。
-  std::unique_lock<std::mutex> changeLock(membershipMu_, std::try_to_lock);
+  std::unique_lock<ProbedMutex> changeLock(membershipMu_, std::try_to_lock);
   if (!changeLock.owns_lock()) {
     return {ClientStatus::kErr, "membership change already in progress", -1};
   }
   {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::lock_guard<ProbedMutex> lock(mu_);
     if (role_ != Role::kLeader) return {ClientStatus::kNotLeader, "", leaderId_};
     if (retiredLocked()) return {ClientStatus::kNotLeader, "", leaderId_};
     if (targetId <= 0) return {ClientStatus::kErr, "invalid target id", -1};
@@ -1242,7 +1242,7 @@ ClientReply RaftNode::changeMembership(MembershipOp op, int targetId,
         std::max<uint64_t>(timeoutMs, cfg_.catchUpTimeoutMs);
     if (!catchUpPeer(targetId, budget)) {
     {
-      std::lock_guard<std::mutex> lock(mu_);
+      std::lock_guard<ProbedMutex> lock(mu_);
       pendingPeers_.erase(targetId);
       erasePeerStateLocked(targetId);
       peerRemoveQueue_.push_back(targetId);
@@ -1258,7 +1258,7 @@ ClientReply RaftNode::changeMembership(MembershipOp op, int targetId,
   // maybeSnapshot 的边界保护与重启期的 J3 校验同时失真。
   LogEntry ce;
   {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::lock_guard<ProbedMutex> lock(mu_);
     if (role_ != Role::kLeader) return {ClientStatus::kNotLeader, "", leaderId_};
     if (inFlightConfigIndex_ != kNoIndex) {
       return {ClientStatus::kErr, "membership change already in flight", -1};
@@ -1299,7 +1299,7 @@ ClientReply RaftNode::changeMembership(MembershipOp op, int targetId,
 
   const ClientReply reply = awaitCommit(ce.index, ce.term, timeoutMs);
   if (reply.status != ClientStatus::kOk && add) {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::lock_guard<ProbedMutex> lock(mu_);
     pendingPeers_.erase(targetId);
   }
   return reply;
@@ -1354,7 +1354,7 @@ ClientReply RaftNode::linearizableGet(const std::string& key,
   uint64_t seq = 0;
   std::vector<std::pair<int, ReadProbeArgs>> jobs;
   {
-    std::unique_lock<std::mutex> lock(mu_);
+    std::unique_lock<ProbedMutex> lock(mu_);
     if (role_ != Role::kLeader) return {ClientStatus::kNotLeader, "", leaderId_};
     const Term term0 = currentTerm_;
     // §8 屏障（评审 B5）：先等到"本任期有条目已提交"，否则 readIndex 可能是
@@ -1395,7 +1395,7 @@ ClientReply RaftNode::linearizableGet(const std::string& key,
         });
   }
 
-  std::unique_lock<std::mutex> lock(mu_);
+  std::unique_lock<ProbedMutex> lock(mu_);
   if (!readQuorumLocked(seq)) {
     cv_.wait_until(lock, probeDeadline, [&] {
       return readQuorumLocked(seq) || role_ != Role::kLeader ||
@@ -1427,7 +1427,7 @@ ClientReply RaftNode::linearizableGet(const std::string& key,
 
 // 探针接收侧：承认同任期领导权（等价于一次心跳），回带 seq。
 ReadProbeReply RaftNode::onReadProbe(const ReadProbeArgs& args) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   if (args.term < currentTerm_) return {currentTerm_, false, args.seq};
   if (args.term > currentTerm_) {
     becomeFollower(args.term);
@@ -1440,7 +1440,7 @@ ReadProbeReply RaftNode::onReadProbe(const ReadProbeArgs& args) {
 }
 
 void RaftNode::onReadProbeReply(int peerId, const ReadProbeReply& reply) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   if (reply.term < currentTerm_) return;  // 陈旧回包
   if (reply.term > currentTerm_) {
     becomeFollower(reply.term);
@@ -1456,7 +1456,7 @@ void RaftNode::onReadProbeReply(int peerId, const ReadProbeReply& reply) {
 
 void RaftNode::onInstallSnapshotReply(int peerId,
                                       const InstallSnapshotReply& reply) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<ProbedMutex> lock(mu_);
   if (role_ != Role::kLeader) return;
   if (reply.term > currentTerm_) {
     becomeFollower(reply.term);

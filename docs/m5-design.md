@@ -379,3 +379,24 @@ TSan（全量 raft 用例 + `raft_perf_test`）必须 0 报告；注入用例：
 
 - **v1.0**（#0 brainstorming，用户豁免硬闸门）：8 项决策冻结；基线证据落档；两段式协议（含 I5 三处）、
   Reactor 语义与生命周期、快照流式化/断点续传、指标集合、基准方法学、测试矩阵与里程碑拆分定稿。
+
+- **v1.1**（#2 TDD 阶段，实测 RED 后回填）：
+  1. **#2 实测结果**：新增 `tests/raft_perf_test.cpp` 共 7 例，**4 红 3 绿**（75 例总计 71 绿 + 4 预期红）。
+     RED：`A1`（持锁窗口内 48 次 durable 调用）、`A2`（follower 新条目路径不显式 sync 且锁被占）、
+     `A3`（`persistMeta` 在持锁状态）、`A6`（metrics 仍为计数桩）。
+     绿（回归守门，M5 改动不得让其变红）：`A4`（sync 失败不 ack/不推进）、`A5`（no-op 满足 §8 读屏障）、
+     `A7`（成员变更仍提交）。
+  2. **#2 阶段发现的真实缺陷（评审未提及）**：`onAppendEntries` 的新条目路径**从不显式调用 `sync()`** ——
+     它在 `log_.append()` 之后**无条件**把 `syncedIndex_` 推到该 index，等于把"durable"寄托在
+     `LogStore::append()` 内含 fsync 这一实现细节上。`FileLogStore::append()` 确实 = `appendNoSync()+sync()`，
+     但 `MemoryLogStore::append()` **不含 fsync**，于是 I10/I11（durable 之后才声明/才 ack）在 Memory 适配器上
+     根本无法表达、也不可测。M5.2 必须改为显式 `appendNoSync()` + **锁外 `sync()`**，成功后才推进 `syncedIndex_`
+     与回复 `success`（对应 M5.A2/A3）。
+  3. **脚手架（本阶段新增）**：`src/raft/lock_probe.h`（`ProbedMutex`：lock/unlock 维护 thread_local 持有深度，
+     零调用点侵入地把"是否持锁"暴露给测试）、`src/raft/metrics.{h,cpp}`（接口 + 计数桩）、
+     `tests/raft_test_harness.h` 追加 `SpyLogStore` / `BlockingLogStore` / `SpyTransport`（仅追加，既有桩零改动）。
+     为兼容 `ProbedMutex`，`RaftNode::cv_` 由 `std::condition_variable` 改为 `condition_variable_any`
+     （标准要求 `cv` 只接受 `unique_lock<std::mutex>`）——语义等价，等待期间 depth 归零。
+  4. **文档化偏差**：B 组 `B2`（流式快照兼容）/`B3`（断点续传）依赖 M5.4 才引入的接口，按子阶段 RED-first
+     在 M5.4 补写；`B1`（kill -9 前后可见性）在实现侧无注入 seam（进程内无法制造"未 fsync 即崩溃"），
+     由 P 组脚本（`raft_fault --repeat 50` + `verify missing 0`）承担。

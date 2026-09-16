@@ -46,6 +46,7 @@ add_library(raftkv_raft STATIC
   src/raft/raft_node.cpp
   src/raft/file_log_store.cpp
   src/raft/message.cpp
+  src/raft/metrics.cpp
   src/raft/transport_tcp.cpp
   src/raft/memory_snapshot_store.cpp
   src/raft/file_snapshot_store.cpp
@@ -75,6 +76,7 @@ if(GTEST_INCLUDE_DIR AND GTEST_LIBRARY)
     tests/raft_restart_test.cpp
     tests/raft_snapshot_test.cpp
     tests/raft_membership_test.cpp
+    tests/raft_perf_test.cpp
   )
   target_include_directories(raftkv_raft_tests PRIVATE
     ${GTEST_INCLUDE_DIR}

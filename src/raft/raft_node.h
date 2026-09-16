@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "cluster_config.h"
+#include "lock_probe.h"
 #include "types.h"
 
 namespace raftkv::raft {
@@ -136,7 +137,7 @@ class RaftNode {
   };
   std::unordered_map<int, DrainState> drainingPeers_;
   // M4 评审 B6：成员变更串行化（覆盖 CatchUp 阶段，见 changeMembership）
-  std::mutex membershipMu_;
+  ProbedMutex membershipMu_;
   uint64_t readSeq_ = 0;                            // M4.4: ReadIndex 探针序号（单调）
   std::unordered_map<int, uint64_t> readAcks_;      // M4.4: peer -> 已确认的最大探针序号
 
@@ -175,8 +176,10 @@ class RaftNode {
   // M4：peer 在本任期是否成功应答过 AppendEntries（设计 §5.4 步骤 5 追平判据）
   std::unordered_map<int, Term> ackedTerm_;
 
-  mutable std::mutex mu_;
-  std::condition_variable cv_;
+  mutable ProbedMutex mu_;
+  // M5：mu_ 换成 ProbedMutex 后必须用 condition_variable_any（cv 只接受
+  // unique_lock<std::mutex>）。等待期间是解锁状态，与 lockprobe 语义一致。
+  std::condition_variable_any cv_;
 };
 
 }  // namespace raftkv::raft
