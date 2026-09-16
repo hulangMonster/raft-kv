@@ -516,6 +516,11 @@ AppendEntriesReply RaftNode::onAppendEntries(const AppendEntriesArgs& args) {
     if (!log_.appendNoSync(toAppend)) {
       return {currentTerm_, false, kNoIndex, kNoTerm};
     }
+    // 决策③「配置条目追加即生效」：必须在这里生效，不能推迟到 fsync 之后。
+    // 否则一旦本次 fsync 失败或窗口内任期被取代（我们就不 ack），该条目已经躺在日志里，
+    // 而重传时 `toAppend` 会为空（条目已存在）→ 配置**永远不会生效** → 收敛失败。
+    // （M5.2 实测：raft_membership_fault.sh iter 26 "配置未收敛"，诊断 dump 定位到此。）
+    applyAppendedConfigLocked(toAppend);
   }
 
   // The last entry this leader has actually shown us is the most we may ever
@@ -548,11 +553,8 @@ AppendEntriesReply RaftNode::onAppendEntries(const AppendEntriesArgs& args) {
     if (durable > log_.lastIndex()) durable = log_.lastIndex();  // M3 B3 夹紧
     if (durable > syncedIndex_) syncedIndex_ = durable;
   }
-  // I5/I11：到这里本批已 durable，才可以"生效配置条目 / 推进 commit / 回 success"
-  if (!toAppend.empty() &&
-      log_.termAt(toAppend.back().index) == toAppend.back().term) {
-    applyAppendedConfigLocked(toAppend);
-  }
+  // I5/I11：到这里本批已 durable，才可以推进 commit / 回 success（配置条目在追加时
+  // 已按决策③生效，见上）。
   if (args.leaderCommit > commitIndex_) {
     const Index newCommit = std::min(args.leaderCommit, lastMatched);
     if (newCommit > commitIndex_) {
