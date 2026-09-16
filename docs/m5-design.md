@@ -432,3 +432,14 @@ TSan（全量 raft 用例 + `raft_perf_test`）必须 0 报告；注入用例：
   两段式只把 **fsync 与 ack** 放到锁外/durable 之后，不动生效时机。快照侧不受影响（B3 的
   `snapIndex` 边界取配置保护仍然有效）。
   教训并入 L16 的复核清单：出锁改造要同时核对**被延后的动作是否会被"已存在"分支短路**。
+
+- **v1.4**（M5.2 复跑观测，待下一轮处理）：`raft_membership_fault.sh --repeat 50` 在修复配置生效时机后
+  已连续通过 iter 1–8，但**单轮耗时从 ~24s 恶化到 ~4–5min**（脚本 41 分钟只跑到 iter 9）。
+  可疑机制（待验证）：`I5` 的元数据落盘被集中到 `tick()` 的锁外阶段 + `metaPersistMu_` 串行化，
+  而 `becomeFollower()` 在**每次收到更高 term 的 RPC** 都会置 `metaDirty_` —— 故障注入下任期频繁
+  更替 → ticker 反复做 meta fsync（1.4–2.8ms/次，且与 `onRequestVote` 的授权落盘争同一把叶子锁）
+  → 心跳节奏被拖慢 → 触发更多选举 → 正反馈。
+  **下一轮修法（不改正确性）**：I5 只要求"**授权投票**与**自投票**"在回复/发送前 durable，
+  `becomeFollower()` 的 term 落盘只是"尽快 durable"（崩溃只丢失 term，Raft 自愈，不违反 I3）。
+  因此把 tick 侧 flush 改为**限频**（例如 ≥50ms 一次，或用单调时间戳门控），必要时退化为
+  "不主动 flush，交由下一次授权/选举路径落盘"。改完后重跑该脚本确认单轮耗时回到 ~24s 量级。
