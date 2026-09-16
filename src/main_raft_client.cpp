@@ -383,21 +383,6 @@ int doSnapshot(Options& o) {
   return 0;
 }
 
-// Reads one reply frame from an open connection.
-bool readFrame(int fd, MsgType& type, Bytes& payload) {
-  Byte lenBuf[4];
-  if (!readFull(fd, lenBuf, sizeof(lenBuf))) return false;
-  const uint32_t len = getU32(lenBuf);
-  if (len == 0) return false;
-  Bytes body(len);
-  if (!readFull(fd, body.data(), body.size())) return false;
-  Bytes whole;
-  whole.reserve(4 + len);
-  whole.insert(whole.end(), lenBuf, lenBuf + 4);
-  whole.insert(whole.end(), body.begin(), body.end());
-  return decodeFrame(whole.data(), whole.size(), type, payload);
-}
-
 int doFill(Options& o, uint64_t n, size_t pipeline) {
   if (pipeline < 1) pipeline = 1;
   const uint64_t base = o.requestId;  // stable requestIds => idempotent retries
@@ -570,10 +555,12 @@ int doMembership(Options& o, uint8_t action, int targetId,
     if (reply.leaderHint > 0) {
       std::string h = host;
       int p = port;
-      if (resolvePeer(o, reply.leaderHint, h, p) ||
-          (!refreshed && refreshTopology(o, host, port) &&
-           resolvePeer(o, reply.leaderHint, h, p))) {
-        refreshed = true;
+      bool ok = resolvePeer(o, reply.leaderHint, h, p);
+      if (!ok && !refreshed) {  // 缓存里没有这个 Leader -> 失效重取一次
+        refreshed = refreshTopology(o, host, port);
+        ok = refreshed && resolvePeer(o, reply.leaderHint, h, p);
+      }
+      if (ok) {
         host = h;  // 重定向到 Leader 再试
         port = p;
         continue;

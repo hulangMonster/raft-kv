@@ -49,9 +49,10 @@ start_node() {
 
 cli() { "$BIN/raftkv_raft_cli" --peers "$PEERS" "$@"; }
 
+# 节点瞬时不可达时必须返回空串：脚本开了 set -e + pipefail，
+# `x="$(field ...)"` 一旦失败会静默退出（没有任何诊断）。
 field() {
-  cli --host 127.0.0.1 --port "$(node_port "$1")" status 2>/dev/null \
-    | tr ' ' '\n' | sed -n "s/^$2=//p"
+{   cli --host 127.0.0.1 --port "$(node_port "$1")" status 2>/dev/null | tr ' ' '\n' | sed -n "s/^$2=//p"; } || true
 }
 
 find_leader() {

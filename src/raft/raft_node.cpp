@@ -239,15 +239,28 @@ void RaftNode::advanceCommitAndApply() {
     lastApplied_ = next;
   }
 
-  // 配置条目一旦提交：清空在途标记与送达集合；自身被移除则让位（§5.7）
+  // 配置条目一旦提交：释放在途标记；自身被移除则让位（§5.7）
   if (inFlightConfigIndex_ != kNoIndex && commitIndex_ >= inFlightConfigIndex_) {
     inFlightConfigIndex_ = kNoIndex;
     prevConfig_ = currConfig_;
     baseConfig_ = currConfig_;  // 已提交 -> 成为新的回滚基线
-    drainingPeers_.clear();
-    // 评审 O2：提交后"被移除的节点"已经不需要再送达，必须在这里把它的每 peer 状态
-    // （nextIndex_/matchIndex_/快照发送进度）和地址簿条目一起清掉；否则这些状态要
-    // 等到下一次配置变更或 InstallSnapshot 才可能被回收（连接/内存泄漏）。
+    // 送达目标收尾（设计 v1.4(a)）：被移除的节点只有**确认收到**移除它的配置条目
+    // 才算送达完成（matchIndex >= 条目 index）；一直没确认的（例如已经下线）由
+    // 预算超时在 purgeDrainsLocked() 里放弃。非 Leader 不承担送达职责。
+    for (auto it = drainingPeers_.begin(); it != drainingPeers_.end();) {
+      const auto mit = matchIndex_.find(it->first);
+      const bool acked =
+          mit != matchIndex_.end() && mit->second >= it->second.until;
+      if (acked || role_ != Role::kLeader ||
+          clock_.nowMs() >= it->second.deadlineMs) {
+        it = drainingPeers_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    // 评审 O2：已经彻底离开配置的 peer，其每 peer 状态（nextIndex_/matchIndex_/
+    // 快照发送进度/readAcks_）与地址簿条目必须回收，否则要等到下一次配置变更或
+    // InstallSnapshot 才可能被清理（连接/内存泄漏）。
     const std::vector<int> gone = removablePeersLocked();
     for (const int id : gone) {
       erasePeerStateLocked(id);
@@ -273,6 +286,7 @@ void RaftNode::tick() {
     const uint64_t now = clock_.nowMs();
 
     if (role_ == Role::kLeader) {
+      purgeDrainsLocked();  // 送达目标确认完成/预算到期 -> 回收（O2 + 设计 v1.4(a)）
       // Raft §8: a leader must commit an entry from its own term before it
       // may advance the commit point over prior-term entries (and serve reads).
       // Append a no-op GET entry (never produced by a client) for that.
@@ -881,10 +895,11 @@ void RaftNode::rebuildConfigFromSeedAndLog() {
     inFlightConfigIndex_ = e.index;
   }
   if (inFlightConfigIndex_ != kNoIndex) {
-    // 配置条目提交前仍要送达被移除的节点（设计 §5.2 送达集合）
+    // 配置条目确认送达前，被移除的节点仍是复制目标（设计 §5.2 / v1.4(a)）
+    const uint64_t deadline = clock_.nowMs() + cfg_.catchUpTimeoutMs;
     for (const Member& m : prevConfig_.members) {
       if (m.id != cfg_.selfId && !currConfig_.contains(m.id)) {
-        drainingPeers_.push_back(m.id);
+        drainingPeers_[m.id] = DrainState{inFlightConfigIndex_, deadline};
       }
     }
   }
@@ -932,7 +947,8 @@ std::vector<int> RaftNode::replicationTargetsLocked() const {
       out.push_back(kv.first);
     }
   }
-  for (const int id : drainingPeers_) {
+  for (const auto& kv : drainingPeers_) {
+    const int id = kv.first;
     if (id != cfg_.selfId && !currConfig_.contains(id) &&
         pendingPeers_.count(id) == 0 &&
         std::find(out.begin(), out.end(), id) == out.end()) {
@@ -958,11 +974,8 @@ std::vector<int> RaftNode::removablePeersLocked() const {
   for (const auto& kv : nextIndex_) {
     const int id = kv.first;
     if (id == cfg_.selfId || currConfig_.contains(id)) continue;
-    if (pendingPeers_.count(id) != 0) continue;  // CatchUp 目标：保留
-    if (std::find(drainingPeers_.begin(), drainingPeers_.end(), id) !=
-        drainingPeers_.end()) {
-      continue;  // 配置条目提交前仍要送达
-    }
+    if (pendingPeers_.count(id) != 0) continue;      // CatchUp 目标：保留
+    if (drainingPeers_.count(id) != 0) continue;     // 送达目标：确认/超时前保留
     gone.push_back(id);
   }
   return gone;
@@ -1000,10 +1013,11 @@ void RaftNode::adoptConfigLocked(const ClusterConfig& sc, Index inFlightIndex,
     }
   }
   drainingPeers_.clear();
-  if (computeDraining) {  // 被移除的节点：配置条目提交前仍要送达
+  if (computeDraining) {  // 被移除的节点：确认收到该配置条目之前仍要送达
+    const uint64_t deadline = clock_.nowMs() + cfg_.catchUpTimeoutMs;
     for (const Member& m : old.members) {
       if (m.id != cfg_.selfId && !currConfig_.contains(m.id)) {
-        drainingPeers_.push_back(m.id);
+        drainingPeers_[m.id] = DrainState{inFlightIndex, deadline};
       }
     }
   }
@@ -1052,9 +1066,10 @@ void RaftNode::recomputeConfigLocked() {
   // 配置条目提交前仍然要收到复制，否则它可能永远学不到"自己被移除"。
   drainingPeers_.clear();
   if (inFlightConfigIndex_ != kNoIndex) {
+    const uint64_t deadline = clock_.nowMs() + cfg_.catchUpTimeoutMs;
     for (const Member& m : prevConfig_.members) {
       if (m.id != cfg_.selfId && !currConfig_.contains(m.id)) {
-        drainingPeers_.push_back(m.id);
+        drainingPeers_[m.id] = DrainState{inFlightConfigIndex_, deadline};
       }
     }
   }
@@ -1111,6 +1126,28 @@ void RaftNode::drainPeerQueues() {
   }
   for (const auto& a : adds) transport_.addPeer(a.first, a.second);
   for (const int id : removes) transport_.removePeer(id);
+}
+
+// 送达目标收尾：已经确认收到移除条目的、或超出送达预算的，移出复制目标并回收
+// 每 peer 状态（评审 O2 + 设计 v1.4(a)）。Leader 每个 tick 调用一次（持锁）。
+void RaftNode::purgeDrainsLocked() {
+  if (drainingPeers_.empty()) return;
+  bool changed = false;
+  for (auto it = drainingPeers_.begin(); it != drainingPeers_.end();) {
+    const auto mit = matchIndex_.find(it->first);
+    const bool acked = mit != matchIndex_.end() && mit->second >= it->second.until;
+    if (acked || clock_.nowMs() >= it->second.deadlineMs) {
+      it = drainingPeers_.erase(it);
+      changed = true;
+    } else {
+      ++it;
+    }
+  }
+  if (!changed) return;
+  for (const int id : removablePeersLocked()) {
+    erasePeerStateLocked(id);
+    peerRemoveQueue_.push_back(id);  // 锁外摘除（L10）
+  }
 }
 
 // add 的前置：把新节点追平到"拥有本节点全部日志"（非投票、不计多数派）。

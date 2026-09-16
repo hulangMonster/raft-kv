@@ -36,7 +36,7 @@ start_node() { # <id> <peers>
 
 cli() { "$BIN/raftkv_raft_cli" --peers "$PEERS4" "$@"; }
 status_of() { cli --host 127.0.0.1 --port "$(node_port "$1")" status 2>/dev/null; }
-field() { status_of "$1" | tr ' ' '\n' | sed -n "s/^$2=//p"; }
+field() { { status_of "$1" | tr ' ' '\n' | sed -n "s/^$2=//p"; } || true; }
 find_leader() {
   for id in 1 2 3 4; do
     [[ -n "${PIDS[$id]:-}" ]] || continue

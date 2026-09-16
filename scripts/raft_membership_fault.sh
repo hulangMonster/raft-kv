@@ -39,7 +39,7 @@ start_node() { # <id> <peers>
 
 cli() { "$BIN/raftkv_raft_cli" --peers "$PEERS6" "$@"; }
 status_of() { cli --host 127.0.0.1 --port "${PORT[$1]}" status 2>/dev/null; }
-field() { status_of "$1" | tr ' ' '\n' | sed -n "s/^$2=//p"; }
+field() { { status_of "$1" | tr ' ' '\n' | sed -n "s/^$2=//p"; } || true; }
 alive() { [[ -n "${PIDS[$1]:-}" ]] && kill -0 "${PIDS[$1]}" 2>/dev/null; }
 
 find_leader() {
@@ -77,6 +77,11 @@ wait_config_converged() {
     done
     (( ok == 1 )) && return 0
     sleep 0.05
+  done
+  # 超时：打印每个存活节点的视图（否则只能看到"未收敛"，无法定位）
+  for id in 1 2 3 4 5 6; do
+    alive "$id" || continue
+    echo "  node$id: cv=$(field "$id" config_version) members=$(field "$id" members) role=$(field "$id" role) retired=$(field "$id" retired)" >&2
   done
   return 1
 }

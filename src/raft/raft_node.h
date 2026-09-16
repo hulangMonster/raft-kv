@@ -108,6 +108,7 @@ class RaftNode {
   ClientReply awaitCommit(Index index, Term term, uint64_t timeoutMs);
   bool catchUpPeer(int peerId, uint64_t timeoutMs);
   void drainPeerQueues();                          // L10：锁外执行地址簿更新
+  void purgeDrainsLocked();                        // 送达目标：确认完成/预算到期 -> 回收
   bool readQuorumLocked(uint64_t seq) const;       // ReadIndex 多数派（M4.4）
   // M4 评审 B5：§8 读屏障——commitIndex_ 处的条目是否属于当前任期
   bool hasCurrentTermCommitLocked() const;
@@ -126,7 +127,14 @@ class RaftNode {
   std::unordered_map<int, std::string> pendingPeers_;  // M4: CatchUp 目标（非投票、不计多数派）
   std::vector<std::pair<int, std::string>> peerAddQueue_;  // M4: 待注册地址（锁外执行）
   std::vector<int> peerRemoveQueue_;                       // M4: 待摘除节点（锁外执行）
-  std::vector<int> drainingPeers_;      // M4: C_old 有、C_new 无的节点；配置条目提交前仍要送达
+  // M4 设计 v1.4(a) / 评审 O2：C_old 有、C_new 无的节点在**确认收到**移除它的配置
+  // 条目之前仍是复制目标（否则它会一直自认成员、靠不断竞选抬高任期搅乱集群）；
+  // 超过预算仍未确认则放弃（不能让一个彻底下线的节点长期占着复制目标与连接）。
+  struct DrainState {
+    Index until = kNoIndex;   // 需要它确认收到的配置条目 index
+    uint64_t deadlineMs = 0;  // 放弃时刻（clock_ 时间轴）
+  };
+  std::unordered_map<int, DrainState> drainingPeers_;
   // M4 评审 B6：成员变更串行化（覆盖 CatchUp 阶段，见 changeMembership）
   std::mutex membershipMu_;
   uint64_t readSeq_ = 0;                            // M4.4: ReadIndex 探针序号（单调）

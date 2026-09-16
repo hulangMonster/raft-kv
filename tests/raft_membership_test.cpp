@@ -189,6 +189,9 @@ class GatedTransport : public MemoryTransport {
 // "配置条目提交后被移除的节点真的被回收了"（评审 O2）。
 class PeerBookTransport : public MemoryTransport {
  public:
+  // 丢掉来自指定 peer 的 AppendEntries 回包：它能收到条目，但永远不被计为 ack
+  void dropRepliesFrom(const std::vector<int>& ids) { dropIds_ = ids; }
+
   void removePeer(int id) override {
     {
       std::lock_guard<std::mutex> lk(mu_);
@@ -199,9 +202,16 @@ class PeerBookTransport : public MemoryTransport {
 
   void sendAppendEntries(int peerId, const AppendEntriesArgs& args,
                          AppendCb cb) override {
+    bool drop = false;
     {
       std::lock_guard<std::mutex> lk(mu_);
       ++sends_[peerId];
+      drop = std::find(dropIds_.begin(), dropIds_.end(), peerId) != dropIds_.end();
+    }
+    if (drop) {
+      MemoryTransport::sendAppendEntries(peerId, args,
+                                         [](const AppendEntriesReply&) {});
+      return;
     }
     MemoryTransport::sendAppendEntries(peerId, args, std::move(cb));
   }
@@ -220,6 +230,7 @@ class PeerBookTransport : public MemoryTransport {
   mutable std::mutex mu_;
   std::set<int> removed_;
   std::map<int, int> sends_;
+  std::vector<int> dropIds_;
 };
 
 // ---- 评审批 1 新增测试桩 ----
@@ -1411,7 +1422,7 @@ TEST(RaftMembership, A27_ConcurrentMembershipChangesAreSerialized) {
   };
 
   std::thread t1(job, 4);
-  for (int i = 0; i < 500 && transport->blockedDistinctPeers() < 1; ++i) {
+  for (int i = 0; i < 1500 && transport->blockedDistinctPeers() < 1; ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
   ASSERT_EQ(transport->blockedDistinctPeers(), 1u);  // 第一个变更已在 CatchUp 中
@@ -1479,6 +1490,34 @@ TEST(RaftMembership, A28_RemovedPeerIsReclaimedAfterCommit) {
   EXPECT_GT(transport->sendsTo(alive), 0);
   EXPECT_FALSE(transport->wasRemoved(alive));
   EXPECT_FALSE(leader->clusterConfig().contains(victim));
+}
+
+TEST(RaftMembership, A29_RemovedPeerKeepsReceivingUntilItAcks) {
+  // 设计 v1.4(a) / 评审 O2：被移除的节点必须**确认收到**移除它的配置条目，否则它
+  // 会一直自认成员、靠不断竞选抬高任期搅乱集群。"配置条目提交"不等于"送达完成"。
+  auto transport = std::make_shared<PeerBookTransport>();
+  auto c = test::makeMembershipClusterWith(3, /*appendNoop=*/true, 1000000, 64,
+                                           transport);
+  test::driveTicks(*c, 60, 10);
+  RaftNode* leader = test::findLeader(*c);
+  ASSERT_NE(leader, nullptr);
+  const int lid = leader->leaderId();
+  const int victim = (lid == 3) ? 2 : 3;
+
+  // victim 的回包全丢：它能收到条目，但 leader 永远拿不到它的 ack
+  transport->dropRepliesFrom({victim});
+  ASSERT_EQ(leader->changeMembership(MembershipOp::kRemove, victim, "", 2000)
+                .status,
+            ClientStatus::kOk);  // C_old/C_new 两个多数派由 leader + 另一个 follower 满足
+  test::driveTicks(*c, 5, 10);
+  ASSERT_FALSE(leader->clusterConfig().contains(victim));  // 已生效
+
+  // 已提交但未被确认 -> 必须继续送达
+  const int afterCommit = transport->sendsTo(victim);
+  test::driveTicks(*c, 100, 10);
+  EXPECT_GT(transport->sendsTo(victim), afterCommit);
+  // 未被确认前不得把它从地址簿摘掉（否则它永远学不到自己被移除）
+  EXPECT_FALSE(transport->wasRemoved(victim));
 }
 
 // ================================ B 组 ================================
