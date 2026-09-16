@@ -274,9 +274,14 @@ int main(int argc, char** argv) {
   std::string peersArg;
   std::string dataDir;
   bool lockWaitMetrics = false;  // M5.1: 打开锁等待计时（默认关，零开销）
-  // M5.3：默认使用 Reactor 异步引擎（设计决策③）。实测其通过了全部 e2e + fault --repeat 50，
-  // 且修掉了同步引擎在成员变更收尾步骤的超时错配；--transport=sync 保留为回退路径。
-  bool useReactor = true;
+  // M5.3：Reactor 引擎**尚未作为默认**。它在 e2e/故障注入下全通过，但在 p=64 高并发基准里
+  // 仍出现 1-2 条"已 ack 的写不可见"（missing != 0）—— 根因是应答缺少关联号：
+  // `onAppendEntriesReply` 用 `lastSentEndIndex_[peer]` 归因，只要"迟到应答"落在下一批发送之后
+  // （门控超时 2*rpcTimeoutMs 后允许重发），归因就会错配 -> matchIndex_ over-count -> 丢写。
+  // 彻底修法（下一轮）：在 AppendEntries/InstallSnapshot 请求里带单调 seq，并在应答里回显，
+  // 用 (peer, seq) -> sentEndIndex 精确配对（只增字段，不动既有语义）。
+  // 在那之前默认走 sync（M2/M3/M4 已验证路径），reactor 用 --transport=reactor 显式开启。
+  bool useReactor = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];

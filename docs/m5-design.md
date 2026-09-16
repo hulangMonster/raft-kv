@@ -443,3 +443,28 @@ TSan（全量 raft 用例 + `raft_perf_test`）必须 0 报告；注入用例：
   `becomeFollower()` 的 term 落盘只是"尽快 durable"（崩溃只丢失 term，Raft 自愈，不违反 I3）。
   因此把 tick 侧 flush 改为**限频**（例如 ≥50ms 一次，或用单调时间戳门控），必要时退化为
   "不主动 flush，交由下一次授权/选举路径落盘"。改完后重跑该脚本确认单轮耗时回到 ~24s 量级。
+
+- **v1.5**（M5.3 落地 + 完整 A/B 后回填；含一条**未关闭的阻断项**）：
+  1. **Reactor 已实现并接入**（`reactor.{h,cpp}` + `transport_reactor.{h,cpp}` + 契约用例 R1–R5 +
+     `--transport=reactor|sync`）；TSan 全绿（0 警告，含异步引擎的并发面）。
+  2. **⚠️ 未关闭的阻断项（M5.3 完成判据未达成）**：完整 A/B 在 **pipeline=64** 下复现
+     `verify missing 1–2` —— **已 ack 的写不可见**。根因是**应答缺少关联号**：M2 的
+     `onAppendEntriesReply` 用 `lastSentEndIndex_[peer]`（"最近一次发送的末尾 index"）归因，
+     这只在"同步发送"（sendX 返回时已拿到应答）下成立。异步引擎即使加了"每 peer 单批在途"
+     门控（超时 2×rpcTimeoutMs 后允许重发），仍存在**迟到应答落在下一批发送之后**的窗口 ->
+     归因错配 -> `matchIndex_` over-count -> leader 认为已复制到多数派并 ack。
+     **彻底修法（下一轮第一件事）**：在 `AppendEntries`/`InstallSnapshot` 请求里携带单调 `seq`，
+     应答原样回显；用 `(peer, seq) -> sentEndIndex` 精确配对（**只增字段**：新 msgType 16/17 或在
+     现有布局尾部追加，保留旧解码路径与 RKS1 兼容）。修完必须重跑：A5/A6 + reactor 侧新增
+     "迟到应答"用例 + `fill 20000 --pipeline 64` ×3 次 `missing 0` + 全部 e2e/fault。
+     在此之前**默认引擎保持 sync**（`--transport=reactor` 显式开启），避免把带丢写风险的引擎
+     作为默认配置交付。
+  3. **性能现状（完整 A/B，3 次中位数，同一次脚本交替测量；本机当时状态比冻结基线时慢约 2×）**：
+     M4 基线 p=1 33.9 ms/写(30 qps) / p=8 8.7(115) / p=64 2.15(464)；
+     M5(sync) p=1 25.7(39) / p=8 7.64(131) / p=64 待重测（本次 M5 列因丢写作废）。
+     => **相对改善成立**（p=1 延迟 0.76×、p=8 延迟 0.87×/吞吐 1.15×），但**绝对验收数字未达成**
+     （目标 p=1 ≤8 ms/写、p=64 ≥1200 qps）。机器状态漂移（同一 M4 基线从冻结时的 15.05 ms/写
+     漂到 33.9 ms/写）是主因之一，必须按 §10 的"同轮交替"口径判定，并在 M5.5 重新冻结目标口径
+     或明确记录未达成。
+  4. **另有一处崩溃待查**：A/B 过程中出现 2 次 node `SIGSEGV`（core dumped），发生在两次压测之间，
+     未影响该轮的 `verify` 结果（3 节点有 2 个存活即可提交）。下一轮用 ASan 构建复现并定位。
