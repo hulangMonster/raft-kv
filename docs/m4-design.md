@@ -1,6 +1,6 @@
 # M4 设计文档：集群成员变更 + 客户端路由（线性一致读）
 
-> 状态：**设计定稿 v1.1（v1.0 已获用户批准；#1 前置校验回退修订，见 §12）**
+> 状态：**设计定稿 v1.2（v1.0 已获用户批准；v1.1 = #1 回退修订，v1.2 = #2 澄清退役态，见 §12）**
 > 关联：[roadmap.md](roadmap.md)（M4 验收口径）· [m2-design.md](m2-design.md) · [m2-prerequisites.md](m2-prerequisites.md) ·
 > [m3-design.md](m3-design.md)（v1.3 §12）· [m3-prerequisites.md](m3-prerequisites.md) · [protocol.md](protocol.md) · [code-review.md](code-review.md)
 > 冻结方式：本文件由 #0 brainstorming 产出（决策 ①–⑧ 见 §3）。**批准后不得擅自偏离**；若 #1/#3 发现设计缺陷，回退 #0 修订并记录版本。
@@ -259,7 +259,9 @@ v2（M4）: 在 v1 之后追加
 2. 若 `SnapshotStore::load()` 成功且 **快照携带配置** → 用其配置（`version = 快照内的 configVersion`）；
 3. `log_.load()` 后**重放日志中的配置条目**（按 index 升序），逐条覆盖内存配置；
 4. 校验单调性（J3）：任何版本**小于**当前版本的配置一律拒绝并记日志；启动时若发现日志中的配置版本小于快照配置版本 → **拒绝启动**（拓扑回退必须显式暴露，禁止静默降级）；
-5. 自身不在配置中 → 以**退役态**启动（只读 status/config）。
+5. 自身不在配置中（被移除，或作为 CatchUp 新节点尚未入配置）→ **退役/非投票态**：
+   不竞选、不接受写请求，但**必须继续接收 AppendEntries / InstallSnapshot**
+   （否则既无法被重新加入，也无法完成 CatchUp），并仍响应 status / config（v1.2 澄清，见 §12）。
 
 ### 5.2 配置条目的生命周期
 
@@ -461,3 +463,4 @@ linearizableGet(key, timeoutMs):
 
 - **v1.0**（#0 brainstorming）：首次定稿。决策①–⑧ 全部选定；新增不变量 J1–J5；锁纪律新增 L10/L11；快照格式升级 RKS1 v2（兼容 v1）。
 - **v1.1**（#1 verification-before-completion）：修正 §4.2 的 op 白名单范围——只需扩展 `decodeLogEntry` 与 `FileLogStore::decodeEntry` 两处；`decodeClientRequest` 保持不变，作为“客户端不可伪造配置条目”的安全边界。依据：m4-prerequisites.md §7.3。
+- **v1.2**（#2 TDD 测试先行时澄清）：统一 未入配置 / 被移除 节点的行为边界——不竞选、不接受写，但**继续接收复制**。§5.1 第 5 步原写 只读 status/config 会被误读为拒绝复制，与决策④ 的 CatchUp 流程冲突。对应用例：A4、A10、A16。
