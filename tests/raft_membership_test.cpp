@@ -693,6 +693,44 @@ TEST(RaftMembership, A17_ConfigMessageCodec) {
   EXPECT_FALSE(decodeConfigReply(pe.data(), pe.size() - 1, repOut));
 }
 
+TEST(RaftMembership, A18_InstalledSnapshotCarriesConfig) {
+  // 配置条目被 compact 掉之后，靠 InstallSnapshot 追平的节点只能从快照里学到拓扑
+  auto c = test::makeMembershipCluster(3, /*appendNoop=*/true, /*threshold=*/8);
+  test::driveTicks(*c, 60, 10);
+  RaftNode* leader = test::findLeader(*c);
+  ASSERT_NE(leader, nullptr);
+  const int lid = leader->leaderId();
+  const int lagId = (lid == 3) ? 2 : 3;
+
+  // 让 lagId 掉队，其余节点完成一次成员变更
+  c->transport->isolate(lagId);
+  ExtraNode n4;
+  attachExtraNode(*c, 4, n4, test::makeSeedConfig(3));
+  ASSERT_EQ(leader->changeMembership(MembershipOp::kAdd, 4, "127.0.0.1:7004",
+                                     2000)
+                .status,
+            ClientStatus::kOk);
+  for (int i = 1; i <= 20; ++i) {
+    leader->propose(putReq(static_cast<uint64_t>(i), "k" + std::to_string(i), "v"),
+                    1000);
+  }
+  leader->triggerSnapshot();
+  test::driveTicks(*c, 120, 10);
+
+  test::TestNode& ltn = c->nodes[static_cast<size_t>(lid - 1)];
+  ASSERT_GT(ltn.log->lastIncludedIndex(), static_cast<Index>(0));  // 已 compact
+  const uint64_t ver = leader->configVersion();
+  ASSERT_GT(ver, static_cast<uint64_t>(0));
+
+  // lagId 回来：落后于快照边界 -> 只能经 InstallSnapshot 追平，并继承快照里的配置
+  c->transport->heal(lagId);
+  test::driveTicks(*c, 600, 10);
+  RaftNode* lag = c->nodes[static_cast<size_t>(lagId - 1)].node.get();
+  EXPECT_GT(lag->lastIncludedIndex(), static_cast<Index>(0));
+  EXPECT_EQ(lag->configVersion(), ver);
+  EXPECT_TRUE(lag->clusterConfig().isVoting(4));
+}
+
 // ================================ B 组 ================================
 
 TEST(RaftMembershipDisk, B1_ConfigPersistsAcrossRestart) {

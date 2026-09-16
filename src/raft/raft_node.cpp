@@ -71,6 +71,14 @@ RaftNode::RaftNode(RaftConfig cfg, LogStore& log, StateMachine& sm,
       lastIncludedTerm_ = snap.lastIncludedTerm;
       lastApplied_ = snap.lastIncludedIndex;
       commitIndex_ = snap.lastIncludedIndex;
+      // M4.3：快照携带配置 -> 作为恢复基线（优先于 seed；日志中的配置条目随后再推进）
+      if (!snap.config.empty()) {
+        ClusterConfig sc;
+        if (!decodeClusterConfig(snap.config.data(), snap.config.size(), sc)) {
+          throw std::runtime_error("raft: undecodable cluster config in snapshot");
+        }
+        currConfig_ = sc;
+      }
       // D3: the boundary must be known before load() validates firstIndex().
       log_.setBoundary(snap.lastIncludedIndex, snap.lastIncludedTerm);
       snapshotBytes_ = encodeSnapshotFile(snap);
@@ -623,6 +631,7 @@ void RaftNode::maybeSnapshot() {
   std::shared_ptr<const SnapshotView> view;
   Index snapIndex = kNoIndex;
   Term snapTerm = kNoTerm;
+  ClusterConfig snapConfig;  // M4.3：随快照持久化，否则安装后拓扑丢失
   uint64_t epoch = 0;
 
   {
@@ -640,6 +649,7 @@ void RaftNode::maybeSnapshot() {
     snapTerm = log_.termAt(snapIndex);
     if (snapIndex == kNoIndex || snapTerm == kNoTerm) return;  // nothing yet
     epoch = installEpoch_;
+    snapConfig = currConfig_;   // 内存拷贝（无序列化/IO，符合 L8）
     view = sm_.snapshotView();  // memory copy only, no serialization (L8)
   }
   if (!view) return;
@@ -649,6 +659,7 @@ void RaftNode::maybeSnapshot() {
   data.lastIncludedIndex = snapIndex;
   data.lastIncludedTerm = snapTerm;
   data.payload = view->serialize();
+  data.config = encodeClusterConfig(snapConfig);  // 锁外序列化（L8）
   if (!snapshots_->save(data)) return;
   Bytes encoded = encodeSnapshotFile(data);  // outside the lock (L8)
 
@@ -738,6 +749,15 @@ InstallSnapshotReply RaftNode::onInstallSnapshot(const InstallSnapshotArgs& args
       throw std::runtime_error("raft: log compaction failed (InstallSnapshot)");
     }
     ++installEpoch_;  // B5: invalidates any in-flight maybeSnapshot() save
+    // M4.3：安装快照即继承其配置（覆盖该边界的配置条目已被 compact 掉）
+    if (!installed.config.empty()) {
+      ClusterConfig sc;
+      if (decodeClusterConfig(installed.config.data(), installed.config.size(),
+                              sc) &&
+          sc.version > currConfig_.version) {
+        adoptConfigLocked(sc, kNoIndex, /*computeDraining=*/false);
+      }
+    }
     lastIncluded_ = installed.lastIncludedIndex;
     lastIncludedTerm_ = installed.lastIncludedTerm;
     snapshotBytes_ = std::move(encoded);
@@ -760,7 +780,9 @@ InstallSnapshotReply RaftNode::onInstallSnapshot(const InstallSnapshotArgs& args
 // 启动配置重建：seed（--peers）-> 日志中的配置条目（按 index 升序）。
 // J3：版本严格单调；任何回退都视为日志损坏 -> 拒绝启动。
 void RaftNode::rebuildConfigFromSeedAndLog() {
-  currConfig_ = seedConfig_;
+  if (currConfig_.members.empty()) {  // 快照已提供配置时保持不变
+    currConfig_ = seedConfig_;
+  }
   if (currConfig_.members.empty()) {
     // 未提供 seed（M2/M3 风格调用点）-> 退化为 cfg_.peerIds（无地址），version = 0
     currConfig_.version = 0;
@@ -872,48 +894,53 @@ void RaftNode::applyAppendedConfigLocked(const std::vector<LogEntry>& appended) 
     }
     if (c.version <= currConfig_.version) continue;  // J3：更小版本不得生效
 
-    const ClusterConfig old = currConfig_;
-    prevConfig_ = old;
-    currConfig_ = c;
-    inFlightConfigIndex_ = e.index;
+    adoptConfigLocked(c, e.index, /*computeDraining=*/true);
+  }
+}
 
-    // 已在配置中的 CatchUp 目标转为正式成员
-    for (auto it = pendingPeers_.begin(); it != pendingPeers_.end();) {
-      if (currConfig_.contains(it->first)) {
-        it = pendingPeers_.erase(it);
-      } else {
-        ++it;
-      }
+// 切换配置后的统一收尾（配置条目追加 / 安装快照 共用）：
+// 清理 CatchUp 登记、计算送达集合、注册新地址（锁外）、清理彻底离开的节点状态。
+void RaftNode::adoptConfigLocked(const ClusterConfig& sc, Index inFlightIndex,
+                                 bool computeDraining) {
+  const ClusterConfig old = currConfig_;
+  prevConfig_ = old;
+  currConfig_ = sc;
+  inFlightConfigIndex_ = inFlightIndex;
+
+  for (auto it = pendingPeers_.begin(); it != pendingPeers_.end();) {
+    if (currConfig_.contains(it->first)) {
+      it = pendingPeers_.erase(it);
+    } else {
+      ++it;
     }
-    // 被移除的节点：配置条目提交前仍要送达（否则它永远不知道自己被移除）
-    drainingPeers_.clear();
+  }
+  drainingPeers_.clear();
+  if (computeDraining) {  // 被移除的节点：配置条目提交前仍要送达
     for (const Member& m : old.members) {
       if (m.id != cfg_.selfId && !currConfig_.contains(m.id)) {
         drainingPeers_.push_back(m.id);
       }
     }
-    // 新成员地址：出锁后注册（L10）
-    for (const Member& m : currConfig_.members) {
-      if (m.id != cfg_.selfId && !m.addr.empty()) {
-        peerAddQueue_.emplace_back(m.id, m.addr);
-      }
+  }
+  for (const Member& m : currConfig_.members) {  // 新成员地址：出锁后注册（L10）
+    if (m.id != cfg_.selfId && !m.addr.empty()) {
+      peerAddQueue_.emplace_back(m.id, m.addr);
     }
-    // 彻底离开（不在新配置、也不在 CatchUp/送达集合）的节点：清理每 peer 状态
-    std::vector<int> gone;
-    for (const auto& kv : nextIndex_) {
-      const int id = kv.first;
-      if (id == cfg_.selfId || currConfig_.contains(id)) continue;
-      if (pendingPeers_.count(id) != 0) continue;
-      if (std::find(drainingPeers_.begin(), drainingPeers_.end(), id) !=
-          drainingPeers_.end()) {
-        continue;
-      }
-      gone.push_back(id);
+  }
+  std::vector<int> gone;
+  for (const auto& kv : nextIndex_) {
+    const int id = kv.first;
+    if (id == cfg_.selfId || currConfig_.contains(id)) continue;
+    if (pendingPeers_.count(id) != 0) continue;
+    if (std::find(drainingPeers_.begin(), drainingPeers_.end(), id) !=
+        drainingPeers_.end()) {
+      continue;
     }
-    for (const int id : gone) {
-      erasePeerStateLocked(id);
-      peerRemoveQueue_.push_back(id);
-    }
+    gone.push_back(id);
+  }
+  for (const int id : gone) {
+    erasePeerStateLocked(id);
+    peerRemoveQueue_.push_back(id);
   }
 }
 

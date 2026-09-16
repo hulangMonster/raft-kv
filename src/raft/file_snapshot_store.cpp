@@ -100,34 +100,53 @@ void fsyncDir(const std::string& dir) {
 }  // namespace
 
 Bytes encodeSnapshotFile(const SnapshotData& d) {
+  // v1 = 无配置段；v2 = payload 之后追加 [configLen:4][configCrc:4][config]（M4.3）
+  const bool withConfig = !d.config.empty();
   Bytes out;
-  out.reserve(kFileHeaderLen + d.payload.size());
+  out.reserve(kFileHeaderLen + d.payload.size() + 8 + d.config.size());
   out.push_back('R');
   out.push_back('K');
   out.push_back('S');
   out.push_back('1');
-  out.push_back(0x01);
+  out.push_back(withConfig ? 0x02 : 0x01);
   putU64(out, d.lastIncludedIndex);
   putU64(out, d.lastIncludedTerm);
   putU32(out, static_cast<uint32_t>(d.payload.size()));
   putU32(out, crc32(d.payload.data(), d.payload.size()));
   out.insert(out.end(), d.payload.begin(), d.payload.end());
+  if (withConfig) {
+    putU32(out, static_cast<uint32_t>(d.config.size()));
+    putU32(out, crc32(d.config.data(), d.config.size()));
+    out.insert(out.end(), d.config.begin(), d.config.end());
+  }
   return out;
 }
 
 bool decodeSnapshotFile(const Byte* bytes, size_t n, SnapshotData& out) {
-  if (n < kFileHeaderLen) return false;
+  if (bytes == nullptr || n < kFileHeaderLen) return false;
   if (std::memcmp(bytes, "RKS1", 4) != 0) return false;
-  if (bytes[4] != 0x01) return false;
+  const uint8_t ver = bytes[4];
+  if (ver != 0x01 && ver != 0x02) return false;  // v1（M3）必须继续可解
 
   out.lastIncludedIndex = getU64(bytes + 5);
   out.lastIncludedTerm = getU64(bytes + 13);
   const uint32_t payloadLen = getU32(bytes + 21);
   const uint32_t crc = getU32(bytes + 25);
-  if (kFileHeaderLen + payloadLen != n) return false;
+  const size_t payloadEnd = kFileHeaderLen + payloadLen;
+  if (ver == 0x01) {
+    if (n != payloadEnd) return false;
+    out.config.clear();  // v1：未携带配置
+  } else {
+    if (n < payloadEnd + 8) return false;
+    const uint32_t configLen = getU32(bytes + payloadEnd);
+    const uint32_t configCrc = getU32(bytes + payloadEnd + 4);
+    if (n != payloadEnd + 8 + configLen) return false;
+    const Byte* cp = bytes + payloadEnd + 8;
+    if (crc32(cp, configLen) != configCrc) return false;
+    out.config.assign(cp, cp + configLen);
+  }
   if (crc32(bytes + kFileHeaderLen, payloadLen) != crc) return false;
-
-  out.payload.assign(bytes + kFileHeaderLen, bytes + n);
+  out.payload.assign(bytes + kFileHeaderLen, bytes + kFileHeaderLen + payloadLen);
   return true;
 }
 

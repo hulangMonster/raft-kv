@@ -95,6 +95,8 @@ class RaftNode {
   std::vector<int> replicationTargetsLocked() const;   // 配置成员 ∪ CatchUp 目标
   void erasePeerStateLocked(int peerId);
   void applyAppendedConfigLocked(const std::vector<LogEntry>& appended);
+  void adoptConfigLocked(const ClusterConfig& sc, Index inFlightIndex,
+                         bool computeDraining);
   PeerJob buildPeerJobLocked(int peer);
   bool catchUpPeer(int peerId, uint64_t timeoutMs);
   void drainPeerQueues();                          // L10：锁外执行地址簿更新
