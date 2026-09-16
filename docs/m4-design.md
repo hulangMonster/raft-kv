@@ -410,8 +410,8 @@ linearizableGet(key, timeoutMs):
 
 | 阶段 | 内容 | 通过判据（必须附实测输出） |
 |---|---|---|
-| **M4.1** | `ClusterConfig`/`Member` + 配置条目编解码/持久化/恢复 + `kConfigRequest/Reply(get)` + `status` 扩展 | A1–A3、B1 |
-| **M4.2** | `add`/`remove`（CatchUp + 双重多数派 + 生效 + 清理 + 退役） | A4–A11、A16 |
+| **M4.1** | `ClusterConfig`/`Member` + 配置条目编解码/持久化/恢复 + 启动配置重建（seed → 日志配置条目）+ 7/8 配置消息编解码 | A1、A3、A11、A17（v1.3 调整） |
+| **M4.2** | `add`/`remove`（CatchUp + 双重多数派 + 生效 + 清理 + 退役） | A2、A4–A10、A15、A16、B1、B3（B3 在 M4.1 为平凡通过，M4.2 起为真实断言） |
 | **M4.3** | 快照携带配置（RKS1 v2）+ 恢复顺序 + compact 后拓扑 | A12、B2–B4 |
 | **M4.4** | `kReadProbe/Reply` + ReadIndex + 客户端拓扑缓存与路由 | A13–A15 |
 | **M4.5** | 5 节点在线增删 + 故障注入 + 观测字段 + 稳定性 | `raft_membership_e2e.sh`、`raft_membership_fault.sh --repeat 50` 全通 |
@@ -464,3 +464,4 @@ linearizableGet(key, timeoutMs):
 - **v1.0**（#0 brainstorming）：首次定稿。决策①–⑧ 全部选定；新增不变量 J1–J5；锁纪律新增 L10/L11；快照格式升级 RKS1 v2（兼容 v1）。
 - **v1.1**（#1 verification-before-completion）：修正 §4.2 的 op 白名单范围——只需扩展 `decodeLogEntry` 与 `FileLogStore::decodeEntry` 两处；`decodeClientRequest` 保持不变，作为“客户端不可伪造配置条目”的安全边界。依据：m4-prerequisites.md §7.3。
 - **v1.2**（#2 TDD 测试先行时澄清）：统一 未入配置 / 被移除 节点的行为边界——不竞选、不接受写，但**继续接收复制**。§5.1 第 5 步原写 只读 status/config 会被误读为拒绝复制，与决策④ 的 CatchUp 流程冲突。对应用例：A4、A10、A16。
+- **v1.3**（M4.1 落地时调整里程碑映射）：`kConfigRequest/Reply` 的**节点分发与 status 扩展**移到 M4.4（与客户端路由同期，才有真实消费者）；`B1`（重启后配置存活）依赖真实成员变更，移到 M4.2；M4.1 增加 A17（7/8 消息编解码往返）。

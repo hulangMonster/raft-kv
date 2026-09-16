@@ -268,25 +268,74 @@ bool decodeClientReply(const Byte* d, size_t n, ClientReply& out) {
 }
 
 // ---- M4 scaffolding: 7/8 配置消息与 9/14 读探针（实现见 M4.1/M4.4）----
+// msgType 7: [action:1][targetId:4][addrLen:2][addr]
 Bytes encodeConfigRequest(const ConfigRequestArgs& args) {
-  (void)args;
-  return Bytes{};
+  Bytes p;
+  p.reserve(7 + args.addr.size());
+  p.push_back(args.action);
+  putU32(p, static_cast<uint32_t>(args.targetId));
+  const uint16_t alen = static_cast<uint16_t>(args.addr.size());
+  p.push_back(static_cast<Byte>((alen >> 8) & 0xff));
+  p.push_back(static_cast<Byte>(alen & 0xff));
+  p.insert(p.end(), args.addr.begin(), args.addr.end());
+  return p;
 }
 bool decodeConfigRequest(const Byte* data, size_t n, ConfigRequestArgs& out) {
-  (void)data;
-  (void)n;
-  (void)out;
-  return false;
+  if (data == nullptr || n < 7) return false;
+  const uint16_t alen =
+      static_cast<uint16_t>((static_cast<uint16_t>(data[5]) << 8) | data[6]);
+  if (n != static_cast<size_t>(7) + alen) return false;
+  out.action = data[0];
+  out.targetId = static_cast<int>(getU32(data + 1));
+  out.addr.assign(reinterpret_cast<const char*>(data + 7), alen);
+  return true;
 }
+// msgType 8: [term:8][ok:1][leaderHint:4][configVersion:8][count:4] members...
 Bytes encodeConfigReply(const ConfigReplyArgs& reply) {
-  (void)reply;
-  return Bytes{};
+  Bytes p;
+  p.reserve(25 + reply.config.members.size() * 16);
+  putU64(p, reply.term);
+  p.push_back(reply.ok ? 1 : 0);
+  putU32(p, static_cast<uint32_t>(reply.leaderHint));
+  putU64(p, reply.config.version);
+  putU32(p, static_cast<uint32_t>(reply.config.members.size()));
+  for (const Member& m : reply.config.members) {
+    putU32(p, static_cast<uint32_t>(m.id));
+    p.push_back(m.voting ? 1 : 0);
+    const uint16_t alen = static_cast<uint16_t>(m.addr.size());
+    p.push_back(static_cast<Byte>((alen >> 8) & 0xff));
+    p.push_back(static_cast<Byte>(alen & 0xff));
+    p.insert(p.end(), m.addr.begin(), m.addr.end());
+  }
+  return p;
 }
 bool decodeConfigReply(const Byte* data, size_t n, ConfigReplyArgs& out) {
-  (void)data;
-  (void)n;
-  (void)out;
-  return false;
+  if (data == nullptr || n < 25) return false;
+  out.term = getU64(data);
+  out.ok = (data[8] != 0);
+  out.leaderHint = static_cast<int>(getU32(data + 9));
+  out.config.version = getU64(data + 13);
+  const uint32_t count = getU32(data + 21);
+  size_t off = 25;
+  if (count > (n - off) / 7) return false;
+  std::vector<Member> ms;
+  ms.reserve(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    if (off + 7 > n) return false;
+    Member m;
+    m.id = static_cast<int>(getU32(data + off));
+    m.voting = (data[off + 4] != 0);
+    const uint16_t alen = static_cast<uint16_t>(
+        (static_cast<uint16_t>(data[off + 5]) << 8) | data[off + 6]);
+    off += 7;
+    if (off + alen > n) return false;
+    m.addr.assign(reinterpret_cast<const char*>(data + off), alen);
+    off += alen;
+    ms.push_back(std::move(m));
+  }
+  if (off != n) return false;
+  out.config.members = std::move(ms);
+  return true;
 }
 Bytes encodeReadProbe(const ReadProbeArgs& args) {
   (void)args;

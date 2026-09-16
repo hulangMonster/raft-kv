@@ -91,6 +91,9 @@ RaftNode::RaftNode(RaftConfig cfg, LogStore& log, StateMachine& sm,
     currentTerm_ = t;
     votedFor_ = v;
   }
+
+  // M4.1: 启动配置重建（seed -> 日志中的配置条目；快照配置在 M4.3 接入）
+  rebuildConfigFromSeedAndLog();
   lastHeartbeatMs_ = clock_.nowMs();
   electionTimeoutMs_ = electionTimeoutMs(cfg_, cfg_.selfId, currentTerm_);
   syncedIndex_ = log_.lastIndex();  // everything recovered from disk is durable
@@ -734,16 +737,61 @@ InstallSnapshotReply RaftNode::onInstallSnapshot(const InstallSnapshotArgs& args
 }
 
 // ---- M4 scaffolding（#2 TDD 阶段：仅为让测试可编译；真实实现见 M4.1-M4.5）----
+// 启动配置重建：seed（--peers）-> 日志中的配置条目（按 index 升序）。
+// J3：版本严格单调；任何回退都视为日志损坏 -> 拒绝启动。
+void RaftNode::rebuildConfigFromSeedAndLog() {
+  currConfig_ = seedConfig_;
+  if (currConfig_.members.empty()) {
+    // 未提供 seed（M2/M3 风格调用点）-> 退化为 cfg_.peerIds（无地址），version = 0
+    currConfig_.version = 0;
+    Member self;
+    self.id = cfg_.selfId;
+    currConfig_.members.push_back(self);
+    for (const int p : cfg_.peerIds) {
+      Member m;
+      m.id = p;
+      currConfig_.members.push_back(m);
+    }
+    std::sort(currConfig_.members.begin(), currConfig_.members.end(),
+              [](const Member& a, const Member& b) { return a.id < b.id; });
+  }
+
+  const Index first = log_.firstIndex();
+  const Index last = log_.lastIndex();
+  if (last < first) return;
+  const auto entries = log_.slice(
+      first, static_cast<size_t>(last - first + 1),
+      std::numeric_limits<size_t>::max());
+  for (const LogEntry& e : entries) {
+    if (e.op != OpCode::kConfig) continue;
+    ClusterConfig c;
+    if (!decodeClusterConfig(reinterpret_cast<const Byte*>(e.value.data()),
+                             e.value.size(), c)) {
+      throw std::runtime_error("raft: undecodable config entry at index " +
+                               std::to_string(e.index));
+    }
+    if (c.version <= currConfig_.version) {
+      throw std::runtime_error(
+          "raft: config version regressed at index " +
+          std::to_string(e.index) + " (have " +
+          std::to_string(currConfig_.version) + ", saw " +
+          std::to_string(c.version) + ")");
+    }
+    currConfig_ = c;
+  }
+}
+
 ClusterConfig RaftNode::clusterConfig() const {
   std::lock_guard<std::mutex> lock(mu_);
-  return ClusterConfig{};  // M4.1: seed -> 快照配置 -> 日志配置条目重放
+  return currConfig_;
 }
 
 uint64_t RaftNode::configVersion() const { return clusterConfig().version; }
 
 bool RaftNode::retired() const {
   std::lock_guard<std::mutex> lock(mu_);
-  return false;  // M4.2: !currConfig_.isVoting(cfg_.selfId)
+  // m4-design v1.2 §5.1/§5.6：未入配置或被移除 = 不竞选、不接受写，但仍接收复制
+  return !currConfig_.isVoting(cfg_.selfId);
 }
 
 ClientReply RaftNode::changeMembership(MembershipOp op, int targetId,

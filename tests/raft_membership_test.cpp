@@ -19,6 +19,7 @@
 
 #include "kv/kv_state_machine.h"
 #include "raft/cluster_config.h"
+#include "raft/message.h"
 #include "raft/snapshot_store.h"
 #include "raft_test_harness.h"
 
@@ -650,6 +651,36 @@ TEST(RaftMembership, A16_LeaderSelfRemovalStepsDownAfterCommit) {
   RaftNode* nl = test::findLeader(*c);
   ASSERT_NE(nl, nullptr);
   EXPECT_EQ(nl->propose(putReq(77, "z", "1"), 1000).status, ClientStatus::kOk);
+}
+
+TEST(RaftMembership, A17_ConfigMessageCodec) {
+  ConfigRequestArgs req;
+  req.action = 1;
+  req.targetId = 7;
+  req.addr = "127.0.0.1:7007";
+  const Bytes re = encodeConfigRequest(req);
+  ConfigRequestArgs reqOut;
+  ASSERT_TRUE(decodeConfigRequest(re.data(), re.size(), reqOut));
+  EXPECT_EQ(reqOut.action, req.action);
+  EXPECT_EQ(reqOut.targetId, req.targetId);
+  EXPECT_EQ(reqOut.addr, req.addr);
+  EXPECT_FALSE(decodeConfigRequest(re.data(), re.size() - 1, reqOut));
+
+  ConfigReplyArgs rep;
+  rep.term = 5;
+  rep.ok = true;
+  rep.leaderHint = 2;
+  rep.config.version = 9;
+  rep.config.members = {Member{1, "127.0.0.1:1", true},
+                        Member{2, "127.0.0.1:2", false}};
+  const Bytes pe = encodeConfigReply(rep);
+  ConfigReplyArgs repOut;
+  ASSERT_TRUE(decodeConfigReply(pe.data(), pe.size(), repOut));
+  EXPECT_EQ(repOut.term, rep.term);
+  EXPECT_TRUE(repOut.ok);
+  EXPECT_EQ(repOut.leaderHint, rep.leaderHint);
+  EXPECT_EQ(repOut.config, rep.config);
+  EXPECT_FALSE(decodeConfigReply(pe.data(), pe.size() - 1, repOut));
 }
 
 // ================================ B 组 ================================

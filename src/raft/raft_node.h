@@ -82,6 +82,7 @@ class RaftNode {
   AppendEntriesArgs buildAppendEntries(int peer);
   void advanceCommitAndApply();
   void maybeSnapshot();
+  void rebuildConfigFromSeedAndLog();
 
   RaftConfig cfg_;
   LogStore& log_;
@@ -90,6 +91,7 @@ class RaftNode {
   Clock& clock_;
   SnapshotStore* snapshots_ = nullptr;  // nullptr == snapshots disabled (M2)
   ClusterConfig seedConfig_;            // M4: 启动种子配置（--peers），version = 0
+  ClusterConfig currConfig_;            // M4: 当前配置（seed -> 日志配置条目；快照配置见 M4.3）
 
   // M3 snapshot boundary state
   Index lastIncluded_ = kNoIndex;
