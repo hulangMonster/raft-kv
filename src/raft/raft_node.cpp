@@ -15,7 +15,9 @@
 #include <utility>
 
 #include "raft/clock.h"
+#include "raft/lock_probe.h"
 #include "raft/log_store.h"
+#include "raft/metrics.h"
 #include "raft/snapshot_store.h"
 #include "raft/state_machine.h"
 #include "raft/transport.h"
@@ -35,14 +37,16 @@ uint64_t electionTimeoutMs(const RaftConfig& cfg, int selfId, Term term) {
 
 RaftNode::RaftNode(RaftConfig cfg, LogStore& log, StateMachine& sm,
                    Transport& transport, Clock& clock,
-                   SnapshotStore* snapshots, const ClusterConfig& seed)
+                   SnapshotStore* snapshots, const ClusterConfig& seed,
+                   Metrics* metrics)
     : cfg_(std::move(cfg)),
       log_(log),
       sm_(sm),
       transport_(transport),
       clock_(clock),
       snapshots_(snapshots),
-      seedConfig_(seed) {
+      seedConfig_(seed),
+      metrics_(metrics) {
   // M4 scaffolding: seedConfig_ 尚未参与配置重建（M4.1 落地，见 m4-prerequisites.md §5.1）
   // A zero chunk size would make InstallSnapshot emit empty chunks forever and
   // a zero threshold would snapshot on every tick: reject the config up front.
@@ -159,6 +163,7 @@ void RaftNode::startElection(
     uint64_t now, std::vector<std::pair<int, RequestVoteArgs>>& voteJobs) {
   role_ = Role::kCandidate;
   ++currentTerm_;
+  if (metrics_ != nullptr) metrics_->onElection();
   votedFor_ = cfg_.selfId;
   leaderId_ = -1;
   votesGranted_ = 0;
@@ -565,6 +570,7 @@ bool RaftNode::appendEntryLocked(const LogEntry& e) {
 
 // 等待条目提交。propose 与 changeMembership 共用（M4 评审 B6）。
 ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
+  const uint64_t metricT0Us = lockprobe::nowUs();
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(timeoutMs);
   for (;;) {
@@ -574,7 +580,12 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
       std::lock_guard<ProbedMutex> lock(mu_);
       // 已提交即成功：Leader 自我移除（§5.7）会在配置条目提交的同一锁段内降级，
       // 此时请求其实已经生效，不能报 NotLeader。
-      if (index <= commitIndex_) return {ClientStatus::kOk, "", -1};
+      if (index <= commitIndex_) {
+        if (metrics_ != nullptr) {
+          metrics_->onWriteCompleted(lockprobe::nowUs() - metricT0Us);
+        }
+        return {ClientStatus::kOk, "", -1};
+      }
       if (role_ != Role::kLeader || currentTerm_ != term) {
         return {ClientStatus::kNotLeader, "", leaderId_};
       }
@@ -586,7 +597,12 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
     }
 
     if (iAmFlusher) {
+      const Index syncedBefore = syncedIndex_;
+      const uint64_t fsyncT0Us = lockprobe::nowUs();
       const bool syncOk = log_.sync();  // ONE fsync for every entry so far
+      if (metrics_ != nullptr) {
+        metrics_->onFsync(lockprobe::nowUs() - fsyncT0Us);
+      }
       std::vector<std::pair<int, AppendEntriesArgs>> jobs;
       std::vector<std::pair<int, InstallSnapshotArgs>> snapJobs;
       {
@@ -597,7 +613,12 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
           // (both leave the retained prefix durable, so clamping is safe).
           Index durable = flushTarget;
           if (durable > log_.lastIndex()) durable = log_.lastIndex();
-          if (durable > syncedIndex_) syncedIndex_ = durable;
+          if (durable > syncedIndex_) {
+            if (metrics_ != nullptr && durable > syncedBefore) {
+              metrics_->onBatch(static_cast<size_t>(durable - syncedBefore));
+            }
+            syncedIndex_ = durable;
+          }
         }
         // A failed fsync must never be reported as durable (I5); leave
         // syncInFlight_ clear so another proposer retries.
@@ -641,7 +662,12 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
       return index <= commitIndex_ || role_ != Role::kLeader ||
              currentTerm_ != term;
     });
-    if (index <= commitIndex_) return {ClientStatus::kOk, "", -1};
+    if (index <= commitIndex_) {
+      if (metrics_ != nullptr) {
+        metrics_->onWriteCompleted(lockprobe::nowUs() - metricT0Us);
+      }
+      return {ClientStatus::kOk, "", -1};
+    }
     if (role_ != Role::kLeader || currentTerm_ != term) {
       return {ClientStatus::kNotLeader, "", leaderId_};
     }
@@ -734,6 +760,7 @@ void RaftNode::maybeSnapshot() {
     }
     lastIncluded_ = snapIndex;
     lastIncludedTerm_ = snapTerm;
+    if (metrics_ != nullptr) metrics_->onSnapshot(encoded.size());
     snapshotBytes_ = std::move(encoded);
     for (auto& kv : snapshotSendOffset_) kv.second = 0;  // restart peer sends
     if (snapIndex > syncedIndex_) syncedIndex_ = snapIndex;
@@ -1298,6 +1325,9 @@ ClientReply RaftNode::changeMembership(MembershipOp op, int targetId,
   drainPeerQueues();  // 新成员地址 / 离开节点的清理在锁外执行（L10）
 
   const ClientReply reply = awaitCommit(ce.index, ce.term, timeoutMs);
+  if (reply.status == ClientStatus::kOk && metrics_ != nullptr) {
+    metrics_->onConfigChange();
+  }
   if (reply.status != ClientStatus::kOk && add) {
     std::lock_guard<ProbedMutex> lock(mu_);
     pendingPeers_.erase(targetId);

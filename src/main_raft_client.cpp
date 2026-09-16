@@ -498,6 +498,24 @@ std::string membersToString(const ClusterConfig& c) {
   return ss.str();
 }
 
+// M5.1：拉取节点指标文本（msgType 15，应答复用 kClientReply）
+int doMetrics(Options& o) {
+  MsgType rt = MsgType::kClientReply;
+  Bytes rp;
+  if (!request(o.host, o.port, MsgType::kMetricsRequest, Bytes{}, rt, rp)) {
+    std::cerr << "cannot reach " << o.host << ":" << o.port << std::endl;
+    return -1;
+  }
+  ClientReply reply;
+  if (rt != MsgType::kClientReply ||
+      !decodeClientReply(rp.data(), rp.size(), reply)) {
+    std::cerr << "bad metrics reply" << std::endl;
+    return -1;
+  }
+  std::cout << reply.value;
+  return 0;
+}
+
 int doConfig(Options& o) {
   // M4（决策⑦）：config 命令顺便刷新客户端拓扑缓存（同一个请求）
   ConfigReplyArgs reply;
@@ -712,6 +730,7 @@ void usage(const char* argv0) {
             << "  " << argv0 << " ... fill <n> [--pipeline K]\n"
             << "  " << argv0 << " ... verify <n>\n"
             << "  " << argv0 << " ... config\n"
+            << "  " << argv0 << " ... metrics\n"
             << "  " << argv0 << " ... add <id> <host:port>\n"
             << "  " << argv0 << " ... remove <id>\n"
             << "  (no command -> interactive mode)\n"
@@ -774,6 +793,7 @@ int main(int argc, char** argv) {
     return doVerify(o, std::stoull(pos[1]));
   }
   if (cmd == "config") return doConfig(o);
+  if (cmd == "metrics") return doMetrics(o);
   if (cmd == "add" && pos.size() >= 3) {
     return doMembership(o, /*action=*/1, std::stoi(pos[1]), pos[2]);
   }

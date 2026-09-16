@@ -298,6 +298,7 @@ TEST(RaftPerf, A6_MetricsCountersAndStatusFragment) {
   m.onFsync(3);
   m.onBatch(4);
   m.onWriteCompleted(120);
+  m.onWriteCompleted(20000);  // 20ms：必须落在 20000us 桶而不是溢出桶
   m.onElection();
   m.onSnapshot(4096);
   m.onLockWait(9);
@@ -305,7 +306,9 @@ TEST(RaftPerf, A6_MetricsCountersAndStatusFragment) {
   EXPECT_EQ(m.fsyncUs(), 10u);
   EXPECT_EQ(m.batches(), 1u);
   EXPECT_EQ(m.batchEntries(), 4u);
-  EXPECT_EQ(m.writes(), 1u);
+  EXPECT_EQ(m.writes(), 2u);
+  EXPECT_EQ(m.latencyP50Us(), 200u);    // {120,20000} -> 中位样本在 200us 桶
+  EXPECT_EQ(m.latencyP99Us(), 20000u);  // 溢出桶不得把 ms 级延迟报成 0
   EXPECT_EQ(m.elections(), 1u);
   EXPECT_EQ(m.snapshots(), 1u);
   EXPECT_EQ(m.lockWaitUsTotal(), 9u);

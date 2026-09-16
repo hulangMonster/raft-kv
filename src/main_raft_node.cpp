@@ -23,7 +23,9 @@
 
 #include "kv/kv_state_machine.h"
 #include "raft/clock.h"
+#include "raft/lock_probe.h"
 #include "raft/log_store.h"
+#include "raft/metrics.h"
 #include "raft/message.h"
 #include "raft/raft_node.h"
 #include "raft/snapshot_store.h"
@@ -93,8 +95,8 @@ std::string roleName(Role r) {
 }
 
 // 评审 B7：单条连接的请求处理循环抽出来，异常只允许影响这条连接。
-void serveConnection(int fd, RaftNode& node, int connClientId,
-                     uint64_t& connRequestId) {
+void serveConnection(int fd, RaftNode& node, Metrics& metrics,
+                     int connClientId, uint64_t& connRequestId) {
   MsgType type;
   Bytes payload;
   while (g_running && readFrame(fd, type, payload)) {
@@ -154,6 +156,7 @@ void serveConnection(int fd, RaftNode& node, int connClientId,
                 << (cfgNow.members[i].voting ? "v" : "n");
       }
       ss << " members=" << members.str();
+      ss << " " << metrics.statusFragment();  // M5.1: 指标（只读）
       ClientReply r;
       r.status = ClientStatus::kOk;
       r.value = ss.str();
@@ -193,6 +196,14 @@ void serveConnection(int fd, RaftNode& node, int connClientId,
             encodeFrame(MsgType::kConfigReply, encodeConfigReply(reply));
         if (!writeFull(fd, f.data(), f.size())) break;
       }
+    } else if (type == MsgType::kMetricsRequest) {
+      // M5.1：可选指标文本端点（Prometheus 风格）
+      ClientReply r;
+      r.status = ClientStatus::kOk;
+      r.value = metrics.prometheusText();
+      r.leaderHint = node.leaderId();
+      const Bytes f = encodeFrame(MsgType::kClientReply, encodeClientReply(r));
+      if (!writeFull(fd, f.data(), f.size())) break;
     } else if (type == MsgType::kReadProbe) {
       ReadProbeArgs args;
       if (decodeReadProbe(payload.data(), payload.size(), args)) {
@@ -207,13 +218,13 @@ void serveConnection(int fd, RaftNode& node, int connClientId,
   }
 }
 
-void handleConnection(int fd, RaftNode& node) {
+void handleConnection(int fd, RaftNode& node, Metrics& metrics) {
   const int connClientId = g_connClientId.fetch_add(1);
   uint64_t connRequestId = 0;
   // 评审 B7：解码/处理抛出的异常（如恶意帧触发的 bad_alloc）绝不能 terminate
   // 整个节点进程——只关闭这一条连接。
   try {
-    serveConnection(fd, node, connClientId, connRequestId);
+    serveConnection(fd, node, metrics, connClientId, connRequestId);
   } catch (const std::exception& e) {
     std::cerr << "[raftkv-node] conn dropped after error: " << e.what() << "\n";
   } catch (...) {
@@ -256,6 +267,7 @@ int main(int argc, char** argv) {
   size_t snapshotThreshold = 10000;
   std::string peersArg;
   std::string dataDir;
+  bool lockWaitMetrics = false;  // M5.1: 打开锁等待计时（默认关，零开销）
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -274,6 +286,8 @@ int main(int argc, char** argv) {
       peersArg = next("--peers");
     } else if (a == "--data-dir") {
       dataDir = next("--data-dir");
+    } else if (a == "--lock-wait-metrics") {
+      lockWaitMetrics = true;
     } else if (a == "--snapshot-threshold") {
       snapshotThreshold = std::stoul(next("--snapshot-threshold"));
     } else {
@@ -304,6 +318,8 @@ int main(int argc, char** argv) {
     cfg.peerIds = std::move(peerIds);
     cfg.snapshotThresholdEntries = snapshotThreshold;
 
+    Metrics metrics;  // M5.1: 进程内指标（只读；不参与任何判定）
+    if (lockWaitMetrics) lockprobe::setTimingEnabled(true);
     FileLogStore log(dataDir);
     FileSnapshotStore snapshots(dataDir);  // M3.4: durable snapshots
     KvStateMachine sm;
@@ -328,7 +344,7 @@ int main(int argc, char** argv) {
     // 以为自己已是成员而不断竞选，把现有 Leader 逼下台。
     std::sort(seed.members.begin(), seed.members.end(),
               [](const Member& a, const Member& b) { return a.id < b.id; });
-    RaftNode node(cfg, log, sm, transport, clock, &snapshots, seed);
+    RaftNode node(cfg, log, sm, transport, clock, &snapshots, seed, &metrics);
 
     struct sigaction sa {};
     sa.sa_handler = onSignal;
@@ -378,7 +394,7 @@ int main(int argc, char** argv) {
       tv.tv_sec = 0;
       tv.tv_usec = 500000;  // idle connections wake every 0.5s to check stop
       ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-      std::thread([c, &node] { handleConnection(c, node); }).detach();
+      std::thread([c, &node, &metrics] { handleConnection(c, node, metrics); }).detach();
     }
 
     ::close(lsock);

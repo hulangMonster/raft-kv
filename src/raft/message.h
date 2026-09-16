@@ -24,6 +24,8 @@ enum class MsgType : uint8_t {
   kStatusRequest = 12,
   kSnapshotTrigger = 13,
   kReadProbeReply = 14,     // 节点 -> Leader：探针回包
+  // M5.1（只增不改）：指标文本端点（可选），应答复用 kClientReply
+  kMetricsRequest = 15,
 };
 
 // ---- M4: 配置查询/变更消息体（m4-design.md v1.1 §4.5）----

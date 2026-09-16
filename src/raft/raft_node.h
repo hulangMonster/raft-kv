@@ -15,6 +15,7 @@
 namespace raftkv::raft {
 
 class Clock;
+class Metrics;
 class LogStore;
 class SnapshotStore;
 class StateMachine;
@@ -35,7 +36,8 @@ class RaftNode {
   RaftNode(RaftConfig cfg, LogStore& log, StateMachine& sm,
            Transport& transport, Clock& clock,
            SnapshotStore* snapshots = nullptr,
-           const ClusterConfig& seed = ClusterConfig{});
+           const ClusterConfig& seed = ClusterConfig{},
+           Metrics* metrics = nullptr);  // M5.1: 可选指标（nullptr = 零开销）
 
   void tick();  // called by the ticker thread (or manually by unit tests)
 
@@ -121,6 +123,7 @@ class RaftNode {
   Clock& clock_;
   SnapshotStore* snapshots_ = nullptr;  // nullptr == snapshots disabled (M2)
   ClusterConfig seedConfig_;            // M4: 启动种子配置（--peers），version = 0
+  Metrics* metrics_ = nullptr;          // M5.1: 指标（只读、不参与判定）
   ClusterConfig currConfig_;            // M4: 当前配置（seed -> 日志配置条目；快照配置见 M4.3）
   ClusterConfig prevConfig_;            // M4: 在途配置条目的 C_old（J2 双重多数派用）
   ClusterConfig baseConfig_;            // M4.5: 已持久基线（快照 / 已提交配置）；回滚基准
