@@ -41,6 +41,7 @@ add_test(NAME raftkv_unit COMMAND raftkv_tests)
 
 # ---- M2: Raft core (new sources only; M1 targets above are unchanged) ----
 add_library(raftkv_raft STATIC
+  src/raft/cluster_config.cpp
   src/raft/memory_adapters.cpp
   src/raft/raft_node.cpp
   src/raft/file_log_store.cpp
@@ -73,6 +74,7 @@ if(GTEST_INCLUDE_DIR AND GTEST_LIBRARY)
     tests/raft_idempotent_test.cpp
     tests/raft_restart_test.cpp
     tests/raft_snapshot_test.cpp
+    tests/raft_membership_test.cpp
   )
   target_include_directories(raftkv_raft_tests PRIVATE
     ${GTEST_INCLUDE_DIR}

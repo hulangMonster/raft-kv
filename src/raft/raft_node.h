@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "cluster_config.h"
 #include "types.h"
 
 namespace raftkv::raft {
@@ -29,9 +30,11 @@ class Transport;
 //   * Private helpers below assume the caller already holds mu_.
 class RaftNode {
  public:
+  // M4: seed = 启动种子配置（version=0，来自 --peers）；真实配置由 快照配置 -> 日志配置条目 重建。
   RaftNode(RaftConfig cfg, LogStore& log, StateMachine& sm,
            Transport& transport, Clock& clock,
-           SnapshotStore* snapshots = nullptr);
+           SnapshotStore* snapshots = nullptr,
+           const ClusterConfig& seed = ClusterConfig{});
 
   void tick();  // called by the ticker thread (or manually by unit tests)
 
@@ -59,6 +62,17 @@ class RaftNode {
   InstallSnapshotReply onInstallSnapshot(const InstallSnapshotArgs& args);
   void onInstallSnapshotReply(int peerId, const InstallSnapshotReply& reply);
 
+  // ---- M4: membership + linearizable read (m4-design.md v1.1 §4.3) ----
+  ClusterConfig clusterConfig() const;   // 值拷贝（锁内读）
+  uint64_t configVersion() const;
+  bool retired() const;                  // self 不是当前配置的投票成员
+  // add: 先 CatchUp 追平再追加配置条目；remove: 直接追加。非 Leader -> kNotLeader。
+  ClientReply changeMembership(MembershipOp op, int targetId,
+                               const std::string& targetAddr, uint64_t timeoutMs);
+  ClientReply linearizableGet(const std::string& key, uint64_t timeoutMs);
+  ReadProbeReply onReadProbe(const ReadProbeArgs& args);
+  void onReadProbeReply(int peerId, const ReadProbeReply& reply);
+
  private:
   // Caller holds mu_.
   void startElection(uint64_t now,
@@ -75,6 +89,7 @@ class RaftNode {
   Transport& transport_;
   Clock& clock_;
   SnapshotStore* snapshots_ = nullptr;  // nullptr == snapshots disabled (M2)
+  ClusterConfig seedConfig_;            // M4: 启动种子配置（--peers），version = 0
 
   // M3 snapshot boundary state
   Index lastIncluded_ = kNoIndex;

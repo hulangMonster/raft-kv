@@ -267,4 +267,46 @@ bool decodeClientReply(const Byte* d, size_t n, ClientReply& out) {
   return true;
 }
 
+// ---- M4 scaffolding: 7/8 配置消息与 9/14 读探针（实现见 M4.1/M4.4）----
+Bytes encodeConfigRequest(const ConfigRequestArgs& args) {
+  (void)args;
+  return Bytes{};
+}
+bool decodeConfigRequest(const Byte* data, size_t n, ConfigRequestArgs& out) {
+  (void)data;
+  (void)n;
+  (void)out;
+  return false;
+}
+Bytes encodeConfigReply(const ConfigReplyArgs& reply) {
+  (void)reply;
+  return Bytes{};
+}
+bool decodeConfigReply(const Byte* data, size_t n, ConfigReplyArgs& out) {
+  (void)data;
+  (void)n;
+  (void)out;
+  return false;
+}
+Bytes encodeReadProbe(const ReadProbeArgs& args) {
+  (void)args;
+  return Bytes{};
+}
+bool decodeReadProbe(const Byte* data, size_t n, ReadProbeArgs& out) {
+  (void)data;
+  (void)n;
+  (void)out;
+  return false;
+}
+Bytes encodeReadProbeReply(const ReadProbeReply& reply) {
+  (void)reply;
+  return Bytes{};
+}
+bool decodeReadProbeReply(const Byte* data, size_t n, ReadProbeReply& out) {
+  (void)data;
+  (void)n;
+  (void)out;
+  return false;
+}
+
 }  // namespace raftkv::raft

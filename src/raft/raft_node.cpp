@@ -34,13 +34,15 @@ uint64_t electionTimeoutMs(const RaftConfig& cfg, int selfId, Term term) {
 
 RaftNode::RaftNode(RaftConfig cfg, LogStore& log, StateMachine& sm,
                    Transport& transport, Clock& clock,
-                   SnapshotStore* snapshots)
+                   SnapshotStore* snapshots, const ClusterConfig& seed)
     : cfg_(std::move(cfg)),
       log_(log),
       sm_(sm),
       transport_(transport),
       clock_(clock),
-      snapshots_(snapshots) {
+      snapshots_(snapshots),
+      seedConfig_(seed) {
+  // M4 scaffolding: seedConfig_ 尚未参与配置重建（M4.1 落地，见 m4-prerequisites.md §5.1）
   // A zero chunk size would make InstallSnapshot emit empty chunks forever and
   // a zero threshold would snapshot on every tick: reject the config up front.
   if (snapshots_ != nullptr &&
@@ -729,6 +731,46 @@ InstallSnapshotReply RaftNode::onInstallSnapshot(const InstallSnapshotArgs& args
     advanceCommitAndApply();
   }
   return {currentTerm(), true, 0};
+}
+
+// ---- M4 scaffolding（#2 TDD 阶段：仅为让测试可编译；真实实现见 M4.1-M4.5）----
+ClusterConfig RaftNode::clusterConfig() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return ClusterConfig{};  // M4.1: seed -> 快照配置 -> 日志配置条目重放
+}
+
+uint64_t RaftNode::configVersion() const { return clusterConfig().version; }
+
+bool RaftNode::retired() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return false;  // M4.2: !currConfig_.isVoting(cfg_.selfId)
+}
+
+ClientReply RaftNode::changeMembership(MembershipOp op, int targetId,
+                                       const std::string& targetAddr,
+                                       uint64_t timeoutMs) {
+  (void)op;
+  (void)targetId;
+  (void)targetAddr;
+  (void)timeoutMs;
+  return {ClientStatus::kErr, "membership change not implemented (M4.2)", -1};
+}
+
+ClientReply RaftNode::linearizableGet(const std::string& key,
+                                      uint64_t timeoutMs) {
+  (void)key;
+  (void)timeoutMs;
+  return {ClientStatus::kErr, "read index not implemented (M4.4)", -1};
+}
+
+ReadProbeReply RaftNode::onReadProbe(const ReadProbeArgs& args) {
+  (void)args;
+  return ReadProbeReply{};
+}
+
+void RaftNode::onReadProbeReply(int peerId, const ReadProbeReply& reply) {
+  (void)peerId;
+  (void)reply;
 }
 
 void RaftNode::onInstallSnapshotReply(int peerId,

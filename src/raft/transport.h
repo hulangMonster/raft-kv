@@ -25,6 +25,14 @@ class Transport {
   // M3.3 (D4): InstallSnapshot chunk transfer.
   virtual void sendInstallSnapshot(int peerId, const InstallSnapshotArgs& args,
                                    InstallCb cb) = 0;
+
+  // M4 (L10): 地址簿动态更新；只在锁外作业中调用。
+  // 默认空实现 -> MemoryTransport 之外的测试桩零改动即可编译。
+  virtual void addPeer(int id, const std::string& addr) {
+    (void)id;
+    (void)addr;
+  }
+  virtual void removePeer(int id) { (void)id; }
 };
 
 // Synchronous in-memory adapter for unit tests. Delivers directly to the
@@ -42,6 +50,10 @@ class MemoryTransport : public Transport {
                          AppendCb cb) override;
   void sendInstallSnapshot(int peerId, const InstallSnapshotArgs& args,
                            InstallCb cb) override;
+
+  // M4: 让测试把"尚未进入配置"的节点接上 transport（等价于 Leader 的 addPeer）
+  void addPeer(int id, const std::string& addr) override;
+  void removePeer(int id) override;
 
  private:
   std::vector<RaftNode*> nodes_;   // indexed by id (id >= 1)

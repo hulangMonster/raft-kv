@@ -16,6 +16,9 @@ enum class OpCode : uint8_t {
   kPut = 1,
   kGet = 2,
   kDel = 3,
+  // M4: Raft 配置条目（仅 raft 层产生/消费；M1 协议与 codec 白名单不含它，
+  // 因此客户端无法伪造配置条目 —— 见 m4-prerequisites.md §7.1 P3）
+  kConfig = 4,
 };
 
 enum class StatusCode : uint8_t {

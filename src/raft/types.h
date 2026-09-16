@@ -100,6 +100,21 @@ struct RaftConfig {
   // M3 snapshot knobs
   size_t snapshotThresholdEntries = 10000;  // trigger compaction threshold
   size_t snapshotChunkBytes = 1u << 20;     // InstallSnapshot chunk size
+  // M4 membership knobs (m4-design.md v1.1)
+  uint64_t catchUpTimeoutMs = 30000;  // add: 追平预算
+  uint64_t readIndexTimeoutMs = 500;  // linearizableGet: quorum 探针预算
+};
+
+// ---- M4: 线性一致读探针（msgType 9/14）----
+struct ReadProbeArgs {
+  Term term = kNoTerm;
+  int leaderId = 0;
+  uint64_t seq = 0;
+};
+struct ReadProbeReply {
+  Term term = kNoTerm;
+  bool ok = false;
+  uint64_t seq = 0;
 };
 
 }  // namespace raftkv::raft

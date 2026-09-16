@@ -164,6 +164,20 @@ void MemoryTransport::sendAppendEntries(int peerId,
   cb(peer->onAppendEntries(args));
 }
 
+void MemoryTransport::addPeer(int id, const std::string& addr) {
+  (void)addr;  // 内存传输按 id 直接投递，地址只对配置语义有意义
+  if (static_cast<size_t>(id) >= nodes_.size()) {
+    nodes_.resize(static_cast<size_t>(id) + 1, nullptr);
+    isolated_.resize(static_cast<size_t>(id) + 1, false);
+  }
+}
+
+void MemoryTransport::removePeer(int id) {
+  if (static_cast<size_t>(id) < nodes_.size()) {
+    nodes_[static_cast<size_t>(id)] = nullptr;
+  }
+}
+
 void MemoryTransport::sendInstallSnapshot(int peerId,
                                           const InstallSnapshotArgs& args,
                                           InstallCb cb) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cluster_config.h"
 #include "common.h"
 #include "types.h"
 
@@ -14,10 +15,28 @@ enum class MsgType : uint8_t {
   kAppendEntriesReply = 4,
   kInstallSnapshot = 5,
   kInstallSnapshotReply = 6,
+  // M4 (m4-design.md v1.1 §4.5)
+  kConfigRequest = 7,       // 客户端 -> 节点：get / add / remove
+  kConfigReply = 8,         // 节点 -> 客户端
+  kReadProbe = 9,           // Leader -> 节点：ReadIndex quorum 探针
   kClientRequest = 10,
   kClientReply = 11,
   kStatusRequest = 12,
   kSnapshotTrigger = 13,
+  kReadProbeReply = 14,     // 节点 -> Leader：探针回包
+};
+
+// ---- M4: 配置查询/变更消息体（m4-design.md v1.1 §4.5）----
+struct ConfigRequestArgs {
+  uint8_t action = 0;  // 0=get, 1=add, 2=remove
+  int targetId = 0;
+  std::string addr;
+};
+struct ConfigReplyArgs {
+  Term term = kNoTerm;
+  bool ok = false;
+  int leaderHint = -1;
+  ClusterConfig config;  // action==0 时返回当前配置；写操作时 version/members 可留空
 };
 
 Bytes encodeFrame(MsgType type, const Bytes& payload);
@@ -47,5 +66,15 @@ bool decodeClientRequest(const Byte* data, size_t n, ClientRequest& out);
 
 Bytes encodeClientReply(const ClientReply& reply);
 bool decodeClientReply(const Byte* data, size_t n, ClientReply& out);
+
+// M4: 7/8 配置消息 + 9/14 读探针（复用 M2 长度前缀帧）
+Bytes encodeConfigRequest(const ConfigRequestArgs& args);
+bool decodeConfigRequest(const Byte* data, size_t n, ConfigRequestArgs& out);
+Bytes encodeConfigReply(const ConfigReplyArgs& reply);
+bool decodeConfigReply(const Byte* data, size_t n, ConfigReplyArgs& out);
+Bytes encodeReadProbe(const ReadProbeArgs& args);
+bool decodeReadProbe(const Byte* data, size_t n, ReadProbeArgs& out);
+Bytes encodeReadProbeReply(const ReadProbeReply& reply);
+bool decodeReadProbeReply(const Byte* data, size_t n, ReadProbeReply& out);
 
 }  // namespace raftkv::raft

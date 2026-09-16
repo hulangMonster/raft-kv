@@ -13,6 +13,9 @@ struct SnapshotData {
   Index lastIncludedIndex = kNoIndex;
   Term lastIncludedTerm = kNoTerm;
   Bytes payload;  // StateMachine-serialized state
+  // M4: 生成该快照时的集群配置（encodeClusterConfig 输出）。
+  // RKS1 v1 快照没有此段 -> 空（视为"未携带配置"，回退 seed/日志，见 §5.1）
+  Bytes config;
 };
 
 // Snapshot persistence seam. Implementations serialize internal state.
