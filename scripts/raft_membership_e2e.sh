@@ -119,4 +119,22 @@ done
 [[ "$r" == "true" ]] || { echo "FAIL: node4 未退役 (retired='$r')" >&2; exit 1; }
 echo "node4 retired=true"
 
+echo "== 6) 客户端拓扑自动刷新（--peers 只给一个非 Leader 种子）=="
+leader="$(require_leader)"
+seed=""
+for id in 1 2 3; do
+  if [[ "$id" != "$leader" ]]; then seed="$id"; break; fi
+done
+[[ -n "$seed" ]] || { echo "FAIL: 找不到非 Leader 节点" >&2; exit 1; }
+# 没有拓扑刷新时：follower 回 NOT_LEADER，leaderHint 在 --peers 里查不到 -> NOT_LEADER
+out="$("$BIN/raftkv_raft_cli" --peers "$seed=127.0.0.1:$(node_port "$seed")"         --host 127.0.0.1 --port "$(node_port "$seed")" get f10)"
+[[ "$out" == "v" ]] || { echo "FAIL: 客户端未按最新拓扑路由到 Leader（得到 '$out'）" >&2; exit 1; }
+echo "seed=node$seed -> 线性一致读 f10 = $out"
+
+echo "== 7) 初始节点连不上时自动换节点 =="
+DEAD=$((BASE + 50))
+out="$("$BIN/raftkv_raft_cli" --peers "$seed=127.0.0.1:$(node_port "$seed")"         --host 127.0.0.1 --port "$DEAD" get f10)"
+[[ "$out" == "v" ]] || { echo "FAIL: 初始节点不可达时未能切换（得到 '$out'）" >&2; exit 1; }
+echo "初始端口不可达 -> 自动换节点后 f10 = $out"
+
 echo "raft_membership_e2e: PASS"

@@ -36,7 +36,10 @@ namespace {
 struct Options {
   std::string host = "127.0.0.1";
   int port = 19601;
-  std::unordered_map<int, std::string> peers;  // id -> "host:port"
+  std::unordered_map<int, std::string> peers;  // --peers 种子：id -> "host:port"
+  // M4（决策⑦）：运行期拓扑缓存。客户端按最新配置路由，不再被 --peers 静态列表限制。
+  uint64_t configVersion = 0;                       // 已缓存的配置版本（0 = 未知）
+  std::unordered_map<int, std::string> topology;     // 最新 id -> "host:port"
   uint64_t clientId =
       static_cast<uint64_t>(::getpid()) * 1000003u +
       static_cast<uint64_t>(
@@ -162,6 +165,90 @@ bool requestWithTimeout(const std::string& host, int port, MsgType type,
   return decodeFrame(whole.data(), whole.size(), replyType, replyPayload);
 }
 
+// ---- M4（决策⑦）：客户端拓扑缓存 ----
+
+// 单个 id -> "host:port"：最新拓扑缓存优先，回退到 --peers 种子。
+std::string peerAddrOf(const Options& o, int id) {
+  const auto it = o.topology.find(id);
+  if (it != o.topology.end() && !it->second.empty()) return it->second;
+  const auto seed = o.peers.find(id);
+  return seed == o.peers.end() ? std::string() : seed->second;
+}
+
+bool resolvePeer(const Options& o, int id, std::string& host, int& port) {
+  const std::string addr = peerAddrOf(o, id);
+  if (addr.empty()) return false;
+  return parseHostPort(addr, host, port);
+}
+
+// 已知节点（拓扑缓存优先，去重；跳过 avoid）。
+std::vector<std::pair<std::string, int>> knownNodes(const Options& o,
+                                                    const std::string& avoidHost,
+                                                    int avoidPort) {
+  std::vector<std::pair<std::string, int>> out;
+  auto push = [&](const std::unordered_map<int, std::string>& m) {
+    for (const auto& kv : m) {
+      std::string h;
+      int p = 0;
+      if (kv.second.empty() || !parseHostPort(kv.second, h, p)) continue;
+      if (h == avoidHost && p == avoidPort) continue;
+      const auto dup = std::find(out.begin(), out.end(),
+                                 std::make_pair(h, p));
+      if (dup == out.end()) out.emplace_back(h, p);
+    }
+  };
+  push(o.topology);
+  push(o.peers);
+  return out;
+}
+
+bool pickOtherNode(const Options& o, const std::string& avoidHost, int avoidPort,
+                   std::string& host, int& port) {
+  const auto nodes = knownNodes(o, avoidHost, avoidPort);
+  if (nodes.empty()) return false;
+  host = nodes.front().first;
+  port = nodes.front().second;
+  return true;
+}
+
+// 向任意可达节点索取最新配置视图并更新缓存。
+// version 单调：只有 >= 已缓存版本才覆盖（陈旧节点的回答不得让缓存回退）。
+// out != nullptr 时回带原始应答（config 命令复用同一次请求）。
+bool refreshTopology(Options& o, const std::string& host, int port,
+                     ConfigReplyArgs* out = nullptr) {
+  std::vector<std::pair<std::string, int>> targets;
+  targets.emplace_back(host, port);
+  for (const auto& n : knownNodes(o, "", 0)) targets.push_back(n);
+
+  for (const auto& t : targets) {
+    MsgType rt = MsgType::kClientReply;
+    Bytes rp;
+    ConfigRequestArgs args;  // action = 0 (get)：任何节点都能回答自己的配置视图
+    if (!request(t.first, t.second, MsgType::kConfigRequest,
+                 encodeConfigRequest(args), rt, rp)) {
+      continue;
+    }
+    ConfigReplyArgs reply;
+    if (rt != MsgType::kConfigReply ||
+        !decodeConfigReply(rp.data(), rp.size(), reply)) {
+      continue;
+    }
+    if (out != nullptr) *out = reply;
+    if (reply.config.version >= o.configVersion) {
+      std::unordered_map<int, std::string> addrs;
+      for (const Member& m : reply.config.members) {
+        if (!m.addr.empty()) addrs[m.id] = m.addr;
+      }
+      if (!addrs.empty()) {
+        o.topology = std::move(addrs);
+        o.configVersion = reply.config.version;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
 // Same as request() but over an already-open connection (used by fill).
 bool requestOnFd(int fd, MsgType type, const Bytes& payload, MsgType& replyType,
                  Bytes& replyPayload) {
@@ -185,6 +272,7 @@ int doOp(Options& o, OpCode op, const std::string& key,
   const uint64_t requestId = ++o.requestId;  // reused across redirect retries
   std::string host = o.host;
   int port = o.port;
+  bool refreshed = false;  // 本次调用是否已经"失效重取"过（避免打转）
 
   for (int attempt = 0; attempt <= 3; ++attempt) {
     ClientRequest req;
@@ -198,6 +286,18 @@ int doOp(Options& o, OpCode op, const std::string& key,
     Bytes replyPayload;
     if (!request(host, port, MsgType::kClientRequest, encodeClientRequest(req),
                  replyType, replyPayload)) {
+      // M4（决策⑦）：连不上当前节点 -> 失效重取拓扑，换一个已知节点重试一次
+      if (!refreshed) {
+        refreshed = true;
+        std::string altHost = host;
+        int altPort = port;
+        if (refreshTopology(o, host, port) &&
+            pickOtherNode(o, host, port, altHost, altPort)) {
+          host = altHost;
+          port = altPort;
+          continue;
+        }
+      }
       std::cerr << "cannot reach " << host << ":" << port << "\n";
       return -1;
     }
@@ -210,9 +310,20 @@ int doOp(Options& o, OpCode op, const std::string& key,
 
     if (reply.status == ClientStatus::kNotLeader) {
       if (reply.leaderHint > 0) {
-        auto it = o.peers.find(reply.leaderHint);
-        if (it != o.peers.end() && parseHostPort(it->second, host, port)) {
+        std::string h = host;
+        int p = port;
+        if (resolvePeer(o, reply.leaderHint, h, p)) {
+          host = h;
+          port = p;
           continue;  // redirect to the leader and retry
+        }
+        // 缓存里没有这个 Leader（例如刚加入的节点当选）-> 失效重取一次
+        if (!refreshed && refreshTopology(o, host, port) &&
+            resolvePeer(o, reply.leaderHint, h, p)) {
+          refreshed = true;
+          host = h;
+          port = p;
+          continue;
         }
       }
       std::cout << "NOT_LEADER\n";
@@ -346,10 +457,18 @@ int doFill(Options& o, uint64_t n, size_t pipeline) {
         if (reply.status == ClientStatus::kNotLeader) {
           ::close(fd);
           fd = -1;
+          // M4（决策⑦）：先查拓扑缓存，查不到再失效重取一次。
+          // 持 addrMu 执行：多个 worker 不会同时打拓扑接口，也不会撕裂 host/port。
           std::lock_guard<std::mutex> lk(addrMu);
           if (reply.leaderHint > 0) {
-            auto it = o.peers.find(reply.leaderHint);
-            if (it != o.peers.end()) parseHostPort(it->second, host, port);
+            std::string h = host;
+            int p = port;
+            if (resolvePeer(o, reply.leaderHint, h, p) ||
+                (refreshTopology(o, host, port) &&
+                 resolvePeer(o, reply.leaderHint, h, p))) {
+              host = h;
+              port = p;
+            }
           }
           continue;
         }
@@ -395,18 +514,10 @@ std::string membersToString(const ClusterConfig& c) {
 }
 
 int doConfig(Options& o) {
-  MsgType rt = MsgType::kClientReply;
-  Bytes rp;
-  ConfigRequestArgs args;  // action = get
-  if (!request(o.host, o.port, MsgType::kConfigRequest,
-               encodeConfigRequest(args), rt, rp)) {
-    std::cerr << "cannot reach " << o.host << ":" << o.port << "\n";
-    return -1;
-  }
+  // M4（决策⑦）：config 命令顺便刷新客户端拓扑缓存（同一个请求）
   ConfigReplyArgs reply;
-  if (rt != MsgType::kConfigReply ||
-      !decodeConfigReply(rp.data(), rp.size(), reply)) {
-    std::cerr << "bad config reply\n";
+  if (!refreshTopology(o, o.host, o.port, &reply)) {
+    std::cerr << "cannot reach " << o.host << ":" << o.port << "\n";
     return -1;
   }
   std::cout << "config_version=" << reply.config.version
@@ -419,6 +530,7 @@ int doMembership(Options& o, uint8_t action, int targetId,
                  const std::string& addr) {
   std::string host = o.host;
   int port = o.port;
+  bool refreshed = false;
   for (int attempt = 0; attempt < 20; ++attempt) {
     MsgType rt = MsgType::kClientReply;
     Bytes rp;
@@ -429,6 +541,18 @@ int doMembership(Options& o, uint8_t action, int targetId,
     // 节点侧要跑 CatchUp + 提交，放宽读超时（默认 500ms 不够）
     if (!requestWithTimeout(host, port, MsgType::kConfigRequest,
                             encodeConfigRequest(args), rt, rp, 15000)) {
+      // M4（决策⑦）：连不上 -> 失效重取拓扑，换一个已知节点重试一次
+      if (!refreshed) {
+        refreshed = true;
+        std::string altHost = host;
+        int altPort = port;
+        if (refreshTopology(o, host, port) &&
+            pickOtherNode(o, host, port, altHost, altPort)) {
+          host = altHost;
+          port = altPort;
+          continue;
+        }
+      }
       std::cerr << "cannot reach " << host << ":" << port << "\n";
       return -1;
     }
@@ -443,10 +567,17 @@ int doMembership(Options& o, uint8_t action, int targetId,
                 << " members=" << membersToString(reply.config) << "\n";
       return 0;
     }
-    auto it = o.peers.find(reply.leaderHint);
-    if (reply.leaderHint > 0 && it != o.peers.end()) {
-      parseHostPort(it->second, host, port);  // 重定向到 Leader 再试
-      continue;
+    if (reply.leaderHint > 0) {
+      std::string h = host;
+      int p = port;
+      if (resolvePeer(o, reply.leaderHint, h, p) ||
+          (!refreshed && refreshTopology(o, host, port) &&
+           resolvePeer(o, reply.leaderHint, h, p))) {
+        refreshed = true;
+        host = h;  // 重定向到 Leader 再试
+        port = p;
+        continue;
+      }
     }
     break;
   }
@@ -501,10 +632,17 @@ int doVerify(Options& o, uint64_t n) {
         if (reply.status == ClientStatus::kNotLeader) {
           ::close(fd);
           fd = -1;
+          // M4（决策⑦）：同 fill：拓扑缓存优先，miss 才失效重取
           std::lock_guard<std::mutex> lk(addrMu);
           if (reply.leaderHint > 0) {
-            auto it = o.peers.find(reply.leaderHint);
-            if (it != o.peers.end()) parseHostPort(it->second, host, port);
+            std::string h = host;
+            int p = port;
+            if (resolvePeer(o, reply.leaderHint, h, p) ||
+                (refreshTopology(o, host, port) &&
+                 resolvePeer(o, reply.leaderHint, h, p))) {
+              host = h;
+              port = p;
+            }
           }
           continue;
         }
@@ -589,7 +727,9 @@ void usage(const char* argv0) {
             << "  " << argv0 << " ... config\n"
             << "  " << argv0 << " ... add <id> <host:port>\n"
             << "  " << argv0 << " ... remove <id>\n"
-            << "  (no command -> interactive mode)\n";
+            << "  (no command -> interactive mode)\n"
+            << "客户端会自动向任意可达节点索取最新集群配置（kConfigRequest）并按新"
+               "拓扑路由，因此 --peers 只需给出一个可达种子。\n";
 }
 
 }  // namespace
