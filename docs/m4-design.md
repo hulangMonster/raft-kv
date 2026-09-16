@@ -1,6 +1,6 @@
 # M4 设计文档：集群成员变更 + 客户端路由（线性一致读）
 
-> 状态：**设计定稿 v1.0（已获用户原则批准，待评审书面确认）**
+> 状态：**设计定稿 v1.1（v1.0 已获用户批准；#1 前置校验回退修订，见 §12）**
 > 关联：[roadmap.md](roadmap.md)（M4 验收口径）· [m2-design.md](m2-design.md) · [m2-prerequisites.md](m2-prerequisites.md) ·
 > [m3-design.md](m3-design.md)（v1.3 §12）· [m3-prerequisites.md](m3-prerequisites.md) · [protocol.md](protocol.md) · [code-review.md](code-review.md)
 > 冻结方式：本文件由 #0 brainstorming 产出（决策 ①–⑧ 见 §3）。**批准后不得擅自偏离**；若 #1/#3 发现设计缺陷，回退 #0 修订并记录版本。
@@ -164,7 +164,8 @@ LogEntry: index(8) term(8) op(1)=4 key(空) value(配置 payload) clientId=0 req
 ```
 
 - `kEntryFixedLen = 41` 与帧格式**保持不变**，旧记录（op=1/2/3）解析路径不变；
-- 三处 op 白名单需追加 kConfig：`src/raft/message.cpp`（2 处）、`src/raft/file_log_store.cpp`（1 处）；
+- 需追加 `kConfig` 的 op 白名单**共 2 处**：`message.cpp::decodeLogEntry`(:38) 与 `file_log_store.cpp::decodeEntry`(:123)（#1 修订，见 §12 v1.1）；
+- `message.cpp::decodeClientRequest`(:233) 的 op 白名单**保持不变**：客户端无法伪造 `op=kConfig` 条目，成员变更只能经 `kConfigRequest` → `RaftNode::changeMembership`（刻意保留的安全性质）；
 - `KvStateMachine::apply` 对 `kConfig` 只推进 `lastApplied_`（与 kGet 同样的 no-op 分支）；
 - 配置条目的**语义处理在 RaftNode**（`advanceCommitAndApply` 拦截，不下发给 SM 数据路径）。
 
@@ -459,3 +460,4 @@ linearizableGet(key, timeoutMs):
 ## 12. 修订记录
 
 - **v1.0**（#0 brainstorming）：首次定稿。决策①–⑧ 全部选定；新增不变量 J1–J5；锁纪律新增 L10/L11；快照格式升级 RKS1 v2（兼容 v1）。
+- **v1.1**（#1 verification-before-completion）：修正 §4.2 的 op 白名单范围——只需扩展 `decodeLogEntry` 与 `FileLogStore::decodeEntry` 两处；`decodeClientRequest` 保持不变，作为“客户端不可伪造配置条目”的安全边界。依据：m4-prerequisites.md §7.3。
