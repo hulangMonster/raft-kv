@@ -393,6 +393,19 @@ linearizableGet(key, timeoutMs):
 | A14 | `ReadIndexRequiresQuorum` | 少数派 Leader 读超时失败 |
 | A15 | `SupraRulesHoldAcrossMembershipChange` | §5.4.2 反例在成员变更后仍成立 |
 | A16 | `LeaderSelfRemovalStepsDownAfterCommit` | Leader 自我移除：提交生效后才下台（§5.7） |
+| A17 | `ConfigMessageCodec` | 7/8/9/14 消息编解码往返；截断被拒 |
+| A18 | `InstalledSnapshotCarriesConfig` | 靠 InstallSnapshot 追平的节点继承快照里的配置（M4.3） |
+| A19 | `ConfigEntryTruncationRollsBackConfig` | 未提交的配置条目被截断后配置回滚（§5.2） |
+| A20 | `J2IsNotBypassedByLaterEntry` | **评审 B2**：后一条普通条目先拿到 C_new 多数派，也不得让 commitIndex 越过在途配置条目 |
+| A21 | `NewLeaderWithStaleCommitIndexMustNotServeStaleRead` | **评审 B5**：陈旧 commitIndex 的新 Leader 必须报错，绝不能返回 NOT_FOUND/旧值 |
+| A22 | `CodecRejectsMaliciousInput` | **评审 B7/O8**：count 炸弹、entry 长度越界、未知 action、重复 id、超长地址 |
+| A23 | `OnlyVotingMembersGetVotesAndRetiredNodesDoNotVote` | **评审 B1（J4）**：非成员 / 退役节点既不给票也拿不到票 |
+| A24 | `SnapshotNeverCarriesInFlightConfig` | **评审 B3**：快照配置 version ≤ 快照边界；同一批 store 重启不抛异常 |
+| A25 | `RestartKeepsConfigChangeInFlight` | **评审 B4**：重启后 J1 仍有效（不得追加第二条配置条目） |
+| A26 | `InstalledSnapshotReseatsConfigBaseline` | **评审 B4**：安装快照无条件重置配置基线（哪怕快照 version 更小） |
+| A27 | `ConcurrentMembershipChangesAreSerialized` | **评审 B6**：并发变更被串行化拒绝；日志只允许 1 条配置条目且 `version == index` |
+| A28 | `RemovedPeerIsReclaimedAfterCommit` | **评审 O2/O4**：确认送达后被移除 peer 的地址簿与每 peer 状态被回收 |
+| A29 | `RemovedPeerKeepsReceivingUntilItAcks` | **设计 v1.4(a) 强化**：提交 ≠ 送达完成——没确认收到移除条目的节点必须继续收复制，且不得被提前摘除 |
 
 ### 8.2 B 组（`FileLogStore` + `FileSnapshotStore` + 真实临时目录）
 
@@ -407,6 +420,7 @@ linearizableGet(key, timeoutMs):
 
 - `scripts/raft_membership_e2e.sh`：3 节点启动 → 压测（`fill` + `verify`）→ `add` 第 4/5 节点 → 继续压测（**无长时间失败**）→ `remove` 1 个节点 → 校验拓扑（`config`/status）与线性一致读（`get` 必须命中已提交值）；
 - `scripts/raft_membership_fault.sh --repeat 50`：变更窗口内注入 `kill -9` / `SIGSTOP`，每轮结束后校验：拓扑一致（所有存活节点 `config_version` 相同或单调推进）、压测可继续、无脑裂读。
+- `scripts/raft_membership_e2e.sh` 追加两步（**评审 O5 / 决策⑦ 的验收目标**）：**6)** `--peers` 只给一个非 Leader 种子 → 客户端仍能按最新拓扑路由到 Leader 完成线性一致读；**7)** `--host` 指向不可达端口 → 客户端自动换节点后仍能完成读。
 
 ---
 
@@ -470,3 +484,19 @@ linearizableGet(key, timeoutMs):
 - **v1.2**（#2 TDD 测试先行时澄清）：统一 未入配置 / 被移除 节点的行为边界——不竞选、不接受写，但**继续接收复制**。§5.1 第 5 步原写 只读 status/config 会被误读为拒绝复制，与决策④ 的 CatchUp 流程冲突。对应用例：A4、A10、A16。
 - **v1.3**（M4.1 落地时调整里程碑映射）：`kConfigRequest/Reply` 的**节点分发与 status 扩展**移到 M4.4（与客户端路由同期，才有真实消费者）；`B1`（重启后配置存活）依赖真实成员变更，移到 M4.2；M4.1 增加 A17（7/8 消息编解码往返）。
 - **v1.4**（M4.2 落地时澄清）：(a) 被移除节点在配置条目提交前仍留在复制目标内（drainingPeers_），否则它永远收不到「自己被移除」，会持续竞选搅乱集群；(b) 配置条目提交导致自身失去投票权时立即让位，且「已提交即成功」——propose / changeMembership 不得因同锁段内的降级返回 NotLeader。对应用例 A7 / A9 / A10 / A16。
+- **v1.5**（#4 独立评审后修订）：独立评审在 `28e1e37` 上复现了 7 个阻断缺陷（探针 `/tmp/m4probe*.cpp`），本轮全部修复并把设计口径写死。修订点如下（逐条对应评审批次）：
+  1. **§5.3 / J2 的判定范围**（评审 B2）：`commitIndex_` 只要会**触及或越过**在途配置条目（`n >= inFlightConfigIndex_`），就必须同时满足 `majority(C_old)` 对**该配置条目自身**的复制要求；只在 `n == inFlightConfigIndex_` 时判定会被「后一条普通条目先拿到 C_new 多数派」绕过（偶数旧配置下 `majority(C_old) > majority(C_new)`，例如 6→5 时 4 > 3）。
+  2. **§5.8 线性一致读新增 §8 屏障**（评审 B5）：只有 `log_.termAt(commitIndex_) == currentTerm_`（本任期已有条目提交）时 `commitIndex_` 才可信，否则新 Leader 可能持有已提交条目却尚未学到提交点，按它做 ReadIndex 会读到陈旧值。屏障不满足时**等待**（预算 = `min(调用方超时, readIndexTimeoutMs)`），超时返回 `kErr`，绝不返回可能陈旧的值。`appendNoop=false` 的配置下读路径因此可能永久失败——这是有意的安全取舍（设计默认 `appendNoop=true`）。
+  3. **§5.2 / §4.6 快照与在途配置**（评审 B3）：配置条目"追加即生效"，故 `currConfig_.version` 可能大于快照边界 `lastApplied_`。快照必须按**边界**取配置：`inFlightConfigIndex_ > snapIndex` 时写 `prevConfig_`，并以 `snapConfig.version <= snapIndex` 兜底跳过；否则重启时 `rebuildConfigFromSeedAndLog` 会因版本回退抛异常（节点起不来），或在条目被截断后留下拓扑泄漏。
+  4. **§5.1 启动重建与在途状态**（评审 B4）：`commitIndex` 是易失状态——重启后**快照边界之上最后一条配置条目一律重新标记为在途**（同时重建它的 `C_old` 与送达集合 `drainingPeers_`）。否则 J1（一次一个）与 J2（双重多数派）在重启后同时失效：可以追加第二条配置条目，且 `prevConfig_` 为空导致任何提交都判不通过。
+  5. **§5.5 安装快照的配置基线**（评审 B4 子项）：`InstallSnapshot` 后日志前缀被 compact，快照携带的配置必须**无条件**成为新的回滚基线（哪怕 `version` 更小——我们日志里那条更新的配置条目已经落在边界之下）。随后 `currConfig_` 由「基线 + 边界之上剩余日志」经 `recomputeConfigLocked()` 重算；`recomputeConfigLocked()` 同时修正 `prevConfig_`（取"最后一条在途配置的 C_old"而非基线）并按同一规则重算 `drainingPeers_`（评审 O3）。
+  6. **§5.4 步骤 5 与 §5.3 选票资格**（评审 O7 / B1）：CatchUp 判据严格按冻结口径实现——`matchIndex_[id] >= commitIndex_` **且**该 peer 在本任期至少成功应答过一次 AppendEntries（新增 `ackedTerm_`，`becomeLeader`/`becomeFollower`/add 时清零）。J4 落实为一票否决：`onRequestVote` 在 term 处理之后先判 `retiredLocked() || !currConfig_.isVoting(candidateId)` → 拒票（非成员、CatchUp 目标、已移除/退役节点一律无票）；否则一个已被移除但仍持 C_old 的分区节点可以拿到 C_old 多数派当选，用更高任期截断已提交条目。
+  7. **§5.8 变更在途时的读多数派**（评审 O1）：`readQuorumLocked` 在 `inFlightConfigIndex_ != kNoIndex` 时同 J2 双重判定（C_old 多数派也要确认本任期领导权）。
+  8. **§5.7 变更的原子性与串行化**（评审 B6）：`changeMembership` 用独立的 `membershipMu_` 覆盖「校验 → CatchUp → 追加条目 → 等提交」全过程（并发调用 `try_lock` 失败即 `kErr`，不做无谓 CatchUp）；配置条目的 `index/term` 与 `next.version` 在**同一个 `mu_` 临界区内**确定并立刻追加，使 `version == 产生它的配置条目 index` 成为不变量（旧实现先猜 index、解锁后才 propose，被别的客户端 PUT 插队时该不变量与 `maybeSnapshot` 的边界保护同时失真）。`propose()` 据此拆出 `appendEntryLocked()`（持锁追加）与 `awaitCommit()`（两条路径共用等待逻辑）。
+  9. **§5.9 送达完成与提交后的回收**（评审 O2/O4，v1.4(a) 的强化）："配置条目提交"**不等于**"被移除节点已知晓"。送达目标改为 `drainingPeers_: id -> {until, deadlineMs}`——只有当被移除节点**确认收到**移除它的配置条目（`matchIndex >= until`）或超出 `catchUpTimeoutMs` 预算时，才把它移出复制目标并回收其每 peer 状态（`erasePeerStateLocked`，含 `readAcks_`）+ 锁外 `transport_.removePeer`（L10），统一走 `removablePeersLocked()`。否则一个"没收到自己被移除"的节点会永远自认成员并靠竞选抬高任期搅乱集群（J4 让它拿不到票，但任期仍会把健康 Leader 逼下台）。回收路径：提交时（`advanceCommitAndApply`）与 Leader 每个 tick（`purgeDrainsLocked`）各一次。
+  10. **§4.3 客户端拓扑缓存落地**（评审 O5，决策⑦ 的验收目标）：客户端维护 `{configVersion, id→addr}` 缓存；收到 `kNotLeader` 且 `leaderHint` 查不到、或连接失败时，向任意可达节点取 `kConfigRequest(get)` 刷新拓扑（version 单调，不回退），再按最新拓扑重定向；`--peers` 退化为"一个可达种子"。新增 e2e 步骤 6/7 守这条目标。
+  11. **wire 健壮性**（评审 B7/O8）：`decodeAppendEntries` 的 `count` 必须先与剩余字节数核对（`count <= (n-40)/41`）；`main_raft_node` 的连接处理拆出 `serveConnection` 并用 `try/catch` 包住——恶意帧只能关闭这一条连接，绝不允许 `std::bad_alloc` → `std::terminate` 整个节点。编码器保证 `addrLen` 与插入字节数一致；`decodeConfigRequest` 拒绝 `action ∉ {0,1,2}`；配置编解码拒绝重复 id；`changeMembership` 拒绝 >64KiB 的地址。
+  12. **状态机契约**（评审 O9）：`KvStateMachine::apply` 把 `kConfig` 当"推进 `lastApplied_` 的 no-op"，`RaftNode` 不再跳过配置条目 —— 保证 SM 的 applied 与 Raft 的 `lastApplied_`/快照边界一致。
+  13. **M2 用例前提修正**（J4 连带）：`RaftElection.VoteGrantedToUpToDateCandidate` 与 `TermAndVotePersistedBeforeReply` 原来用"配置外的 `candidateId=2`"当候选人，与 J4 冲突；改为配置内成员（只改前提，被验证语义不变）。
+
+  **本轮有意保留（不做）**：完整 Joint Consensus、成员变更的批量/自动化编排（设计非目标）；`onRequestVote`/`onAppendEntries` 在 `mu_` 内 fsync（M2 既有 L2 偏差，非正确性问题，M5 两段式持久化一并解决；M3→M4 的 A/B 基准显示无回归）；多数派计算的完全单一入口（本轮已收敛为 `hasMajorityLocked` / `removablePeersLocked`，其余散点记录在案）。

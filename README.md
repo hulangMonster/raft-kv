@@ -1,6 +1,6 @@
 # raftkv —— Raft-based Distributed Key-Value Store
 
-> 里程碑：M1 ✅ 单机版 KV + WAL；M2 ✅ Raft 选主 + 日志复制；M3 ✅ 快照与日志压缩（含 group commit，已按 #4 评审加固）；M4 ✅ 成员变更 + 客户端路由 / 线性一致读。Roadmap 见
+> 里程碑：M1 ✅ 单机版 KV + WAL；M2 ✅ Raft 选主 + 日志复制；M3 ✅ 快照与日志压缩（含 group commit，已按 #4 评审加固）；M4 ✅ 成员变更 + 客户端路由 / 线性一致读（已按 #4 第三轮独立评审加固，7 个阻断项全部修复）。Roadmap 见
 > [docs/roadmap.md](docs/roadmap.md)。
 
 一个从零实现、面向简历与生产场景的分布式 KV 存储项目：
@@ -53,12 +53,14 @@ M2 在它之上实现 Raft 共识，演进为**多节点、可自动选主、可
 
 - **在线成员变更**：one-at-a-time + 新节点先 **CatchUp**（非投票、不计多数派）追平后才写入配置；配置条目进 raft.log（延续 D1，无独立配置存储），**追加即生效**（决策③）且提交需 **C_old 与 C_new 双多数派**（J2）
 - **配置持久化**：快照携带配置（RKS1 **v2**，尾部追加 config 段，**兼容 v1**）；启动按「快照配置 → 日志配置条目」重建，**版本回退即拒绝启动**（J3）；配置条目被截断时按基线**回滚**（A19）
-- **移除语义**：被移除节点在配置条目提交前仍收到该条目（drainingPeers_），提交后清理并从 transport 摘除；被移除 / 未入配置的节点进入**退役态**（不竞选、不接受写，但继续接收复制）
-- **线性一致读**：GET 走 **ReadIndex**（探针 msgType 9/14 + quorum 确认 + 等 lastApplied >= readIndex），失败即报错，**绝不退化为读本地状态机**
-- **客户端路由**：可连任意节点；新增 config / add <id> <host:port> / remove <id> 子命令，非 Leader 按 leaderHint 重定向
-- 测试：raftkv_raft_tests **58/58**；scripts/raft_membership_e2e.sh（3→4 节点在线增删 + 线性一致读）；scripts/raft_membership_fault.sh --repeat 50（5 节点，变更窗口内 kill -9 / SIGSTOP）
+- **移除语义**：被移除节点在**确认收到**移除它的配置条目之前一直是复制目标（`drainingPeers_` 带确认目标与预算，超时兜底），确认后回收每 peer 状态并从 transport 摘除（`removablePeersLocked()`）——避免它永远自认成员、靠竞选抬高任期搅乱集群；被移除 / 未入配置的节点进入**退役态**（不竞选、不接受写、**不投票**，但继续接收复制）
+- **选举资格（J4）**：只给当前配置里的投票成员投票；非成员、CatchUp 目标、退役节点一律无票——否则已移除但仍持旧配置的分区节点可以拿旧多数派当选并截断已提交条目
+- **线性一致读**：GET 走 **ReadIndex**（探针 msgType 9/14 + quorum 确认 + **§8 同任期提交屏障** + 等 lastApplied >= readIndex），失败即报错，**绝不退化为读本地状态机**，也绝不在新 Leader 尚未提交本任期条目时按陈旧 commitIndex 返回旧值
+- **客户端路由与拓扑发现**：可连任意节点；客户端缓存 `{configVersion, id→addr}`，收到 `kNotLeader`（leaderHint 查不到）或连接失败时向任意可达节点取最新配置视图后重新路由，`--peers` 退化为"一个可达种子"；新增 config / add <id> <host:port> / remove <id> 子命令
+- **变更串行化**：`changeMembership` 全过程（校验 → CatchUp → 追加配置条目 → 等提交）串行化，并发变更立即被拒（J1）
+- 测试：raftkv_raft_tests **68/68**（M2 14 + M3 14 + M4 A1–A29 / B1–B4）；scripts/raft_membership_e2e.sh（3→4 节点在线增删 + 线性一致读 + **客户端拓扑刷新两步**）；scripts/raft_membership_fault.sh --repeat 50（5 节点，变更窗口内 kill -9 / SIGSTOP）
 
-      # 任意节点接入即可（自动重定向到 Leader）
+      # 任意节点接入即可（自动重定向到 Leader；--peers 只给一个可达种子也够）
       ./build/bin/raftkv_raft_cli --peers "$PEERS" --host 127.0.0.1 --port 19601 config
       ... add 4 127.0.0.1:19604   # 第 4 个节点用 --peers 现有成员启动（非投票），追平后加入
       ... remove 4

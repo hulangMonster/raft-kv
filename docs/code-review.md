@@ -154,3 +154,131 @@ M2（Raft 选主 + 日志复制）**核心正确、可上简历**：选举、日
 5. `RaftSnapshotDisk.FileStoreClusterKeepsCommittingAfterCompaction` —— 真实文件存储集群在压缩后**持续提交**
    （修复前该用例复现了压缩后提交停滞，是定位 B13 边界错误的关键用例）。
 
+
+---
+
+# M4 代码评审报告（#4，第三轮）
+
+> 评审方式：**独立评审子代理**（只读，未改仓库；基线 HEAD `28e1e37`），产出 7 个阻断项 + 9 条优化建议，
+> 并用 `/tmp/m4probe*.cpp` 临时探针**实际复现了 B1 / B2 / B3 / B4 / B5 / B7** 的关键路径。
+> 评审范围：`docs/m4-design.md`、`docs/m4-prerequisites.md`、`src/raft/*`、`src/kv/*`、
+> `src/main_raft_*.cpp`、`tests/raft_membership_test.cpp`、`scripts/raft_membership_*.sh`，
+> 并用 `git diff` 核对了 M1/M2/M3 的存量改动。
+> 评审结论：设计文档、测试工程化、RKS1 v2、两个故障注入脚本扎实；**但 `58/58` 全绿覆盖不到 J2 越过提交、
+> J4 非成员投票、新 Leader 陈旧 ReadIndex、在途配置快照、重启丢在途配置等安全关键路径**，
+> 因此**当时不可判定 M4 完成**。
+
+## 结论：7 个阻断项 + 9 条优化项全部处理完毕 ✅
+
+修复分四批落地，每批**先写"守它的用例"（A20–A28），再在"移除修复"的状态下确认用例确实 RED**——
+这既证明了缺陷真实存在，也保证用例不会再退化成"绿灯噪声"。设计侧的对应修订见
+[m4-design.md](m4-design.md) **v1.5** §12。
+
+| 批次 | commit | 覆盖 |
+|---|---|---|
+| 批 1 | `c3f42ad` | **B2**（J2 不得被后一条条目绕过）、**B5**（ReadIndex 同任期屏障）、**B7**（count 炸弹 + 连接级 `try/catch`）；O1/O6/O7/O8/O9 的廉价部分 |
+| 批 2 | `c4e42b5` | **B1**（J4 投票资格）、**B3**（在途配置不得进快照）、**B4**（重启重建在途/prev/base + 安装快照基线）、O3 |
+| 批 3 | `a9270b0` | **B6**（`changeMembership` 串行化 + `version == index` 不变量；`propose()` 拆出 `appendEntryLocked()` / `awaitCommit()`） |
+| 批 4 | `61fd1f2` | O2（被移除 peer 的每 peer 状态 + 地址簿回收，`removablePeersLocked()` 单一入口）、O4（`readAcks_` 回收） |
+| 批 4b | 本轮 | O2 强化（设计 v1.4(a)）：**"提交"不等于"送达完成"**——送达目标改为 `{until, deadlineMs}`，被移除节点确认收到移除条目（或超预算）才移出复制目标并回收；新增 `purgeDrainsLocked()` |
+| O5 | `3088814` | 客户端拓扑缓存 + 失效重取（决策⑦ 的验收目标），e2e 新增第 6/7 步 |
+
+## 【阻断项】逐条处置
+
+| 编号 | 缺陷（评审要点） | 处置 | 守它的用例（RED 证据） |
+|---|---|---|---|
+| B1 | **J4 未落实**：`onRequestVote` 只比 term/日志新旧，给非成员与退役节点投票 → 已被移除但仍持 C_old 的分区节点可拿 C_old 多数派当选，用更高任期截断已提交条目 | ✅ 接受：term 处理之后先判 `retiredLocked() \|\| !currConfig_.isVoting(candidateId)` → 拒票 | A23（RED：三处 `voteGranted=true`） |
+| B2 | **J2 可被绕过**：提交循环只在 `n == inFlightConfigIndex_` 时校验 C_old 多数派，后一条普通条目先拿到 C_new 多数派即可越过 | ✅ 接受：凡 `n >= inFlightConfigIndex_` 都必须先满足 `hasMajorityLocked(prevConfig_, inFlightConfigIndex_)` | A20（RED：`commitIndex 2 > cfgIdx 1`） |
+| B3 | **在途配置写进快照**：`snapIndex = lastApplied_` 却写 `currConfig_` → 重启重放同一条目抛 `config version regressed`（节点起不来），或条目被截断后拓扑泄漏 | ✅ 接受：按边界取配置（在途取 `prevConfig_`）+ `snapConfig.version <= snapIndex` 兜底 | A24（RED：`sc.version 2 > 边界 1` 且重启抛异常） |
+| B4 | **重启不重建在途/prev/base**，安装快照的基线更新被 `sc.version` 门控 | ✅ 接受：重启时把快照边界之上最后一条配置条目重新标记为在途（并重建 C_old 与送达集合）；安装快照**无条件**重置基线后按「基线 + 剩余日志」重算 | A25（RED：重启后追加了第二条配置条目）、A26（RED：保留了已不在日志里的 v5 拓扑） |
+| B5 | **线性一致读可返回陈旧值**：新 Leader 未提交本任期条目时 `commitIndex_` 可能落后于真实提交点 | ✅ 接受：读前要求 `log_.termAt(commitIndex_) == currentTerm_`（§8 屏障），超时 `kErr`，绝不返回可能陈旧的值 | A21（RED：返回 `kNotFound`） |
+| B6 | **`changeMembership` check-then-act 竞态**：两个线程可同时通过 in-flight 检查；`next.version` 靠猜 index | ✅ 接受：`membershipMu_` 串行化整个变更；`index/term/version` 在同一 `mu_` 临界区内确定并立即追加 | A27（RED：两个变更同时进入 CatchUp、日志出现 2 条配置条目） |
+| B7 | **`decodeAppendEntries` 未校验 count 就 reserve**（40 字节帧 → `bad_alloc`），连接线程无 `try/catch` → `terminate` | ✅ 接受（存量缺陷，M4 未修且同端口可达，一并修）：`count <= (n-40)/41`；连接处理拆出 `serveConnection()` 并整段 `try/catch` | A22（RED：`std::bad_alloc`） |
+
+## 【优化项】逐条处置
+
+| 编号 | 建议 | 处置 |
+|---|---|---|
+| O1 | ReadIndex 在途变更时按设计做双重多数派 | ✅ 采纳：`readQuorumLocked` 在 `inFlightConfigIndex_ != kNoIndex` 时同时要求 C_old 多数派 |
+| O2 | 配置提交后清理被移除 peer（连接/每 peer map 泄漏） | ✅ 采纳并强化：批 4 起 `removablePeersLocked()` 单一入口 + `erasePeerStateLocked` + 锁外 `transport_.removePeer`；批 4b 把清理时机从"配置条目提交"推迟到"被移除节点确认收到该条目（或超 `catchUpTimeoutMs` 预算）"，见下方额外发现 4 |
+| O3 | `recomputeConfigLocked` 未重算 `drainingPeers_`/`prevConfig_` | ✅ 采纳：批 2，`prevConfig_ = 最后一条在途配置的 C_old`，并按同一规则重算送达集合 |
+| O4 | `readAcks_` 不清理 | ✅ 采纳：批 4，随 `erasePeerStateLocked` 一并回收 |
+| O5 | **客户端拓扑缓存/失效重取缺失（验收目标未达成，非"取舍"）** | ✅ 采纳：`3088814` 实现缓存 + `kConfigRequest(get)` 失效重取；e2e 新增第 6/7 步直接守这条目标 |
+| O6 | 超时配置不一致 / `readIndexTimeoutMs` 是死配置 | ✅ 部分采纳：`readIndexTimeoutMs` 接入为探针阶段预算（`min(调用方超时, 500ms)`）。**服务端 catch-up 预算（`max(timeoutMs, 30s)`）与客户端 15s 读超时的不一致保留**：`add/remove` 的结果是"提交后才算成功"，客户端超时后重试 `config` 即可看到真实结果，改变默认值会让慢网络下更容易误报失败。**推迟**：`add/remove` 的幂等状态查询 |
+| O7 | 多数派未完全单一入口 / CatchUp 判据偏严 | ✅ 采纳：CatchUp 回到设计冻结判据（`matchIndex >= commitIndex` **且**本任期已应答，新增 `ackedTerm_`）；清理逻辑收敛为 `removablePeersLocked()`。多数派计算仍散落 `hasMajorityLocked` 派生的少数几处（已复核全部带配置语义），**推迟**纯重构 |
+| O8 | 新 wire codec 健壮性（addrLen 截断、未知 action、重复 id） | ✅ 采纳：编码器保证 `addrLen` 与插入字节数一致；`decodeConfigRequest` 拒绝 `action ∉ {0,1,2}`；配置编解码拒绝重复 id；`changeMembership` 拒绝 >64KiB 地址。**推迟**："地址非空"校验——M2/M3 风格的退化配置（无地址，仅 peerIds）是合法内部状态，快照里会携带它，强制非空会让既有重启路径解不出来 |
+| O9 | SM 的 `kConfig` no-op 分支 + 锁内 fsync | ✅ 部分采纳：`KvStateMachine::apply` 把 `kConfig` 当推进 `lastApplied_` 的 no-op，`RaftNode` 不再跳过配置条目（保证 SM applied 与快照边界一致）。**锁内 fsync 保留**：这是 M2 既有 L2 偏差（`onRequestVote`/`onAppendEntries`），非正确性问题；修它要动 M2 选主/复制路径的两段式持久化，与"最小改动存量代码"冲突，且 M3→M4 的 A/B 基准显示**无回归**（见下表），随 M5 的两段式持久化一起做 |
+
+## 修复过程中的额外发现（评审未提及）
+
+1. **J4 与 M2 用例前提冲突**：`RaftElection.VoteGrantedToUpToDateCandidate`（`makeCluster(1)`）与
+   `TermAndVotePersistedBeforeReply`（无 `peerIds`）用**配置外的 `candidateId=2`** 充当候选人，
+   J4 落实后必然拒票。这两条用例想验证的是"日志同样新的候选人会拿到票"与"授权前先落盘"，
+   因此改为把候选人放进配置（`makeCluster(2)` / `cfg.peerIds = {2}`）——**只修正测试前提，被验证语义不变**。
+2. **A19 依赖"旧配置节点仍会给被移除节点投票"**：J4 之后 l1（已切到 C_new）不再给 victim 投票，
+   但 l1 之外的节点仍持 C_old，`votesGranted_ = 1 + self = 2 = majority(C_old)` 依然够，用例语义未变
+   （实测通过）。
+3. **"提交"不等于"送达完成"（A29 的由来）**：`raft_membership_fault.sh --repeat 50` 在**收尾**步骤偶发
+   "remove 未收敛"。50 轮故障全部通过，说明不是故障窗口的问题，而是：被移除的节点**没有被保证收到**
+   移除它的配置条目。J2 只要求 `majority(C_old) ∧ majority(C_new)` 确认该条目，被移除的那个节点本身
+   可以不在任何多数派里；旧实现在条目**一提交**就清空送达集合、随即摘除它的连接——于是"错过了那一
+   次发送"的节点永远停在旧配置里，会不断竞选（J4 让它拿不到票，但每次竞选都会抬高任期，把健康
+   Leader 逼下台，正是设计 v1.4(a) 想消除的搅动）。修复：送达目标带 `{until, deadlineMs}`，确认收到
+   （`matchIndex >= until`）或超预算才收尾；`purgeDrainsLocked()` 在 Leader 每 tick 兜底。守它的用例是
+   **A29**（丢包面下必须继续送达、不得提前摘除；无修复时 `sendsTo(victim)` 提交后立刻冻结、地址簿被摘）。
+4. **故障脚本自身的静默失败**："`x="$(field ...)"` 在节点瞬时不可达时会让整条管道失败，而脚本开了
+   `set -e + pipefail` → **无任何诊断地退出**（`raft_snapshot_fault.sh` 就是在 SIGSTOP/SIGCONT 边界上
+   命中它，表现为"跑到一半无声失败"）。M3 起就存在（脚本里为 `require_leader` 打过补丁，但 `field`
+   没打）。已把 `field()` 统一改成返回空串，并给收敛检查加上超时后的逐节点视图 dump。
+5. **`version == 配置条目 index` 是隐性跨模块不变量**：它同时被 `maybeSnapshot` 的边界保护
+   （`snapConfig.version <= snapIndex`）与重启期 J3 校验依赖。B6 的"猜 index"会同时打穿这两处，
+   因此批 3 把"确定 index/version + 追加"合并进同一个临界区，而不是只加一把互斥锁。
+
+## 已确认无问题（抽查复核）
+
+- 配置条目字节布局为**纯追加**：M2 `LogEntry` 落盘布局、`decodeLogEntry`/`FileLogStore::decodeEntry`
+  仅扩白名单；M1 `codec.*`、`decodeClientRequest` 未动 → 客户端仍无法伪造配置条目。
+- RKS1 v1 解码路径保留（B4 用例从 #2 起即通过）；快照五步恢复顺序未变，只在尾部追加 config 段。
+- M1 源码零行为改动（仅 `common.h` 新增 `OpCode::kConfig = 4`）；`tests/test_*.cpp`、`scripts/e2e.sh` 在 diff 中为空。
+- §5.4.2 提交规则、fast backup、D2/D3 语义、组提交 `syncedIndex_` gating 均未被 M4 改动（既有用例全绿）。
+- Leader 自我移除（A16）、退役节点继续接收复制（A10）、J5（C_old ∩ C_new ≠ ∅，one-at-a-time 保证）复核无误。
+- L10（`transport_.addPeer/removePeer` 只在锁外调用）、L11（锁序 `mu_ → transport → log`）复核无嵌套违规；
+  新增的 `membershipMu_` 是叶子锁，锁序 `membershipMu_ → mu_`，不与既有路径交叉。
+
+## 验证证据（修复后，全部在 ubuntu-vm 实测）
+
+| 检查 | 结果 |
+|---|---|
+| `raftkv_raft_tests` | **68/68 PASS**（58 → +A20–A29 共 10 例） |
+| `raftkv_tests`（M1） | **13/13 PASS** |
+| `scripts/e2e.sh`（M1） | PASS |
+| `scripts/raft_e2e.sh` | PASS |
+| `scripts/raft_snapshot_e2e.sh` | PASS |
+| `scripts/raft_membership_e2e.sh`（含新增第 6/7 步） | PASS |
+| `scripts/raft_fault.sh --repeat 50` | PASS |
+| `scripts/raft_snapshot_fault.sh --repeat 50` | PASS |
+| `scripts/raft_membership_fault.sh --repeat 50` | PASS |
+| M3(`b747c70`) vs M4 A/B 基准（同 `--snapshot-threshold`） | **13.2 ms/write vs 13.2 ms/write**——成员变更与读路径未引入回归 |
+
+**RED 证据**（临时移除修复后重跑，逐条复现评审探针现象）：
+
+| 用例 | 无修复时的失败信息（节选） |
+|---|---|
+| A20 | `Expected: (leader->commitIndex()) < (cfgIdx), actual: 2 vs 1` |
+| A21 | `Expected: (rd.status) != (ClientStatus::kNotFound), actual: 1-byte object <01>` |
+| A22 | `Actual: it throws std::bad_alloc` |
+| A23 | `Value of: on->onRequestVote(stale).voteGranted  Actual: true`（退役/非成员同样 `true`） |
+| A24 | `(sc.version) <= (snap.lastIncludedIndex) actual: 2 vs 1`；重启 `throws std::runtime_error "raft: config version regressed at index 2"` |
+| A25 | 重启后第二条配置条目被追加（`log->lastIndex()` 增长、`config_version` 被推进） |
+| A26 | 安装快照后仍保留 `v5`（`contains(3) == false`） |
+| A27 | `blocked == 2`（两个变更同时进入 CatchUp）、日志出现 2 条配置条目 |
+| A28 | `transport->wasRemoved(victim) == false`（地址簿从不回收） |
+| A29 | `sendsTo(victim)` 提交后冻结（10 vs 10）、`wasRemoved(victim) == true`（送达未确认就摘除） |
+
+## 建议执行顺序（后续）
+
+1. ✅ 7 个阻断项 + O1–O5/O8 已全部落地，`m4-membership` 快照随之可打。
+2. 推迟项：M5 两段式持久化（消除锁内 fsync，同时解决 O9 的锁内 IO）、异步 transport、
+   `LogEntry` 编解码去重（M3 O4）、`add/remove` 幂等状态查询。
+3. 评审提出的**未覆盖路径**已记录为后续工作：真实 TCP 下的恶意帧/并发 `add`（单测走 MemoryTransport）、
+   M3 v1 数据目录与 M4 日志混合的完整恢复组合、50 轮以上长时间故障下的拓扑收敛断言增强。

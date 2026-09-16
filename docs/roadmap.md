@@ -72,19 +72,28 @@
 
 ## M4 ✅ 成员变更 + 客户端路由（已完成）
 
-> 详细设计见 [m4-design.md](m4-design.md)（**v1.4**，含 4 次修订），前置校验见 [m4-prerequisites.md](m4-prerequisites.md)。
+> 详细设计见 [m4-design.md](m4-design.md)（**v1.5**，含 5 次修订；v1.5 记录第三轮评审后的口径修正），前置校验见 [m4-prerequisites.md](m4-prerequisites.md)。
 
 - ClusterConfig/Member + 配置条目（复用 M2 entry 布局，OpCode::kConfig）+ 启动配置重建（seed → 快照配置 → 日志条目，版本严格单调）
-- 成员变更：一次一个（J1）、新节点 CatchUp 后加入、提交需双多数派（J2）、移除的送达与退役、Leader 自我移除（§5.7）
-- 快照携带配置（RKS1 **v2**，兼容 v1）；InstallSnapshot 安装即继承配置；配置条目被截断时**回滚**到基线重算（§5.2）
-- 线性一致读：ReadIndex（探针 msgType 9/14）+ 客户端 config / add / remove 与重定向路由
+- 被移除节点的送达：确认收到移除条目（或超 `catchUpTimeoutMs` 预算）才移出复制目标并回收（设计 v1.4(a)）
+- 成员变更：一次一个（J1，`changeMembership` 全程串行化）、新节点 CatchUp 后加入（判据：`matchIndex >= commitIndex` 且本任期已应答）、提交需双多数派（J2，且 **commitIndex 只要触及/越过在途配置条目就必须满足 C_old 多数派**）、移除的送达与退役、Leader 自我移除（§5.7）
+- 选举与投票资格（J4）：非成员 / CatchUp 目标 / 退役节点既不给票也拿不到票
+- 快照携带配置（RKS1 **v2**，兼容 v1）；**在途配置绝不写进快照**（按边界取配置）；InstallSnapshot 安装即无条件重置配置基线并按剩余日志重算；配置条目被截断时**回滚**到基线重算（§5.2）；重启后日志尾部配置条目重新标记为**在途**（J1/J2 不因重启失效）
+- 线性一致读：ReadIndex（探针 msgType 9/14）+ **§8 同任期提交屏障**（新 Leader 未提交本任期条目时宁可变读失败也不返回陈旧值）
+- 客户端拓扑发现：缓存 `{configVersion, id→addr}`，`kNotLeader` / 连接失败时失效重取，`--peers` 只需一个可达种子
 - 验收（均实测通过）：
-  - raftkv_raft_tests **58/58**（M2 14 + M3 14 + M4 A1–A19 / B1–B4）
-  - scripts/raft_membership_e2e.sh **PASS**（3 节点压测 → 第 4 节点 seed 启动 → add → 4 节点压测 + 线性一致读 → remove → 退役校验）
+  - raftkv_raft_tests **68/68**（M2 14 + M3 14 + M4 A1–A29 / B1–B4，含评审回归 A20–A29）
+  - scripts/raft_membership_e2e.sh **PASS**（3 节点压测 → 第 4 节点 seed 启动 → add → 4 节点压测 + 线性一致读 → remove → 退役校验 → `--peers` 只给一个 follower 种子仍能路由 → 初始节点不可达时自动换节点）
   - scripts/raft_membership_fault.sh --repeat 50 **PASS**（5 节点；每轮轮换 follower 注入 kill -9 / SIGSTOP、每 4 轮额外杀 Leader，并在窗口内做成员变更；每轮校验配置收敛 + 追平 + 压测可继续 + 线性一致读）
   - 既有 M2/M3 脚本与 e2e.sh 全部保持 PASS
 - M4 期间修掉的真实缺陷：op 白名单两处漏加 kConfig（TCP 复制 / 重启恢复会静默丢配置条目）、
   TcpTransport::addPeer/removePeer 未实现（CatchUp 永远连不上新节点）、配置回滚缺失（A19）
+- **#4 第三轮独立评审（7 阻断 + 9 优化）全部处置**（详见 [code-review.md](code-review.md) M4 段）：
+  J2 被"后一条条目先提交"绕过、J4 未落实（非成员/退役节点仍投票）、新 Leader 陈旧 ReadIndex 返回旧值、
+  在途配置写进快照导致重启拒绝启动、重启丢在途配置（J1/J2 失效）、`changeMembership` check-then-act 竞态、
+  `decodeAppendEntries` count 未校验导致远程 `bad_alloc` 终止进程；优化项覆盖 ReadIndex 双重多数派、
+  被移除 peer 回收、`readAcks_` 回收、回滚重算、客户端拓扑缓存、wire codec 加固、SM 的 kConfig 契约。
+  每个修复都有对应回归用例，且**在移除修复的状态下确认过 RED**（探针现象复现）
 - 吞吐：同一机器状态下 M3 收尾版与 M4 的 fill 200 --pipeline 1 均为 13.2 ms/写（**无可测回归**）；
   bench 的绝对数字受机器状态与 --snapshot-threshold 影响很大，跨会话不可直接比较
 
