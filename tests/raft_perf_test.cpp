@@ -319,6 +319,38 @@ TEST(RaftPerf, A6_MetricsCountersAndStatusFragment) {
   EXPECT_NE(frag.find("batch_max="), std::string::npos) << frag;
 }
 
+// M5.A8 [RED->GREEN] J4 纵深防御：陈旧/陌生候选者**不得抬高我们的任期**（否则被移除节点
+// 可以靠不停竞选把健康 Leader 逼下台）；而配置内成员的高任期请求仍然必须被采纳。
+TEST(RaftPerf, A8_NonMemberVoteRequestCannotBumpTerm) {
+  auto c = makeSpyCluster(3);
+  driveSpy(c, 60, 10);
+  RaftNode* leader = spyLeader(c);
+  ASSERT_NE(leader, nullptr);
+  const Term term0 = leader->currentTerm();
+  const int lid = leader->leaderId();
+
+  // 1) 被移除/陌生节点（id=99）带更高 term 竞选：任期不得变化，角色不变
+  RequestVoteArgs stale;
+  stale.term = term0 + 5;
+  stale.candidateId = 99;
+  stale.lastLogIndex = leader->commitIndex();
+  stale.lastLogTerm = term0;
+  const auto r1 = leader->onRequestVote(stale);
+  EXPECT_FALSE(r1.voteGranted);
+  EXPECT_EQ(leader->currentTerm(), term0) << "非成员候选者不得抬高任期";
+  EXPECT_EQ(leader->role(), Role::kLeader);
+
+  // 2) 配置内成员的更高 term 请求：必须照常采纳（否则真正落后的节点会卡任期）
+  RequestVoteArgs member;
+  member.term = term0 + 1;
+  member.candidateId = (lid == 2) ? 3 : 2;
+  member.lastLogIndex = 0;
+  member.lastLogTerm = 0;
+  const auto r2 = leader->onRequestVote(member);
+  EXPECT_FALSE(r2.voteGranted);  // 日志不更新 -> 不授权
+  EXPECT_EQ(leader->currentTerm(), term0 + 1) << "成员候选者的高 term 必须被采纳";
+}
+
 // M5.A7 [GUARD] R2 守门：两段式改造不得破坏成员变更语义（J1/J2 仍成立）。
 TEST(RaftPerf, A7_ConfigChangeStillCommits) {
   auto c = makeSpyCluster(3);

@@ -33,7 +33,8 @@ TEST(ProposeStepDown, ReturnsNotLeaderAfterStepDown) {
   // A higher-term RPC forces the leader to step down.
   RequestVoteArgs higher;
   higher.term = leader->currentTerm() + 5;
-  higher.candidateId = 99;
+  // M5.2：非成员候选者不再被采纳任期（J4 纵深防御），改用配置内成员触发降级
+  higher.candidateId = 2;
   higher.lastLogIndex = kNoIndex;
   higher.lastLogTerm = kNoTerm;
   leader->onRequestVote(higher);

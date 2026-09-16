@@ -289,7 +289,8 @@ TEST(RaftSnapshot, ProposeNotLeaderUnaffectedBySnapshot) {
 
   RequestVoteArgs higher;
   higher.term = leader->currentTerm() + 5;
-  higher.candidateId = 99;
+  // M5.2：非成员候选者不再被采纳任期，改用配置内成员（前提修正，语义不变）
+  higher.candidateId = 2;
   leader->onRequestVote(higher);
 
   const auto reply = leader->propose(putReq(2000, "x", "y"), 100);

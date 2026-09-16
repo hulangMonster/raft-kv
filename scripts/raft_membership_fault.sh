@@ -64,16 +64,33 @@ wait_applied_at_least() { # <id> <min>
   done
   return 1
 }
+# 收敛判据（M5.2 起对齐设计）：只要求**当前配置的成员**收敛。
+# 被移除的节点是否学到"自己被移除"是**尽力而为**（设计 v1.4(a)）：移除条目由"当时的 Leader"
+# 送达，若该 Leader 在送达前被替换，新 Leader 不会再送达它。此时该节点停留在旧配置 —
+# 这在安全上是无害的：J4 让它拿不到票，且 M5.2 起非成员候选者的任期不再被采纳，因此它
+# 无法再用竞选搅乱集群。用例 A29 守"同一 Leader 下必须确认送达"，本脚本守"当前成员收敛"。
 wait_config_converged() {
   for _ in $(seq 1 600); do
-    local ref="" ok=1
+    local ref="" refmembers="" ok=1
+    # 先取一个存活节点的视图作为基准配置
     for id in 1 2 3 4 5 6; do
       alive "$id" || continue
       local cv ms
       cv="$(field "$id" config_version 2>/dev/null || true)"
       ms="$(field "$id" members 2>/dev/null || true)"
+      [[ -n "$cv" && -n "$ms" ]] || continue
+      ref="$cv|$ms"; refmembers=",$ms,"; break
+    done
+    [[ -n "$ref" ]] || { sleep 0.05; continue; }
+    for id in 1 2 3 4 5 6; do
+      alive "$id" || continue
+      # 只检查"当前配置成员"（被移除的节点不参与收敛判定）
+      case "$refmembers" in *",$id:"*) ;; *) continue;; esac
+      local cv ms
+      cv="$(field "$id" config_version 2>/dev/null || true)"
+      ms="$(field "$id" members 2>/dev/null || true)"
       [[ -n "$cv" && -n "$ms" ]] || { ok=0; break; }
-      if [[ -z "$ref" ]]; then ref="$cv|$ms"; elif [[ "$ref" != "$cv|$ms" ]]; then ok=0; break; fi
+      [[ "$ref" == "$cv|$ms" ]] || { ok=0; break; }
     done
     (( ok == 1 )) && return 0
     sleep 0.05

@@ -691,7 +691,8 @@ TEST(RaftMembership, A13_ReadIsNotServedByStaleLeader) {
   // 用更高任期的投票请求把 Leader 打下去：绝不能返回陈旧值
   RequestVoteArgs hv;
   hv.term = leader->currentTerm() + 5;
-  hv.candidateId = 99;
+  // M5.2：非成员候选者不再被采纳任期（J4 纵深防御）-> 用配置内成员触发降级
+  hv.candidateId = (leader->leaderId() == 2) ? 3 : 2;
   hv.lastLogIndex = 0;
   hv.lastLogTerm = 0;
   leader->onRequestVote(hv);
