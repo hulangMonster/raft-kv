@@ -16,6 +16,7 @@ class Transport {
   using VoteCb = std::function<void(const RequestVoteReply&)>;
   using AppendCb = std::function<void(const AppendEntriesReply&)>;
   using InstallCb = std::function<void(const InstallSnapshotReply&)>;
+  using ReadProbeCb = std::function<void(const ReadProbeReply&)>;
 
   virtual ~Transport() = default;
   virtual void sendRequestVote(int peerId, const RequestVoteArgs& args,
@@ -25,6 +26,15 @@ class Transport {
   // M3.3 (D4): InstallSnapshot chunk transfer.
   virtual void sendInstallSnapshot(int peerId, const InstallSnapshotArgs& args,
                                    InstallCb cb) = 0;
+
+  // M4.4: ReadIndex 探针（msgType 9/14）。默认不实现：未实现的传输会让读请求
+  // 超时失败，而绝不会退化成"读本地状态机"（保持线性一致）。
+  virtual void sendReadProbe(int peerId, const ReadProbeArgs& args,
+                             ReadProbeCb cb) {
+    (void)peerId;
+    (void)args;
+    (void)cb;
+  }
 
   // M4 (L10): 地址簿动态更新；只在锁外作业中调用。
   // 默认空实现 -> MemoryTransport 之外的测试桩零改动即可编译。
@@ -50,6 +60,9 @@ class MemoryTransport : public Transport {
                          AppendCb cb) override;
   void sendInstallSnapshot(int peerId, const InstallSnapshotArgs& args,
                            InstallCb cb) override;
+
+  void sendReadProbe(int peerId, const ReadProbeArgs& args,
+                     ReadProbeCb cb) override;
 
   // M4: 让测试把"尚未进入配置"的节点接上 transport（等价于 Leader 的 addPeer）
   void addPeer(int id, const std::string& addr) override;

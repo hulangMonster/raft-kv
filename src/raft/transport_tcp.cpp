@@ -191,6 +191,35 @@ void TcpTransport::sendAppendEntries(int peerId, const AppendEntriesArgs& args,
   }
 }
 
+void TcpTransport::addPeer(int id, const std::string& addr) {
+  std::lock_guard<std::mutex> lock(mu_);
+  const auto it = peers_.find(id);
+  if (it != peers_.end() && it->second == addr) return;
+  peers_[id] = addr;
+  dropConnection(id);  // 地址变化：旧连接作废，下次重连新地址
+}
+
+void TcpTransport::removePeer(int id) {
+  std::lock_guard<std::mutex> lock(mu_);
+  peers_.erase(id);
+  dropConnection(id);
+}
+
+void TcpTransport::sendReadProbe(int peerId, const ReadProbeArgs& args,
+                                 ReadProbeCb cb) {
+  MsgType replyType = MsgType::kReadProbeReply;
+  Bytes replyPayload;
+  if (!roundTrip(peerId, MsgType::kReadProbe, encodeReadProbe(args), replyType,
+                 replyPayload, rpcTimeoutMs_)) {
+    return;  // 丢包/超时：Leader 会因凑不齐多数派而拒绝读（不失线性一致）
+  }
+  ReadProbeReply reply;
+  if (replyType == MsgType::kReadProbeReply &&
+      decodeReadProbeReply(replyPayload.data(), replyPayload.size(), reply)) {
+    cb(reply);
+  }
+}
+
 void TcpTransport::sendInstallSnapshot(int peerId,
                                        const InstallSnapshotArgs& args,
                                        InstallCb cb) {

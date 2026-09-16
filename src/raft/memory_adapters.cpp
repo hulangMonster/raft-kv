@@ -164,6 +164,17 @@ void MemoryTransport::sendAppendEntries(int peerId,
   cb(peer->onAppendEntries(args));
 }
 
+void MemoryTransport::sendReadProbe(int peerId, const ReadProbeArgs& args,
+                                    ReadProbeCb cb) {
+  RaftNode* peer = (static_cast<size_t>(peerId) < nodes_.size())
+                       ? nodes_[static_cast<size_t>(peerId)]
+                       : nullptr;
+  const bool dropped = (static_cast<size_t>(peerId) < isolated_.size()) &&
+                       isolated_[static_cast<size_t>(peerId)];
+  if (peer == nullptr || dropped) return;
+  cb(peer->onReadProbe(args));
+}
+
 void MemoryTransport::addPeer(int id, const std::string& addr) {
   (void)addr;  // 内存传输按 id 直接投递，地址只对配置语义有意义
   if (static_cast<size_t>(id) >= nodes_.size()) {

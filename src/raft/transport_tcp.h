@@ -27,6 +27,11 @@ class TcpTransport : public Transport {
                          AppendCb cb) override;
   void sendInstallSnapshot(int peerId, const InstallSnapshotArgs& args,
                            InstallCb cb) override;
+  void sendReadProbe(int peerId, const ReadProbeArgs& args,
+                     ReadProbeCb cb) override;
+  // M4：地址簿动态更新（L10：只在锁外作业中调用）
+  void addPeer(int id, const std::string& addr) override;
+  void removePeer(int id) override;
 
  private:
   bool roundTrip(int peerId, MsgType reqType, const Bytes& reqPayload,

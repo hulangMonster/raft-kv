@@ -488,18 +488,15 @@ void RaftNode::onAppendEntriesReply(int peerId, const AppendEntriesReply& reply)
 }
 
 ClientReply RaftNode::propose(const ClientRequest& req, uint64_t timeoutMs) {
+  // M4.4（D-2）：GET 不再直接读本地状态机，改走 ReadIndex 线性一致读
+  if (req.op == OpCode::kGet) {
+    return linearizableGet(req.key, timeoutMs);
+  }
   LogEntry e;
-  const bool isGet = (req.op == OpCode::kGet);
-
   {
     std::lock_guard<std::mutex> lock(mu_);
     if (role_ != Role::kLeader) {
       return {ClientStatus::kNotLeader, "", leaderId_};
-    }
-    if (isGet) {
-      std::string out;
-      if (sm_.get(req.key, out)) return {ClientStatus::kOk, out, -1};
-      return {ClientStatus::kNotFound, "", -1};
     }
 
     e.index = log_.lastIndex() + 1;
@@ -1055,15 +1052,20 @@ ClientReply RaftNode::changeMembership(MembershipOp op, int targetId,
   }
   drainPeerQueues();
 
-  if (add && !catchUpPeer(targetId, timeoutMs)) {
+  if (add) {
+    // 追平可能要多轮 RPC（大日志），预算取调用方超时与 catchUpTimeoutMs 的较大者
+    const uint64_t budget =
+        std::max<uint64_t>(timeoutMs, cfg_.catchUpTimeoutMs);
+    if (!catchUpPeer(targetId, budget)) {
     {
       std::lock_guard<std::mutex> lock(mu_);
       pendingPeers_.erase(targetId);
       erasePeerStateLocked(targetId);
       peerRemoveQueue_.push_back(targetId);
     }
-    drainPeerQueues();
-    return {ClientStatus::kErr, "catch-up failed or timed out", -1};
+      drainPeerQueues();
+      return {ClientStatus::kErr, "catch-up failed or timed out", -1};
+    }
   }
 
   ClusterConfig next;
@@ -1108,21 +1110,110 @@ ClientReply RaftNode::changeMembership(MembershipOp op, int targetId,
   return reply;
 }
 
-ClientReply RaftNode::linearizableGet(const std::string& key,
-                                      uint64_t timeoutMs) {
-  (void)key;
-  (void)timeoutMs;
-  return {ClientStatus::kErr, "read index not implemented (M4.4)", -1};
+// ReadIndex 多数派判定：投票成员中已确认">= seq"的数量（含 self）。
+bool RaftNode::readQuorumLocked(uint64_t seq) const {
+  const size_t maj = currConfig_.majority();
+  if (maj == 0) return false;
+  size_t acks = 0;
+  for (const int peer : currConfig_.votingIds()) {
+    const auto it = readAcks_.find(peer);
+    if (it != readAcks_.end() && it->second >= seq) ++acks;
+  }
+  return acks >= maj;
 }
 
+// 线性一致读（m4-design v1.2 §5.8）：记录 readIndex -> quorum 探针确认同任期领导权
+// -> 等 lastApplied >= readIndex -> 读状态机。任一步失败都返回错误，绝不返回可能陈旧的值。
+ClientReply RaftNode::linearizableGet(const std::string& key,
+                                      uint64_t timeoutMs) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+  Index readIndex = kNoIndex;
+  Term term = kNoTerm;
+  uint64_t seq = 0;
+  std::vector<std::pair<int, ReadProbeArgs>> jobs;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (role_ != Role::kLeader) return {ClientStatus::kNotLeader, "", leaderId_};
+    readIndex = commitIndex_;
+    term = currentTerm_;
+    seq = ++readSeq_;
+    if (currConfig_.isVoting(cfg_.selfId)) readAcks_[cfg_.selfId] = seq;
+    for (const int peer : currConfig_.votingIds()) {
+      if (peer == cfg_.selfId) continue;
+      ReadProbeArgs a;
+      a.term = currentTerm_;
+      a.leaderId = cfg_.selfId;
+      a.seq = seq;
+      jobs.emplace_back(peer, a);
+    }
+  }
+
+  for (auto& j : jobs) {  // 锁外发送（L2）
+    transport_.sendReadProbe(
+        j.first, j.second,
+        [this, peer = j.first](const ReadProbeReply& reply) {
+          onReadProbeReply(peer, reply);
+        });
+  }
+
+  std::unique_lock<std::mutex> lock(mu_);
+  if (!readQuorumLocked(seq)) {
+    cv_.wait_until(lock, deadline, [&] {
+      return readQuorumLocked(seq) || role_ != Role::kLeader ||
+             currentTerm_ != term;
+    });
+  }
+  if (role_ != Role::kLeader || currentTerm_ != term) {
+    return {ClientStatus::kNotLeader, "", leaderId_};
+  }
+  if (!readQuorumLocked(seq)) {
+    return {ClientStatus::kErr, "read index timeout (no quorum)", -1};
+  }
+  if (lastApplied_ < readIndex) {
+    cv_.wait_until(lock, deadline, [&] {
+      return lastApplied_ >= readIndex || role_ != Role::kLeader ||
+             currentTerm_ != term;
+    });
+  }
+  if (role_ != Role::kLeader || currentTerm_ != term) {
+    return {ClientStatus::kNotLeader, "", leaderId_};
+  }
+  if (lastApplied_ < readIndex) {
+    return {ClientStatus::kErr, "read index timeout (apply lag)", -1};
+  }
+  std::string out;
+  if (sm_.get(key, out)) return {ClientStatus::kOk, out, -1};
+  return {ClientStatus::kNotFound, "", -1};
+}
+
+// 探针接收侧：承认同任期领导权（等价于一次心跳），回带 seq。
 ReadProbeReply RaftNode::onReadProbe(const ReadProbeArgs& args) {
-  (void)args;
-  return ReadProbeReply{};
+  std::lock_guard<std::mutex> lock(mu_);
+  if (args.term < currentTerm_) return {currentTerm_, false, args.seq};
+  if (args.term > currentTerm_) {
+    becomeFollower(args.term);
+  } else if (role_ == Role::kCandidate) {
+    role_ = Role::kFollower;
+  }
+  leaderId_ = args.leaderId;
+  lastHeartbeatMs_ = clock_.nowMs();
+  return {currentTerm_, true, args.seq};
 }
 
 void RaftNode::onReadProbeReply(int peerId, const ReadProbeReply& reply) {
-  (void)peerId;
-  (void)reply;
+  std::lock_guard<std::mutex> lock(mu_);
+  if (reply.term < currentTerm_) return;  // 陈旧回包
+  if (reply.term > currentTerm_) {
+    becomeFollower(reply.term);
+    return;
+  }
+  if (!reply.ok || !currConfig_.isVoting(peerId)) return;
+  const auto it = readAcks_.find(peerId);
+  if (it == readAcks_.end() || it->second < reply.seq) {
+    readAcks_[peerId] = reply.seq;  // 单调：更大的 seq 覆盖
+  }
+  cv_.notify_all();
 }
 
 void RaftNode::onInstallSnapshotReply(int peerId,

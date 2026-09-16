@@ -338,25 +338,37 @@ bool decodeConfigReply(const Byte* data, size_t n, ConfigReplyArgs& out) {
   out.config.members = std::move(ms);
   return true;
 }
+// msgType 9: [term:8][leaderId:4][seq:8]
 Bytes encodeReadProbe(const ReadProbeArgs& args) {
-  (void)args;
-  return Bytes{};
+  Bytes p;
+  p.reserve(20);
+  putU64(p, args.term);
+  putU32(p, static_cast<uint32_t>(args.leaderId));
+  putU64(p, args.seq);
+  return p;
 }
 bool decodeReadProbe(const Byte* data, size_t n, ReadProbeArgs& out) {
-  (void)data;
-  (void)n;
-  (void)out;
-  return false;
+  if (data == nullptr || n != 20) return false;
+  out.term = getU64(data);
+  out.leaderId = static_cast<int>(getU32(data + 8));
+  out.seq = getU64(data + 12);
+  return true;
 }
+// msgType 14: [term:8][ok:1][seq:8]
 Bytes encodeReadProbeReply(const ReadProbeReply& reply) {
-  (void)reply;
-  return Bytes{};
+  Bytes p;
+  p.reserve(17);
+  putU64(p, reply.term);
+  p.push_back(reply.ok ? 1 : 0);
+  putU64(p, reply.seq);
+  return p;
 }
 bool decodeReadProbeReply(const Byte* data, size_t n, ReadProbeReply& out) {
-  (void)data;
-  (void)n;
-  (void)out;
-  return false;
+  if (data == nullptr || n != 17) return false;
+  out.term = getU64(data);
+  out.ok = (data[8] != 0);
+  out.seq = getU64(data + 9);
+  return true;
 }
 
 }  // namespace raftkv::raft

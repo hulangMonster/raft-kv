@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <algorithm>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -141,7 +142,19 @@ void handleConnection(int fd, RaftNode& node) {
          << " commit_index=" << node.commitIndex()
          << " last_applied=" << node.lastApplied()
          << " snapshot_index=" << node.lastIncludedIndex()
-         << " snapshot_term=" << node.lastIncludedTerm();
+         << " snapshot_term=" << node.lastIncludedTerm()
+         // M4.4: 拓扑与读路径观测
+         << " config_version=" << node.configVersion()
+         << " retired=" << (node.retired() ? "true" : "false")
+         << " read_index=" << node.commitIndex();
+      const ClusterConfig cfgNow = node.clusterConfig();
+      std::ostringstream members;
+      for (size_t i = 0; i < cfgNow.members.size(); ++i) {
+        if (i != 0) members << ",";
+        members << cfgNow.members[i].id << ":" << cfgNow.members[i].addr << ":"
+                << (cfgNow.members[i].voting ? "v" : "n");
+      }
+      ss << " members=" << members.str();
       ClientReply r;
       r.status = ClientStatus::kOk;
       r.value = ss.str();
@@ -156,6 +169,36 @@ void handleConnection(int fd, RaftNode& node) {
       r.leaderHint = -1;
       const Bytes f = encodeFrame(MsgType::kClientReply, encodeClientReply(r));
       if (!writeFull(fd, f.data(), f.size())) break;
+    } else if (type == MsgType::kConfigRequest) {
+      ConfigRequestArgs args;
+      if (decodeConfigRequest(payload.data(), payload.size(), args)) {
+        ConfigReplyArgs reply;
+        reply.term = node.currentTerm();
+        reply.leaderHint = node.leaderId();
+        reply.config = node.clusterConfig();
+        if (args.action == 0) {
+          reply.ok = true;  // get：任何节点都可回答自己的配置视图
+        } else {
+          const MembershipOp op = (args.action == 1) ? MembershipOp::kAdd
+                                                     : MembershipOp::kRemove;
+          const ClientReply cr =
+              node.changeMembership(op, args.targetId, args.addr, 2000);
+          reply.ok = (cr.status == ClientStatus::kOk);
+          reply.leaderHint = cr.leaderHint;
+          reply.config = node.clusterConfig();
+        }
+        const Bytes f =
+            encodeFrame(MsgType::kConfigReply, encodeConfigReply(reply));
+        if (!writeFull(fd, f.data(), f.size())) break;
+      }
+    } else if (type == MsgType::kReadProbe) {
+      ReadProbeArgs args;
+      if (decodeReadProbe(payload.data(), payload.size(), args)) {
+        const ReadProbeReply reply = node.onReadProbe(args);
+        const Bytes f = encodeFrame(MsgType::kReadProbeReply,
+                                    encodeReadProbeReply(reply));
+        if (!writeFull(fd, f.data(), f.size())) break;
+      }
     } else {
       break;  // unknown frame type
     }
@@ -253,7 +296,23 @@ int main(int argc, char** argv) {
     // ticker long enough to starve live peers of heartbeats. Proper async
     // sends are a listed M5 improvement.
     TcpTransport transport(transportPeers, /*rpcTimeoutMs=*/30);
-    RaftNode node(cfg, log, sm, transport, clock, &snapshots);
+    // M4: --peers 是启动种子配置（version=0，含地址）；运行期由日志/快照推进
+    ClusterConfig seed;
+    seed.version = 0;
+    for (const auto& [pid, addr] : peers) {
+      Member m;
+      m.id = pid;
+      m.addr = addr;
+      m.voting = true;
+      seed.members.push_back(m);
+    }
+    // 注意：self 不在 --peers 中 = 这是一个“动态加入”的节点（seed 里没有自己）：
+    // 它必须以非投票/退役态启动，只接收复制，等 Leader 用 add 把它写入配置
+    // （m4-design v1.2 §5.1-5 / §5.4）。绝不能自动把自己塞进 seed，否则它会
+    // 以为自己已是成员而不断竞选，把现有 Leader 逼下台。
+    std::sort(seed.members.begin(), seed.members.end(),
+              [](const Member& a, const Member& b) { return a.id < b.id; });
+    RaftNode node(cfg, log, sm, transport, clock, &snapshots, seed);
 
     struct sigaction sa {};
     sa.sa_handler = onSignal;

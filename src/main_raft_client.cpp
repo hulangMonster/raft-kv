@@ -19,6 +19,7 @@
 #include <exception>
 #include <iostream>
 #include <mutex>
+#include <algorithm>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -74,6 +75,14 @@ bool writeFull(int fd, const void* buf, size_t len) {
   return true;
 }
 
+void setSocketTimeout(int fd, uint64_t ms) {
+  timeval tv{};
+  tv.tv_sec = static_cast<time_t>(ms / 1000);
+  tv.tv_usec = static_cast<suseconds_t>((ms % 1000) * 1000);
+  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 int connectTo(const std::string& host, int port) {
   struct addrinfo hints {};
   hints.ai_family = AF_UNSPEC;
@@ -111,10 +120,23 @@ bool parseHostPort(const std::string& s, std::string& host, int& port) {
 }
 
 // One request over a fresh connection; returns reply or nullptr via `ok`.
+// timeoutMs = 0 表示沿用默认的 500ms 连接超时（普通请求）；
+// 成员变更这类"节点侧要跑 CatchUp + 提交"的请求需要显式放宽。
+bool requestWithTimeout(const std::string& host, int port, MsgType type,
+                        const Bytes& payload, MsgType& replyType,
+                        Bytes& replyPayload, uint64_t timeoutMs);
+
 bool request(const std::string& host, int port, MsgType type,
              const Bytes& payload, MsgType& replyType, Bytes& replyPayload) {
+  return requestWithTimeout(host, port, type, payload, replyType, replyPayload, 0);
+}
+
+bool requestWithTimeout(const std::string& host, int port, MsgType type,
+                        const Bytes& payload, MsgType& replyType,
+                        Bytes& replyPayload, uint64_t timeoutMs) {
   const int fd = connectTo(host, port);
   if (fd < 0) return false;
+  if (timeoutMs > 0) setSocketTimeout(fd, timeoutMs);
   const Bytes frame = encodeFrame(type, payload);
   const bool w = writeFull(fd, frame.data(), frame.size());
   if (!w) {
@@ -360,6 +382,78 @@ int doFill(Options& o, uint64_t n, size_t pipeline) {
 // Reads back f0..f{n-1} and reports how many are missing. A concurrent `fill`
 // must not lose writes: requestIds of one client have to stay monotonic, which
 // is why every fill worker uses its own clientId.
+// ---- M4: 集群配置查询与成员变更 ----
+
+std::string membersToString(const ClusterConfig& c) {
+  std::ostringstream ss;
+  for (size_t i = 0; i < c.members.size(); ++i) {
+    if (i != 0) ss << ",";
+    ss << c.members[i].id << ":" << c.members[i].addr << ":"
+       << (c.members[i].voting ? "v" : "n");
+  }
+  return ss.str();
+}
+
+int doConfig(Options& o) {
+  MsgType rt = MsgType::kClientReply;
+  Bytes rp;
+  ConfigRequestArgs args;  // action = get
+  if (!request(o.host, o.port, MsgType::kConfigRequest,
+               encodeConfigRequest(args), rt, rp)) {
+    std::cerr << "cannot reach " << o.host << ":" << o.port << "\n";
+    return -1;
+  }
+  ConfigReplyArgs reply;
+  if (rt != MsgType::kConfigReply ||
+      !decodeConfigReply(rp.data(), rp.size(), reply)) {
+    std::cerr << "bad config reply\n";
+    return -1;
+  }
+  std::cout << "config_version=" << reply.config.version
+            << " members=" << membersToString(reply.config) << "\n";
+  return 0;
+}
+
+// action: 1 = add, 2 = remove。非 Leader 时按 leaderHint + --peers 重定向重试。
+int doMembership(Options& o, uint8_t action, int targetId,
+                 const std::string& addr) {
+  std::string host = o.host;
+  int port = o.port;
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    MsgType rt = MsgType::kClientReply;
+    Bytes rp;
+    ConfigRequestArgs args;
+    args.action = action;
+    args.targetId = targetId;
+    args.addr = addr;
+    // 节点侧要跑 CatchUp + 提交，放宽读超时（默认 500ms 不够）
+    if (!requestWithTimeout(host, port, MsgType::kConfigRequest,
+                            encodeConfigRequest(args), rt, rp, 15000)) {
+      std::cerr << "cannot reach " << host << ":" << port << "\n";
+      return -1;
+    }
+    ConfigReplyArgs reply;
+    if (rt != MsgType::kConfigReply ||
+        !decodeConfigReply(rp.data(), rp.size(), reply)) {
+      std::cerr << "bad config reply\n";
+      return -1;
+    }
+    if (reply.ok) {
+      std::cout << "OK config_version=" << reply.config.version
+                << " members=" << membersToString(reply.config) << "\n";
+      return 0;
+    }
+    auto it = o.peers.find(reply.leaderHint);
+    if (reply.leaderHint > 0 && it != o.peers.end()) {
+      parseHostPort(it->second, host, port);  // 重定向到 Leader 再试
+      continue;
+    }
+    break;
+  }
+  std::cerr << "membership change rejected\n";
+  return 1;
+}
+
 int doVerify(Options& o, uint64_t n) {
   std::mutex addrMu;  // guards the (shared) leader address for redirects
   std::string host = o.host;
@@ -492,6 +586,9 @@ void usage(const char* argv0) {
             << "  " << argv0 << " ... status\n"
             << "  " << argv0 << " ... fill <n> [--pipeline K]\n"
             << "  " << argv0 << " ... verify <n>\n"
+            << "  " << argv0 << " ... config\n"
+            << "  " << argv0 << " ... add <id> <host:port>\n"
+            << "  " << argv0 << " ... remove <id>\n"
             << "  (no command -> interactive mode)\n";
 }
 
@@ -548,6 +645,13 @@ int main(int argc, char** argv) {
   }
   if (cmd == "verify" && pos.size() >= 2) {
     return doVerify(o, std::stoull(pos[1]));
+  }
+  if (cmd == "config") return doConfig(o);
+  if (cmd == "add" && pos.size() >= 3) {
+    return doMembership(o, /*action=*/1, std::stoi(pos[1]), pos[2]);
+  }
+  if (cmd == "remove" && pos.size() >= 2) {
+    return doMembership(o, /*action=*/2, std::stoi(pos[1]), "");
   }
   if (cmd == "put" && pos.size() >= 3) return doOp(o, OpCode::kPut, pos[1], pos[2]);
   if (cmd == "get" && pos.size() >= 2) return doOp(o, OpCode::kGet, pos[1], "");

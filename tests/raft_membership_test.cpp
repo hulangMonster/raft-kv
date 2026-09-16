@@ -691,6 +691,30 @@ TEST(RaftMembership, A17_ConfigMessageCodec) {
   EXPECT_EQ(repOut.leaderHint, rep.leaderHint);
   EXPECT_EQ(repOut.config, rep.config);
   EXPECT_FALSE(decodeConfigReply(pe.data(), pe.size() - 1, repOut));
+
+  // 9/14：ReadIndex 探针
+  ReadProbeArgs probe;
+  probe.term = 3;
+  probe.leaderId = 1;
+  probe.seq = 42;
+  const Bytes pb = encodeReadProbe(probe);
+  ReadProbeArgs probeOut;
+  ASSERT_TRUE(decodeReadProbe(pb.data(), pb.size(), probeOut));
+  EXPECT_EQ(probeOut.term, probe.term);
+  EXPECT_EQ(probeOut.leaderId, probe.leaderId);
+  EXPECT_EQ(probeOut.seq, probe.seq);
+
+  ReadProbeReply pr;
+  pr.term = 3;
+  pr.ok = true;
+  pr.seq = 42;
+  const Bytes prb = encodeReadProbeReply(pr);
+  ReadProbeReply prOut;
+  ASSERT_TRUE(decodeReadProbeReply(prb.data(), prb.size(), prOut));
+  EXPECT_EQ(prOut.term, pr.term);
+  EXPECT_TRUE(prOut.ok);
+  EXPECT_EQ(prOut.seq, pr.seq);
+  EXPECT_FALSE(decodeReadProbeReply(prb.data(), prb.size() - 1, prOut));
 }
 
 TEST(RaftMembership, A18_InstalledSnapshotCarriesConfig) {
