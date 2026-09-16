@@ -48,7 +48,8 @@ TEST(RaftElection, SplitVoteResolvedByNextTimeout) {
 }
 
 TEST(RaftElection, VoteGrantedToUpToDateCandidate) {
-  auto c = test::makeCluster(1);
+  // M4 J4：只给当前配置里的投票成员投票 -> 候选人必须是配置内成员（这里 2 号）。
+  auto c = test::makeCluster(2);
   RequestVoteArgs args;
   args.term = 1;
   args.candidateId = 2;
@@ -67,6 +68,7 @@ TEST(RaftElection, TermAndVotePersistedBeforeReply) {
   raftkv::KvStateMachine sm;
   RaftConfig cfg;
   cfg.selfId = 1;
+  cfg.peerIds = {2};  // M4 J4：候选人 2 必须是配置内成员才会被投票
   RaftNode node(cfg, *spy, sm, *transport, *clock);
   transport->addNode(1, &node);
 

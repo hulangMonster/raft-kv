@@ -333,6 +333,13 @@ RequestVoteReply RaftNode::onRequestVote(const RequestVoteArgs& args) {
     becomeFollower(args.term);
   }
 
+  // J4（评审 B1）：只给"当前配置里的投票成员"投票。非成员（CatchUp 中的新节点、
+  // 已废弃的节点）与自己的退役态都不得投票。否则一个已被移除、但还没收到移除
+  // 条目的分区节点可以拿到 C_old 多数派当选，再用更高任期截断已提交条目。
+  if (retiredLocked() || !currConfig_.isVoting(args.candidateId)) {
+    return {currentTerm_, false};
+  }
+
   const Term lastLogTerm = log_.lastTerm();
   const Index lastLogIndex = log_.lastIndex();
   const bool upToDate =
@@ -656,7 +663,17 @@ void RaftNode::maybeSnapshot() {
     snapTerm = log_.termAt(snapIndex);
     if (snapIndex == kNoIndex || snapTerm == kNoTerm) return;  // nothing yet
     epoch = installEpoch_;
-    snapConfig = currConfig_;   // 内存拷贝（无序列化/IO，符合 L8）
+    // M4（评审 B3）：配置条目"追加即生效"，所以 currConfig_.version 可能大于快照
+    // 边界 snapIndex。把更新的在途配置写进快照会有两种后果：重启时
+    // rebuildConfigFromSeedAndLog 会从 firstIndex() 重放该条目并因版本回退直接抛
+    // 异常（节点起不来），或者该条目随后被截断而快照已经把没覆盖到的新拓扑持久化
+    // （拓扑泄漏）。因此按边界取配置：边界处的最后一个已生效配置。
+    if (inFlightConfigIndex_ != kNoIndex && inFlightConfigIndex_ > snapIndex) {
+      snapConfig = prevConfig_;  // 在途配置的 C_old 才是边界内的配置
+    } else {
+      snapConfig = currConfig_;  // 内存拷贝（无序列化/IO，符合 L8）
+    }
+    if (snapConfig.version > snapIndex) return;  // 边界覆盖不到该配置 -> 跳过本次快照
     view = sm_.snapshotView();  // memory copy only, no serialization (L8)
   }
   if (!view) return;
@@ -756,14 +773,17 @@ InstallSnapshotReply RaftNode::onInstallSnapshot(const InstallSnapshotArgs& args
       throw std::runtime_error("raft: log compaction failed (InstallSnapshot)");
     }
     ++installEpoch_;  // B5: invalidates any in-flight maybeSnapshot() save
-    // M4.3：安装快照即继承其配置（覆盖该边界的配置条目已被 compact 掉）
+    // M4.3 / M4 评审 B4：安装快照即继承其配置。日志前缀刚被 compact，快照里的
+    // 配置必须**无条件**成为新的回滚基线——哪怕 version 更小：我们日志里那条更新
+    // 的配置条目已经落在边界之下、被 compact 掉了，继续保留它就是拓扑泄漏。
+    // currConfig_ 随后由「基线 + 边界之上的剩余日志」重算（见 recomputeConfigLocked）。
+    bool snapshotConfigAdopted = false;
     if (!installed.config.empty()) {
       ClusterConfig sc;
       if (decodeClusterConfig(installed.config.data(), installed.config.size(),
-                              sc) &&
-          sc.version > currConfig_.version) {
-        adoptConfigLocked(sc, kNoIndex, /*computeDraining=*/false);
-        baseConfig_ = currConfig_;  // 快照是持久的 -> 成为回滚基线
+                              sc)) {
+        baseConfig_ = sc;
+        snapshotConfigAdopted = true;
       }
     }
     lastIncluded_ = installed.lastIncludedIndex;
@@ -779,6 +799,8 @@ InstallSnapshotReply RaftNode::onInstallSnapshot(const InstallSnapshotArgs& args
     if (installed.lastIncludedIndex > syncedIndex_) {
       syncedIndex_ = installed.lastIncludedIndex;
     }
+    // 先按新基线重算配置（含在途标记/C_old/送达集合），再推进提交点
+    if (snapshotConfigAdopted) recomputeConfigLocked();
     advanceCommitAndApply();
   }
   return {currentTerm(), true, 0};
@@ -807,6 +829,8 @@ void RaftNode::rebuildConfigFromSeedAndLog() {
   }
 
   baseConfig_ = currConfig_;  // 回滚基线：快照携带的配置，或 seed/peerIds 退化配置
+  prevConfig_ = currConfig_;
+  inFlightConfigIndex_ = kNoIndex;
 
   const Index first = log_.firstIndex();
   const Index last = log_.lastIndex();
@@ -829,7 +853,20 @@ void RaftNode::rebuildConfigFromSeedAndLog() {
           std::to_string(currConfig_.version) + ", saw " +
           std::to_string(c.version) + ")");
     }
+    prevConfig_ = currConfig_;  // 本条的 C_old
     currConfig_ = c;
+    // M4（评审 B4）：commitIndex 是易失状态——重启后快照边界之上的条目一律视为
+    // 未确认提交，因此日志里最后一条配置条目必须重新标记为"在途"，否则 J1（一次
+    // 一个）与 J2（双重多数派）在重启后同时失效，可以追加第二条配置。
+    inFlightConfigIndex_ = e.index;
+  }
+  if (inFlightConfigIndex_ != kNoIndex) {
+    // 配置条目提交前仍要送达被移除的节点（设计 §5.2 送达集合）
+    for (const Member& m : prevConfig_.members) {
+      if (m.id != cfg_.selfId && !currConfig_.contains(m.id)) {
+        drainingPeers_.push_back(m.id);
+      }
+    }
   }
 }
 
@@ -961,6 +998,7 @@ void RaftNode::recomputeConfigLocked() {
   prevConfig_ = currConfig_;
   inFlightConfigIndex_ = kNoIndex;
 
+
   const Index first = log_.firstIndex();
   const Index last = log_.lastIndex();
   if (last >= first) {
@@ -975,8 +1013,21 @@ void RaftNode::recomputeConfigLocked() {
         continue;
       }
       if (c.version <= currConfig_.version) continue;  // J3：只推进
+      // 评审 O3：C_old 必须是"本条配置之前的那个配置"，否则 J2 会拿错误的旧配置
+      // 做多数派判定（日志里有多条配置条目时尤其明显）。
+      prevConfig_ = currConfig_;
       currConfig_ = c;
       inFlightConfigIndex_ = e.index;  // 保守：视为仍未提交
+    }
+  }
+  // 评审 O3：送达集合必须一并重算——若截断后仍有在途的 remove，被移除的节点在
+  // 配置条目提交前仍然要收到复制，否则它可能永远学不到"自己被移除"。
+  drainingPeers_.clear();
+  if (inFlightConfigIndex_ != kNoIndex) {
+    for (const Member& m : prevConfig_.members) {
+      if (m.id != cfg_.selfId && !currConfig_.contains(m.id)) {
+        drainingPeers_.push_back(m.id);
+      }
     }
   }
   // 回滚后重新属于配置的成员：地址重新登记（锁外执行，L10）
@@ -992,7 +1043,6 @@ void RaftNode::recomputeConfigLocked() {
       ++it;
     }
   }
-  drainingPeers_.clear();
 }
 
 // 给某个 peer 的复制作业：落后于快照边界 -> 一个快照块；否则 AppendEntries。

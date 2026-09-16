@@ -1039,6 +1039,260 @@ TEST(RaftMembership, A22_CodecRejectsMaliciousInput) {
   }
 }
 
+TEST(RaftMembership, A23_OnlyVotingMembersGetVotesAndRetiredNodesDoNotVote) {
+  // 评审 B1（安全性，J4）：非投票成员 / 已退役节点都不得投票，也不得拿到票。
+  // 否则一个已被移除、但仍自认持有 C_old 的分区节点可以拿到 C_old 多数派当选，
+  // 再用更高任期截断已提交条目。
+  auto c = test::makeMembershipCluster(3);
+  test::driveTicks(*c, 60, 10);
+  RaftNode* leader = test::findLeader(*c);
+  ASSERT_NE(leader, nullptr);
+  const int lid = leader->leaderId();
+  int victim = 0;
+  int other = 0;
+  for (int id = 1; id <= 3; ++id) {
+    if (id == lid) continue;
+    if (victim == 0) {
+      victim = id;
+    } else {
+      other = id;
+    }
+  }
+  ASSERT_NE(victim, 0);
+  ASSERT_NE(other, 0);
+
+  ASSERT_EQ(leader->changeMembership(MembershipOp::kRemove, victim, "", 2000)
+                .status,
+            ClientStatus::kOk);
+  test::driveTicks(*c, 60, 10);
+  ASSERT_FALSE(leader->clusterConfig().contains(victim));
+
+  test::TestNode& rtn = c->nodes[static_cast<size_t>(victim - 1)];
+  RaftNode* rn = rtn.node.get();
+  ASSERT_TRUE(rn->retired());
+  RaftNode* on = c->nodes[static_cast<size_t>(other - 1)].node.get();
+
+  // 1) stale 的已移除节点竞选（日志并不落后）：持有 C_new 的成员必须拒票
+  RequestVoteArgs stale;
+  stale.term = on->currentTerm() + 1;
+  stale.candidateId = victim;
+  stale.lastLogIndex = rtn.log->lastIndex();
+  stale.lastLogTerm = rtn.log->lastTerm();
+  EXPECT_FALSE(on->onRequestVote(stale).voteGranted);
+
+  // 2) 退役节点自己也不投票（即使对方任期更高、日志更新）
+  test::TestNode& ltn = c->nodes[static_cast<size_t>(lid - 1)];
+  RequestVoteArgs fromMember;
+  fromMember.term = rn->currentTerm() + 1;
+  fromMember.candidateId = lid;
+  fromMember.lastLogTerm =
+      std::max(ltn.log->lastTerm(), rtn.log->lastTerm());
+  fromMember.lastLogIndex =
+      std::max(ltn.log->lastIndex(), rtn.log->lastIndex()) + 1;
+  EXPECT_FALSE(rn->onRequestVote(fromMember).voteGranted);
+
+  // 3) 从没进过配置的节点（CatchUp 目标）同样拿不到票
+  RequestVoteArgs outsider;
+  outsider.term = leader->currentTerm() + 1;
+  outsider.candidateId = 9;
+  outsider.lastLogIndex = ltn.log->lastIndex() + 1;
+  outsider.lastLogTerm = std::max(ltn.log->lastTerm(), leader->currentTerm());
+  EXPECT_FALSE(leader->onRequestVote(outsider).voteGranted);
+}
+
+TEST(RaftMembership, A24_SnapshotNeverCarriesInFlightConfig) {
+  // 评审 B3（持久化一致性）：配置条目"追加即生效"，所以 in-flight 配置的 version
+  // 可能大于快照边界。若把它写进快照，重启时重放同一条目会因版本回退直接抛异常。
+  auto c = test::makeMembershipCluster(3, /*appendNoop=*/false, 1000000);
+  test::driveTicks(*c, 60, 10);
+  RaftNode* leader = test::findLeader(*c);
+  ASSERT_NE(leader, nullptr);
+  const int lid = leader->leaderId();
+  int victim = 0;
+  for (int id = 1; id <= 3; ++id) {
+    if (id != lid) {
+      victim = id;
+      break;
+    }
+  }
+  test::TestNode& ltn = c->nodes[static_cast<size_t>(lid - 1)];
+
+  // 先提交一条普通条目：让 lastApplied_ > lastIncluded_，快照才有内容可做
+  ASSERT_EQ(leader->propose(putReq(1, "k", "v"), 1000).status,
+            ClientStatus::kOk);
+  ASSERT_EQ(leader->lastApplied(), static_cast<Index>(1));
+
+  // 隔离其余节点：remove 条目只能"追加即生效"，提交不了（在途）
+  for (int id = 1; id <= 3; ++id) {
+    if (id != lid) c->transport->isolate(id);
+  }
+  EXPECT_EQ(leader->changeMembership(MembershipOp::kRemove, victim, "", 300)
+                .status,
+            ClientStatus::kErr);
+  const Index cfgIdx = ltn.log->lastIndex();
+  ASSERT_EQ(cfgIdx, static_cast<Index>(2));
+  ASSERT_LT(leader->commitIndex(), cfgIdx);                 // 仍然在途
+  EXPECT_FALSE(leader->clusterConfig().contains(victim));    // 但已生效
+
+  leader->triggerSnapshot();
+  leader->tick();
+
+  SnapshotData snap;
+  ASSERT_TRUE(ltn.snapshots->load(snap));
+  ASSERT_FALSE(snap.config.empty());
+  ClusterConfig sc;
+  ASSERT_TRUE(decodeClusterConfig(snap.config.data(), snap.config.size(), sc));
+  EXPECT_LE(sc.version, snap.lastIncludedIndex);  // 快照配置不得越界（B3）
+  EXPECT_TRUE(sc.contains(victim));               // 边界内的拓扑仍是 C_old
+
+  // 同一批 store 重启（模拟崩溃恢复）：绝不能抛"config version regressed"
+  const ClusterConfig seed = test::makeSeedConfig(3);
+  RaftConfig rcfg;
+  rcfg.selfId = lid;
+  rcfg.appendNoop = false;
+  rcfg.snapshotThresholdEntries = 1000000;
+  rcfg.snapshotChunkBytes = 64;
+  for (const Member& m : seed.members) {
+    if (m.id != lid) rcfg.peerIds.push_back(m.id);
+  }
+  std::unique_ptr<RaftNode> restarted;
+  EXPECT_NO_THROW(
+      restarted = std::make_unique<RaftNode>(rcfg, *ltn.log, *ltn.sm,
+                                            *c->transport, *c->clock,
+                                            ltn.snapshots.get(), seed));
+  ASSERT_NE(restarted, nullptr);
+  // 拓扑与日志一致：快照给 C_old，日志里那条在途条目把它推进到 C_new
+  EXPECT_EQ(restarted->configVersion(), cfgIdx);
+  EXPECT_FALSE(restarted->clusterConfig().contains(victim));
+}
+
+TEST(RaftMembership, A25_RestartKeepsConfigChangeInFlight) {
+  // 评审 B4：commitIndex 是易失状态，重启后日志尾部的配置条目必须重新标记为
+  // "在途"，否则 J1（一次一个）失效 -> 可以追加第二条配置条目。
+  auto c = test::makeMembershipCluster(3, /*appendNoop=*/false, 1000000);
+  test::driveTicks(*c, 60, 10);
+  RaftNode* leader = test::findLeader(*c);
+  ASSERT_NE(leader, nullptr);
+  const int lid = leader->leaderId();
+  int victim = 0;
+  int other = 0;
+  for (int id = 1; id <= 3; ++id) {
+    if (id == lid) continue;
+    if (victim == 0) {
+      victim = id;
+    } else {
+      other = id;
+    }
+  }
+  test::TestNode& ltn = c->nodes[static_cast<size_t>(lid - 1)];
+
+  // 隔离其余节点：remove 条目追加成功但无法提交（在途）
+  for (int id = 1; id <= 3; ++id) {
+    if (id != lid) c->transport->isolate(id);
+  }
+  EXPECT_EQ(leader->changeMembership(MembershipOp::kRemove, victim, "", 300)
+                .status,
+            ClientStatus::kErr);
+  const Index cfgIdx = ltn.log->lastIndex();
+  ASSERT_GT(cfgIdx, kNoIndex);
+  ASSERT_LT(leader->commitIndex(), cfgIdx);
+
+  // kill -9 + 重新拉起（同一批 store）
+  ltn.node.reset();
+  ltn.sm = std::make_unique<KvStateMachine>();
+  const ClusterConfig seed = test::makeSeedConfig(3);
+  RaftConfig rcfg;
+  rcfg.selfId = lid;
+  rcfg.appendNoop = false;
+  rcfg.snapshotThresholdEntries = 1000000;
+  rcfg.snapshotChunkBytes = 64;
+  for (const Member& m : seed.members) {
+    if (m.id != lid) rcfg.peerIds.push_back(m.id);
+  }
+  ltn.node = std::make_unique<RaftNode>(rcfg, *ltn.log, *ltn.sm, *c->transport,
+                                        *c->clock, ltn.snapshots.get(), seed);
+  c->transport->addNode(lid, ltn.node.get());
+  RaftNode* restarted = ltn.node.get();
+
+  // 只有它 tick：它竞选并当选（其它节点会同步应答投票）
+  for (int id = 1; id <= 3; ++id) c->transport->heal(id);
+  test::tickNodesOnly(*c, {lid}, 200, 10);
+  ASSERT_EQ(restarted->role(), Role::kLeader);
+
+  // J1 必须在重启后依然有效：第二条配置条目不允被追加
+  const Index before = ltn.log->lastIndex();
+  const auto r2 =
+      restarted->changeMembership(MembershipOp::kRemove, other, "", 300);
+  EXPECT_EQ(r2.status, ClientStatus::kErr);
+  EXPECT_EQ(ltn.log->lastIndex(), before);                  // 日志没有增长
+  EXPECT_EQ(restarted->clusterConfig().version, cfgIdx);
+}
+
+TEST(RaftMembership, A26_InstalledSnapshotReseatsConfigBaseline) {
+  // 评审 B4（安装路径）：日志前缀被 compact 后，快照携带的配置必须无条件成为新的
+  // 回滚基线，哪怕 version 更小——否则会保留一条已经不在日志里的"在途配置"（拓扑泄漏）。
+  MemoryLogStore log;
+  KvStateMachine sm;
+  MemorySnapshotStore snaps;
+  MemoryTransport transport;
+  FakeClock clock;
+  const ClusterConfig seed = test::makeSeedConfig(3);
+
+  // 日志里一条更新的配置条目（v5，去掉了 3 号）
+  ClusterConfig v5 = seed;
+  v5.version = 5;
+  v5.members.erase(std::remove_if(v5.members.begin(), v5.members.end(),
+                                  [](const Member& m) { return m.id == 3; }),
+                   v5.members.end());
+  LogEntry ce;
+  ce.index = 1;
+  ce.term = 1;
+  ce.op = OpCode::kConfig;
+  ce.value = toStr(encodeClusterConfig(v5));
+  ASSERT_TRUE(log.append({ce}));
+
+  RaftConfig cfg;
+  cfg.selfId = 1;
+  cfg.snapshotThresholdEntries = 1000000;
+  cfg.snapshotChunkBytes = 64;
+  RaftNode node(cfg, log, sm, transport, clock, &snaps, seed);
+  ASSERT_EQ(node.configVersion(), static_cast<uint64_t>(5));
+  ASSERT_FALSE(node.clusterConfig().contains(3));  // v5 已把 3 号移出配置
+
+  // 构造一个边界更大（index=8）、配置更旧（v0）的合法快照，直接走安装路径
+  KvStateMachine srcSm;  // 生成合法 payload
+  LogEntry put;
+  put.index = 8;
+  put.term = 1;
+  put.op = OpCode::kPut;
+  put.key = "k";
+  put.value = "v";
+  put.clientId = 1;
+  put.requestId = 1;
+  srcSm.apply(put);
+
+  SnapshotData sd;
+  sd.lastIncludedIndex = 8;
+  sd.lastIncludedTerm = 1;
+  sd.payload = srcSm.snapshotView()->serialize();
+  sd.config = encodeClusterConfig(seed);  // v0：3 个成员都在
+
+  InstallSnapshotArgs args;
+  args.term = node.currentTerm();
+  args.leaderId = 2;
+  args.lastIncludedIndex = 8;
+  args.lastIncludedTerm = 1;
+  args.offset = 0;
+  args.done = true;
+  args.data = encodeSnapshotFile(sd);
+  ASSERT_TRUE(node.onInstallSnapshot(args).success);
+
+  EXPECT_EQ(node.lastIncludedIndex(), static_cast<Index>(8));
+  EXPECT_EQ(node.configVersion(), static_cast<uint64_t>(0));  // 基线被重置
+  EXPECT_TRUE(node.clusterConfig().contains(3));
+  EXPECT_FALSE(node.retired());
+}
+
 // ================================ B 组 ================================
 
 TEST(RaftMembershipDisk, B1_ConfigPersistsAcrossRestart) {
