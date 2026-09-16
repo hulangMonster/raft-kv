@@ -400,3 +400,24 @@ TSan（全量 raft 用例 + `raft_perf_test`）必须 0 报告；注入用例：
   4. **文档化偏差**：B 组 `B2`（流式快照兼容）/`B3`（断点续传）依赖 M5.4 才引入的接口，按子阶段 RED-first
      在 M5.4 补写；`B1`（kill -9 前后可见性）在实现侧无注入 seam（进程内无法制造"未 fsync 即崩溃"），
      由 P 组脚本（`raft_fault --repeat 50` + `verify missing 0`）承担。
+
+- **v1.2**（M5.2 落地后回填两处口径修正 + 一条新发现）：
+  1. **I9 的判定口径精确化**：`lockprobe` 改为**按锁类别**计数（`kConsensus`=mu_ / `kMembership` /
+     `kMeta`），I9 判定统一用 `lockprobe::consensusHeld()` —— "锁内"专指**共识锁 `mu_`**；
+     `membershipMu_`（成员变更串行化）与 `metaPersistMu_`（meta 落盘串行化）是叶子锁，在它们内部
+     做 IO 是设计允许的（否则"串行化 meta 落盘"本身就无从实现）。第一版探针把三类锁合并计数，
+     导致 A1/A3 把合法的 meta 串行化也算成 I9 违反。
+  2. **`tick` 的实际结构**（实现比 v1.0 描述更细）：拆成
+     [锁段1：leader 追加 no-op（只 write）/ follower 触发选举] → [锁外1：no-op 的 fsync + 推进
+     `syncedIndex_` + `advanceCommitAndApply`] → [锁外2：`flushMetaOutsideLock()`，选举场景下落盘
+     失败或任期被取代则**丢弃 voteJobs**] → [锁段2：构造心跳/复制作业] → `drainPeerQueues()` → 发送。
+     `becomeFollower` 只置 `metaDirty_`，由锁外2 延迟落盘（~10ms 内 durable）。
+  3. **新发现（重要，已修）**：把 `log_.compact()` 移出 `mu_` 会**打破 FileLogStore 依赖的外部互斥**——
+     `FileLogStore::appendNoSync()` 刻意不持 store 锁，其正确性建立在"它只在 `RaftNode::mu_` 下被调用，
+     而 `compact()/truncateSuffix()` 也在同一把锁下"这一隐含约定上（log_store.h 原注释明确写了）。
+     出锁后 append 会与 compact 的 `close/rename/reopen logFd_` 并发 → `log append failed` +
+     节点 `Aborted (core dumped)`（被 `raft_snapshot_fault.sh` 的 100k 条目 + 压缩阶段抓到）。
+     修复：**FileLogStore 自持锁**（`append/sync/appendNoSync/truncateSuffix` 公共入口统一取 `mu_`，
+     内部拆出 `*Locked` 实现避免自死锁），不再依赖 `RaftNode::mu_` 串行化。
+     ⇒ **新增工程准则 L16**：任何"把 IO 移出 `mu_`"的改动，必须逐一确认被移出方与**仍留在锁内**的
+     调用方之间原有的互斥/顺序关系是否被打破；被移出方若曾借用 `mu_` 做互斥，就必须自己补锁。

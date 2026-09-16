@@ -45,6 +45,7 @@
 | **L13** | `metaPersistMu_` 是叶子锁，锁序 **`metaPersistMu_ → mu_`**；持 `mu_` 时绝不获取它。"决定 term/votedFor → 落盘 → 回锁校验"整体在 `metaPersistMu_` 下串行，保证**磁盘 meta 版本单调** |
 | **L14** | `Reactor` 线程**从不持有 `mu_`**；它只触发回调，回调入口自己取 `mu_`（与今日同步回调一致）。`Transport` 内部锁序列保持在 `mu_` 之外，锁序不变 |
 | **L15** | 关闭顺序：`Reactor::stop()`（停 epoll → 关连接 → 丢弃在途回调）→ join reactor → join ticker → 再析构 `RaftNode`/store；**禁止再用 `std::_Exit(0)` 绕过析构** |
+| **L16** | （M5.2 实测新增）任何"把 IO 移出 `mu_`"的改动，必须确认被移出方与**仍留在锁内**的调用方之间原有的互斥/顺序关系是否被打破；被移出方若曾借用 `mu_` 互斥，必须自己补锁（例：`FileLogStore::appendNoSync` 依赖 `mu_` 与 `compact()` 互斥，出锁后必须改为 store 自持锁） |
 
 ### 2.3 原子性与可见性
 
