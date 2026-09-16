@@ -147,6 +147,9 @@ class RaftNode {
   // M5.2：串行化 meta 落盘（叶子锁，锁序 metaPersistMu_ -> mu_）；metaDirty_ 受 mu_ 保护。
   MetaMutex metaPersistMu_;
   bool metaDirty_ = false;
+  // M5.2：非选举场景的 meta 落盘限频（I5 只对授权/自投票要求严格）
+  static constexpr uint64_t kMetaFlushMinGapMs = 50;
+  uint64_t lastMetaFlushMs_ = 0;
   uint64_t readSeq_ = 0;                            // M4.4: ReadIndex 探针序号（单调）
   std::unordered_map<int, uint64_t> readAcks_;      // M4.4: peer -> 已确认的最大探针序号
 

@@ -338,14 +338,34 @@ void RaftNode::tick() {
     }
   }
 
-  // 锁外 2：term/votedFor 落盘（I5）。选举场景下**未 durable 就绝不发投票请求**。
+  // 锁外 2：term/votedFor 落盘。
+  //   * 选举（自投票）：I5 要求**发投票请求前必须 durable** -> 每次都落盘
+  //   * 其它（becomeFollower 的任期更新）：只要求"尽快 durable" -> **限频 ≥50ms**
+  //     （v1.4 观测：故障注入下任期频繁更替会让 ticker 反复做 meta fsync（1.4-2.8ms/次），
+  //      并与授权路径争 metaPersistMu_，把心跳节奏拖慢 -> 触发更多选举 -> 正反馈）
   if (metaFlushNeeded) {
-    const bool ok = flushMetaOutsideLock();
-    if (!ok) {
-      voteJobs.clear();
-    } else if (electionTerm != kNoTerm) {
+    bool doFlush = (electionTerm != kNoTerm);
+    if (doFlush) {
       std::lock_guard<ProbedMutex> lock(mu_);
-      if (currentTerm_ != electionTerm) voteJobs.clear();  // 窗口内被取代
+      lastMetaFlushMs_ = clock_.nowMs();
+    } else {
+      const uint64_t nowMs = clock_.nowMs();
+      std::lock_guard<ProbedMutex> lock(mu_);
+      if (nowMs - lastMetaFlushMs_ >= kMetaFlushMinGapMs) {
+        lastMetaFlushMs_ = nowMs;
+        doFlush = true;
+      }
+    }
+    if (doFlush) {
+      const bool ok = flushMetaOutsideLock();
+      if (!ok) {
+        voteJobs.clear();
+      } else if (electionTerm != kNoTerm) {
+        std::lock_guard<ProbedMutex> lock(mu_);
+        if (currentTerm_ != electionTerm) voteJobs.clear();  // 窗口内被取代
+      }
+    } else if (electionTerm != kNoTerm) {
+      voteJobs.clear();  // 不会发生（选举必落盘），保守兜底
     }
   }
 
@@ -423,17 +443,20 @@ RequestVoteReply RaftNode::onRequestVote(const RequestVoteArgs& args) {
   Term grantedTerm = kNoTerm;
   {
     std::lock_guard<ProbedMutex> lock(mu_);
+    // J4 + 纵深防御（M5.2 故障注入实测补充）：候选者不在当前配置的投票成员里时，
+    // **连它的任期都不采纳**。否则一个"没收到自己被移除"的陈旧节点（或任何陌生节点）
+    // 可以靠不停竞选把健康 Leader 逼下台 —— 它拿不到票，但每次竞选都发起一轮真实选举，
+    // 足以把集群搅成选举风暴（实测：被移除节点落后一个配置版本 + 持续竞选）。
+    // 不采纳不会让真正落后的节点卡住任期：它会通过 AppendEntries 或 RequestVoteReply
+    // 里更高的 term 追平（两条路径都会 becomeFollower）。
+    if (retiredLocked() || !currConfig_.isVoting(args.candidateId)) {
+      return {currentTerm_, false};
+    }
     if (args.term < currentTerm_) {
       return {currentTerm_, false};
     }
     if (args.term > currentTerm_) {
       becomeFollower(args.term);
-    }
-
-    // J4（评审 B1）：只给"当前配置里的投票成员"投票。非成员（CatchUp 中的新节点、
-    // 已废弃的节点）与自己的退役态都不得投票。
-    if (retiredLocked() || !currConfig_.isVoting(args.candidateId)) {
-      return {currentTerm_, false};
     }
 
     const Term lastLogTerm = log_.lastTerm();

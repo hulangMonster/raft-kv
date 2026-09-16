@@ -38,6 +38,11 @@ namespace {
 
 std::atomic<bool> g_running{true};
 std::atomic<int> g_connClientId{1};
+// M5.2 实测：故障窗口内客户端重试洪泛会让 thread-per-connection 无限起线程
+// （实测单节点 1021 个线程，几乎全在等锁）-> ticker 被饿死 -> 无法选主。
+// 在 Reactor 落地（M5.3）之前先加硬上限：超限直接关连接，绝不让线程数失控。
+std::atomic<int> g_activeConns{0};
+constexpr int kMaxConns = 256;
 
 void onSignal(int /*sig*/) { g_running = false; }
 
@@ -394,7 +399,15 @@ int main(int argc, char** argv) {
       tv.tv_sec = 0;
       tv.tv_usec = 500000;  // idle connections wake every 0.5s to check stop
       ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-      std::thread([c, &node, &metrics] { handleConnection(c, node, metrics); }).detach();
+      if (g_activeConns.load() >= kMaxConns) {
+        ::close(c);  // 保护：拒绝而不是无限起线程
+        continue;
+      }
+      g_activeConns.fetch_add(1);
+      std::thread([c, &node, &metrics] {
+        handleConnection(c, node, metrics);
+        g_activeConns.fetch_sub(1);
+      }).detach();
     }
 
     ::close(lsock);
