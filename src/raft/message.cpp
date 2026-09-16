@@ -37,7 +37,8 @@ bool decodeLogEntry(const Byte* p, size_t n, LogEntry& e) {
   const uint8_t op = p[16];
   if (op != static_cast<uint8_t>(OpCode::kPut) &&
       op != static_cast<uint8_t>(OpCode::kGet) &&
-      op != static_cast<uint8_t>(OpCode::kDel)) {
+      op != static_cast<uint8_t>(OpCode::kDel) &&
+      op != static_cast<uint8_t>(OpCode::kConfig)) {  // M4: 配置条目（m4-prerequisites §5.1-11）
     return false;
   }
   const size_t keyLen = getU32(p + 17);

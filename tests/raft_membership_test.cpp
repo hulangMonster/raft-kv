@@ -386,14 +386,17 @@ TEST(RaftMembership, A7_SecondChangeRejectedWhileOneInFlight) {
   }
 
   test::TestNode& ltn = c->nodes[static_cast<size_t>(lid - 1)];
+  // 只移除"非 leader"的节点（移除 leader 自己属于 §5.7，另行覆盖）
+  const int target = (lid == 5) ? 4 : 5;
+  const int other = (target == 4) ? 3 : 4;
   const Index before = ltn.log->lastIndex();
-  EXPECT_EQ(leader->changeMembership(MembershipOp::kRemove, 5, "", 300).status,
-            ClientStatus::kErr);  // 未凑齐多数派
+  EXPECT_EQ(leader->changeMembership(MembershipOp::kRemove, target, "", 300).status,
+            ClientStatus::kErr);  // 未凑齐多数派 -> 超时
   const Index afterFirst = ltn.log->lastIndex();
   EXPECT_GT(afterFirst, before);  // 条目已追加：变更在途
 
   // J1：在途期间第二个变更必须被拒绝，且不得追加新条目
-  EXPECT_EQ(leader->changeMembership(MembershipOp::kRemove, 4, "", 300).status,
+  EXPECT_EQ(leader->changeMembership(MembershipOp::kRemove, other, "", 300).status,
             ClientStatus::kErr);
   EXPECT_EQ(ltn.log->lastIndex(), afterFirst);
 }
@@ -406,10 +409,16 @@ TEST(RaftMembership, A8_ConfigCommitNeedsBothMajorities) {
   ASSERT_NE(leader, nullptr);
   const int lid = leader->leaderId();
 
-  // 4 号节点可达（能追平），但对"配置条目"的回包被丢掉：3、4 都收不到 ack
+  // 4 号节点可达（能追平），但对"配置条目"的回包被丢掉：
+  // 只允许 leader + 1 个旧成员 ack（满足 C_old 多数派 2/3，但不满足 C_new 多数派 3/4）
   ExtraNode n4;
   attachExtraNode(*c, 4, n4, test::makeSeedConfig(3));
-  transport->dropConfigRepliesFrom({3, 4});
+  std::vector<int> oldFollowers;
+  for (int id = 1; id <= 3; ++id) {
+    if (id != lid) oldFollowers.push_back(id);
+  }
+  ASSERT_EQ(oldFollowers.size(), 2u);
+  transport->dropConfigRepliesFrom({oldFollowers[1], 4});
 
   test::TestNode& ltn = c->nodes[static_cast<size_t>(lid - 1)];
   const Index before = ltn.log->lastIndex();
@@ -623,8 +632,9 @@ TEST(RaftMembership, A15_SupraRuleHoldsAfterMembershipChange) {
   ASSERT_EQ(carrier->role(), Role::kLeader);
 
   // 4) 心跳把旧任期条目复制到多数派，但 §5.4.2 禁止据此提交
+  //    （配置条目本身是它自己任期的，已提交；未提交的是 oldIndex 处的旧任期条目）
   test::tickNodesOnly(*c, {carrier->leaderId()}, 200, 10);
-  EXPECT_EQ(carrier->commitIndex(), kNoIndex);
+  EXPECT_LT(carrier->commitIndex(), oldIndex);
 
   // 5) 本任期条目提交后把旧条目一起带上去
   const auto r2 = carrier->propose(putReq(2, "new", "v2"), 1000);

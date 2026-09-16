@@ -84,6 +84,21 @@ class RaftNode {
   void maybeSnapshot();
   void rebuildConfigFromSeedAndLog();
 
+  // ---- M4.2: membership plumbing ----
+  struct PeerJob {                    // 给某个 peer 的复制作业（追加 or 快照块）
+    bool isSnapshot = false;
+    AppendEntriesArgs append;
+    InstallSnapshotArgs snapshot;
+  };
+  bool retiredLocked() const;                      // 调用方持锁
+  bool hasMajorityLocked(const ClusterConfig& c, Index index) const;
+  std::vector<int> replicationTargetsLocked() const;   // 配置成员 ∪ CatchUp 目标
+  void erasePeerStateLocked(int peerId);
+  void applyAppendedConfigLocked(const std::vector<LogEntry>& appended);
+  PeerJob buildPeerJobLocked(int peer);
+  bool catchUpPeer(int peerId, uint64_t timeoutMs);
+  void drainPeerQueues();                          // L10：锁外执行地址簿更新
+
   RaftConfig cfg_;
   LogStore& log_;
   StateMachine& sm_;
@@ -92,6 +107,12 @@ class RaftNode {
   SnapshotStore* snapshots_ = nullptr;  // nullptr == snapshots disabled (M2)
   ClusterConfig seedConfig_;            // M4: 启动种子配置（--peers），version = 0
   ClusterConfig currConfig_;            // M4: 当前配置（seed -> 日志配置条目；快照配置见 M4.3）
+  ClusterConfig prevConfig_;            // M4: 在途配置条目的 C_old（J2 双重多数派用）
+  Index inFlightConfigIndex_ = kNoIndex;  // M4: 在途配置条目 index（kNoIndex = 无）
+  std::unordered_map<int, std::string> pendingPeers_;  // M4: CatchUp 目标（非投票、不计多数派）
+  std::vector<std::pair<int, std::string>> peerAddQueue_;  // M4: 待注册地址（锁外执行）
+  std::vector<int> peerRemoveQueue_;                       // M4: 待摘除节点（锁外执行）
+  std::vector<int> drainingPeers_;      // M4: C_old 有、C_new 无的节点；配置条目提交前仍要送达
 
   // M3 snapshot boundary state
   Index lastIncluded_ = kNoIndex;

@@ -1,6 +1,6 @@
 # M4 设计文档：集群成员变更 + 客户端路由（线性一致读）
 
-> 状态：**设计定稿 v1.2（v1.0 已获用户批准；v1.1 = #1 回退修订，v1.2 = #2 澄清退役态，见 §12）**
+> 状态：**设计定稿 v1.4（v1.0 已获批准；v1.1 #1 修订、v1.2 #2 澄清、v1.3 M4.1 映射、v1.4 M4.2 落地澄清，见 §12）**
 > 关联：[roadmap.md](roadmap.md)（M4 验收口径）· [m2-design.md](m2-design.md) · [m2-prerequisites.md](m2-prerequisites.md) ·
 > [m3-design.md](m3-design.md)（v1.3 §12）· [m3-prerequisites.md](m3-prerequisites.md) · [protocol.md](protocol.md) · [code-review.md](code-review.md)
 > 冻结方式：本文件由 #0 brainstorming 产出（决策 ①–⑧ 见 §3）。**批准后不得擅自偏离**；若 #1/#3 发现设计缺陷，回退 #0 修订并记录版本。
@@ -302,7 +302,9 @@ bool RaftNode::hasMajority(const ClusterConfig& c,
 
 1. 校验：`id` 在配置中、无在途变更、`id != selfId`（移除自身见 §5.7）；
 2. 追加配置条目 `C_new = currConfig_ - id`；
-3. **生效时**（本地看到该条目）即把 `id` 从 `currConfig_` 移除，并清理：`nextIndex_/matchIndex_/lastSentEndIndex_/snapshotSendOffset_/snapshotChunkEnd_/readAcks_/pendingPeers_`；
+3. **生效时**（本地看到该条目）即把 `id` 从 `currConfig_` 移除；
+   该节点在配置条目**提交前**仍留在复制目标集合（`drainingPeers_`），确保它收到「自己被移除」这一条目；
+   提交后清空该集合，并清理以下状态：
 4. **锁外**执行 `transport_.removePeer(id)`（L10）；
 5. 提交判定按 J2（旧配置多数派 + 新配置多数派）。
 
@@ -317,6 +319,8 @@ bool RaftNode::hasMajority(const ClusterConfig& c,
 
 - `remove <leaderId>` 由**其他节点**或客户端发起；Leader 追加该条目后**继续服务**直到该条目**提交并生效**，随后主动 `becomeFollower` 并进入退役态；
 - 若客户端直接对 Leader 请求 `remove self`：允许，但回复在条目提交后才返回（复用 propose 的超时语义），回复中带 `leaderHint=-1` 提示自行重新发现拓扑。
+- **v1.4 落地澄清**：配置条目提交的那一刻，若自身已不是投票成员，Leader 立即 `becomeFollower`；
+  且 `changeMembership` / `propose` 对「已提交」的条目一律返回成功（kOk），不得因为同一锁段内的降级而报 NotLeader。
 
 ### 5.8 ReadIndex 线性一致读
 
@@ -465,3 +469,4 @@ linearizableGet(key, timeoutMs):
 - **v1.1**（#1 verification-before-completion）：修正 §4.2 的 op 白名单范围——只需扩展 `decodeLogEntry` 与 `FileLogStore::decodeEntry` 两处；`decodeClientRequest` 保持不变，作为“客户端不可伪造配置条目”的安全边界。依据：m4-prerequisites.md §7.3。
 - **v1.2**（#2 TDD 测试先行时澄清）：统一 未入配置 / 被移除 节点的行为边界——不竞选、不接受写，但**继续接收复制**。§5.1 第 5 步原写 只读 status/config 会被误读为拒绝复制，与决策④ 的 CatchUp 流程冲突。对应用例：A4、A10、A16。
 - **v1.3**（M4.1 落地时调整里程碑映射）：`kConfigRequest/Reply` 的**节点分发与 status 扩展**移到 M4.4（与客户端路由同期，才有真实消费者）；`B1`（重启后配置存活）依赖真实成员变更，移到 M4.2；M4.1 增加 A17（7/8 消息编解码往返）。
+- **v1.4**（M4.2 落地时澄清）：(a) 被移除节点在配置条目提交前仍留在复制目标内（drainingPeers_），否则它永远收不到「自己被移除」，会持续竞选搅乱集群；(b) 配置条目提交导致自身失去投票权时立即让位，且「已提交即成功」——propose / changeMembership 不得因同锁段内的降级返回 NotLeader。对应用例 A7 / A9 / A10 / A16。

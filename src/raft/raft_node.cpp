@@ -11,6 +11,7 @@
 #include <chrono>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 #include "raft/clock.h"
@@ -127,12 +128,18 @@ void RaftNode::becomeLeader() {
   lastHeartbeatSentMs_ = 0;  // send an immediate heartbeat on the next tick
 
   const Index next = log_.lastIndex() + 1;
-  for (const int peer : cfg_.peerIds) {
+  for (const int peer : replicationTargetsLocked()) {
     nextIndex_[peer] = next;
     matchIndex_[peer] = kNoIndex;
     lastSentEndIndex_[peer] = kNoIndex;
     snapshotSendOffset_[peer] = 0;
     snapshotChunkEnd_[peer] = 0;
+  }
+  // 新配置里可能有本节点此前不知道的地址：出锁后注册（L10）
+  for (const Member& m : currConfig_.members) {
+    if (m.id != cfg_.selfId && !m.addr.empty()) {
+      peerAddQueue_.emplace_back(m.id, m.addr);
+    }
   }
   matchIndex_[cfg_.selfId] = log_.lastIndex();
   cv_.notify_all();
@@ -149,12 +156,14 @@ void RaftNode::startElection(
   lastHeartbeatMs_ = now;
   electionTimeoutMs_ = electionTimeoutMs(cfg_, cfg_.selfId, currentTerm_);
 
-  if (cfg_.peerIds.empty()) {  // majority of 1 == self (single-node path)
+  const std::vector<int> voters = currConfig_.votingIds();
+  if (voters.size() <= 1) {  // 只有自己一个投票成员 -> 立即当选
     becomeLeader();
     return;
   }
 
-  for (const int peer : cfg_.peerIds) {
+  for (const int peer : voters) {
+    if (peer == cfg_.selfId) continue;
     RequestVoteArgs args;
     args.term = currentTerm_;
     args.candidateId = cfg_.selfId;
@@ -193,28 +202,37 @@ AppendEntriesArgs RaftNode::buildAppendEntries(int peer) {
 
 void RaftNode::advanceCommitAndApply() {
   if (role_ == Role::kLeader) {
-    const size_t majority = (cfg_.peerIds.size() + 1) / 2 + 1;
     for (Index n = log_.lastIndex(); n > commitIndex_; --n) {
       if (log_.termAt(n) != currentTerm_) continue;  // §5.4.2: only current term
-      // Self counts only once the entry is locally durable (group commit).
-      size_t replicated = (n <= syncedIndex_) ? 1 : 0;
-      for (const int peer : cfg_.peerIds) {
-        if (matchIndex_[peer] >= n) ++replicated;
+      bool committed = hasMajorityLocked(currConfig_, n);
+      if (committed && n == inFlightConfigIndex_) {
+        // J2：在途配置条目还必须拿到 C_old 的多数派
+        committed = hasMajorityLocked(prevConfig_, n);
       }
-      if (replicated >= majority) {
+      if (committed) {
         commitIndex_ = n;
         break;
       }
     }
   }
 
-  // Apply committed entries in order.
+  // Apply committed entries in order. 配置条目只推进 applied（配置在追加时已生效）
   while (lastApplied_ < commitIndex_) {
     const Index next = lastApplied_ + 1;
     auto entries = log_.slice(next, 1, std::numeric_limits<size_t>::max());
     if (entries.empty() || entries[0].index != next) break;
-    sm_.apply(entries[0]);
+    if (entries[0].op != OpCode::kConfig) sm_.apply(entries[0]);
     lastApplied_ = next;
+  }
+
+  // 配置条目一旦提交：清空在途标记与送达集合；自身被移除则让位（§5.7）
+  if (inFlightConfigIndex_ != kNoIndex && commitIndex_ >= inFlightConfigIndex_) {
+    inFlightConfigIndex_ = kNoIndex;
+    prevConfig_ = currConfig_;
+    drainingPeers_.clear();
+    if (role_ == Role::kLeader && !currConfig_.isVoting(cfg_.selfId)) {
+      becomeFollower(currentTerm_);
+    }
   }
   cv_.notify_all();
 }
@@ -250,37 +268,23 @@ void RaftNode::tick() {
       }
       if (now - lastHeartbeatSentMs_ >= cfg_.heartbeatMs) {
         lastHeartbeatSentMs_ = now;
-        for (const int peer : cfg_.peerIds) {
-          // M3.3: a peer behind the snapshot boundary gets one snapshot chunk
-          // per tick (so the ticker is never blocked for long).
-          if (lastIncluded_ != kNoIndex && !snapshotBytes_.empty() &&
-              nextIndex_[peer] <= lastIncluded_) {
-            const uint64_t total = snapshotBytes_.size();
-            uint64_t start = snapshotSendOffset_[peer];
-            if (start >= total) start = 0;
-            const uint64_t remaining = total - start;
-            const uint64_t take =
-                std::min<uint64_t>(cfg_.snapshotChunkBytes, remaining);
-            InstallSnapshotArgs a;
-            a.term = currentTerm_;
-            a.leaderId = cfg_.selfId;
-            a.lastIncludedIndex = lastIncluded_;
-            a.lastIncludedTerm = lastIncludedTerm_;
-            a.offset = start;
-            a.done = (start + take >= total);
-            a.data.assign(snapshotBytes_.begin() + start,
-                          snapshotBytes_.begin() + start + take);
-            snapshotChunkEnd_[peer] = start + take;
-            snapJobs.emplace_back(peer, std::move(a));
+        // 每个 peer 一条作业：落后于快照边界 -> 一个快照块；否则 AppendEntries。
+        // tick / propose / CatchUp 共用同一路由（M3 评审 B13 的建议）。
+        for (const int peer : replicationTargetsLocked()) {
+          PeerJob job = buildPeerJobLocked(peer);
+          if (job.isSnapshot) {
+            snapJobs.emplace_back(peer, std::move(job.snapshot));
           } else {
-            appendJobs.emplace_back(peer, buildAppendEntries(peer));
+            appendJobs.emplace_back(peer, std::move(job.append));
           }
         }
       }
-    } else if (now - lastHeartbeatMs_ >= electionTimeoutMs_) {
+    } else if (!retiredLocked() && now - lastHeartbeatMs_ >= electionTimeoutMs_) {
       startElection(now, voteJobs);
     }
   }
+
+  drainPeerQueues();  // L10：地址簿更新只在锁外执行
 
   for (auto& job : voteJobs) {
     transport_.sendRequestVote(
@@ -384,6 +388,8 @@ AppendEntriesReply RaftNode::onAppendEntries(const AppendEntriesArgs& args) {
     if (toAppend.back().index > syncedIndex_) {
       syncedIndex_ = toAppend.back().index;
     }
+    // M4：配置条目在追加时生效（决策③）
+    applyAppendedConfigLocked(toAppend);
   }
 
   // The last entry this leader has actually shown us is the most we may ever
@@ -409,7 +415,7 @@ AppendEntriesReply RaftNode::onAppendEntries(const AppendEntriesArgs& args) {
   return {currentTerm_, true, kNoIndex, kNoTerm};
 }
 
-void RaftNode::onRequestVoteReply(int /*peerId*/, const RequestVoteReply& reply) {
+void RaftNode::onRequestVoteReply(int peerId, const RequestVoteReply& reply) {
   std::lock_guard<std::mutex> lock(mu_);
   if (reply.term > currentTerm_) {
     becomeFollower(reply.term);
@@ -420,10 +426,13 @@ void RaftNode::onRequestVoteReply(int /*peerId*/, const RequestVoteReply& reply)
     return;
   }
 
+  if (!currConfig_.isVoting(peerId)) return;  // 非投票成员 / 已移除节点的票不计
+  const size_t majority = currConfig_.majority();
+  if (majority == 0) return;
+
   ++votesGranted_;
-  const size_t totalNodes = cfg_.peerIds.size() + 1;
-  const size_t majority = totalNodes / 2 + 1;
-  if (static_cast<size_t>(votesGranted_) + 1 >= majority) {  // +1 for self vote
+  const size_t selfVote = currConfig_.isVoting(cfg_.selfId) ? 1 : 0;
+  if (static_cast<size_t>(votesGranted_) + selfVote >= majority) {
     becomeLeader();
   }
 }
@@ -496,6 +505,8 @@ ClientReply RaftNode::propose(const ClientRequest& req, uint64_t timeoutMs) {
     if (!log_.appendNoSync({e})) {
       return {ClientStatus::kErr, "log append failed", -1};
     }
+    // M4：配置条目在追加时生效（决策③）；J2 的提交判定在 advanceCommitAndApply
+    applyAppendedConfigLocked({e});
   }
 
   const auto deadline = std::chrono::steady_clock::now() +
@@ -505,10 +516,12 @@ ClientReply RaftNode::propose(const ClientRequest& req, uint64_t timeoutMs) {
     Index flushTarget = kNoIndex;
     {
       std::lock_guard<std::mutex> lock(mu_);
+      // 已提交即成功：Leader 自我移除（§5.7）会在配置条目提交的同一锁段内降级，
+      // 此时请求其实已经生效，不能报 NotLeader。
+      if (e.index <= commitIndex_) return {ClientStatus::kOk, "", -1};
       if (role_ != Role::kLeader || currentTerm_ != e.term) {
         return {ClientStatus::kNotLeader, "", leaderId_};
       }
-      if (e.index <= commitIndex_) return {ClientStatus::kOk, "", -1};
       if (!syncInFlight_ && syncedIndex_ < e.index) {
         syncInFlight_ = true;
         flushTarget = log_.lastIndex();  // captured under the lock
@@ -519,6 +532,7 @@ ClientReply RaftNode::propose(const ClientRequest& req, uint64_t timeoutMs) {
     if (iAmFlusher) {
       const bool syncOk = log_.sync();  // ONE fsync for every entry so far
       std::vector<std::pair<int, AppendEntriesArgs>> jobs;
+      std::vector<std::pair<int, InstallSnapshotArgs>> snapJobs;
       {
         std::lock_guard<std::mutex> lock(mu_);
         if (syncOk) {
@@ -535,14 +549,13 @@ ClientReply RaftNode::propose(const ClientRequest& req, uint64_t timeoutMs) {
         if (syncOk && role_ == Role::kLeader && currentTerm_ == e.term) {
           // Single-node clusters commit here (no peer jobs below).
           advanceCommitAndApply();
-          for (const int peer : cfg_.peerIds) {
-            // Peers behind the snapshot boundary are served by tick()'s
-            // InstallSnapshot branch: never send AppendEntries into the
-            // compacted region (§5.5).
-            if (lastIncluded_ != kNoIndex && nextIndex_[peer] <= lastIncluded_) {
-              continue;
+          for (const int peer : replicationTargetsLocked()) {
+            PeerJob job = buildPeerJobLocked(peer);
+            if (job.isSnapshot) {
+              snapJobs.emplace_back(peer, std::move(job.snapshot));
+            } else {
+              jobs.emplace_back(peer, std::move(job.append));
             }
-            jobs.emplace_back(peer, buildAppendEntries(peer));
           }
         }
         cv_.notify_all();
@@ -557,6 +570,13 @@ ClientReply RaftNode::propose(const ClientRequest& req, uint64_t timeoutMs) {
               onAppendEntriesReply(peer, reply);
             });
       }
+      for (auto& job : snapJobs) {
+        transport_.sendInstallSnapshot(
+            job.first, job.second,
+            [this, peer = job.first](const InstallSnapshotReply& reply) {
+              onInstallSnapshotReply(peer, reply);
+            });
+      }
       continue;
     }
 
@@ -565,10 +585,10 @@ ClientReply RaftNode::propose(const ClientRequest& req, uint64_t timeoutMs) {
       return e.index <= commitIndex_ || role_ != Role::kLeader ||
              currentTerm_ != e.term;
     });
+    if (e.index <= commitIndex_) return {ClientStatus::kOk, "", -1};
     if (role_ != Role::kLeader || currentTerm_ != e.term) {
       return {ClientStatus::kNotLeader, "", leaderId_};
     }
-    if (e.index <= commitIndex_) return {ClientStatus::kOk, "", -1};
     if (std::chrono::steady_clock::now() >= deadline) {
       return {ClientStatus::kErr, "timeout waiting for commit", -1};
     }
@@ -788,20 +808,277 @@ ClusterConfig RaftNode::clusterConfig() const {
 
 uint64_t RaftNode::configVersion() const { return clusterConfig().version; }
 
+// m4-design v1.2 §5.1/§5.6：未入配置或被移除 = 不竞选、不接受写，但仍接收复制
+bool RaftNode::retiredLocked() const { return !currConfig_.isVoting(cfg_.selfId); }
+
 bool RaftNode::retired() const {
   std::lock_guard<std::mutex> lock(mu_);
-  // m4-design v1.2 §5.1/§5.6：未入配置或被移除 = 不竞选、不接受写，但仍接收复制
-  return !currConfig_.isVoting(cfg_.selfId);
+  return retiredLocked();
 }
 
+// ---- M4.2: membership helpers (m4-design v1.2 §5.3-§5.5) ---------------------
+
+// 多数派唯一入口：self 仅当它是该配置的投票成员、且自身已持久化到 index 时计数。
+bool RaftNode::hasMajorityLocked(const ClusterConfig& c, Index index) const {
+  const size_t maj = c.majority();
+  if (maj == 0) return false;  // 空配置没有多数派（m4-prerequisites §6.4）
+  size_t replicated = 0;
+  if (c.isVoting(cfg_.selfId) && index <= syncedIndex_) ++replicated;
+  for (const int peer : c.votingIds()) {
+    if (peer == cfg_.selfId) continue;
+    const auto it = matchIndex_.find(peer);
+    if (it != matchIndex_.end() && it->second >= index) ++replicated;
+  }
+  return replicated >= maj;
+}
+
+// 复制目标 = 当前配置成员 ∪ CatchUp 目标 ∪ 尚未确认离开的旧成员
+std::vector<int> RaftNode::replicationTargetsLocked() const {
+  std::vector<int> out;
+  for (const Member& m : currConfig_.members) {
+    if (m.id != cfg_.selfId) out.push_back(m.id);
+  }
+  for (const auto& kv : pendingPeers_) {
+    if (kv.first != cfg_.selfId && !currConfig_.contains(kv.first)) {
+      out.push_back(kv.first);
+    }
+  }
+  for (const int id : drainingPeers_) {
+    if (id != cfg_.selfId && !currConfig_.contains(id) &&
+        pendingPeers_.count(id) == 0 &&
+        std::find(out.begin(), out.end(), id) == out.end()) {
+      out.push_back(id);
+    }
+  }
+  return out;
+}
+
+void RaftNode::erasePeerStateLocked(int peerId) {
+  nextIndex_.erase(peerId);
+  matchIndex_.erase(peerId);
+  lastSentEndIndex_.erase(peerId);
+  snapshotSendOffset_.erase(peerId);
+  snapshotChunkEnd_.erase(peerId);
+}
+
+// 配置条目"追加即生效"（决策③）：切换 currConfig_、记录在途标记与送达集合。
+void RaftNode::applyAppendedConfigLocked(const std::vector<LogEntry>& appended) {
+  for (const LogEntry& e : appended) {
+    if (e.op != OpCode::kConfig) continue;
+    ClusterConfig c;
+    if (!decodeClusterConfig(reinterpret_cast<const Byte*>(e.value.data()),
+                             e.value.size(), c)) {
+      continue;  // 解码失败：忽略（启动期才 fatal，见 rebuildConfigFromSeedAndLog）
+    }
+    if (c.version <= currConfig_.version) continue;  // J3：更小版本不得生效
+
+    const ClusterConfig old = currConfig_;
+    prevConfig_ = old;
+    currConfig_ = c;
+    inFlightConfigIndex_ = e.index;
+
+    // 已在配置中的 CatchUp 目标转为正式成员
+    for (auto it = pendingPeers_.begin(); it != pendingPeers_.end();) {
+      if (currConfig_.contains(it->first)) {
+        it = pendingPeers_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    // 被移除的节点：配置条目提交前仍要送达（否则它永远不知道自己被移除）
+    drainingPeers_.clear();
+    for (const Member& m : old.members) {
+      if (m.id != cfg_.selfId && !currConfig_.contains(m.id)) {
+        drainingPeers_.push_back(m.id);
+      }
+    }
+    // 新成员地址：出锁后注册（L10）
+    for (const Member& m : currConfig_.members) {
+      if (m.id != cfg_.selfId && !m.addr.empty()) {
+        peerAddQueue_.emplace_back(m.id, m.addr);
+      }
+    }
+    // 彻底离开（不在新配置、也不在 CatchUp/送达集合）的节点：清理每 peer 状态
+    std::vector<int> gone;
+    for (const auto& kv : nextIndex_) {
+      const int id = kv.first;
+      if (id == cfg_.selfId || currConfig_.contains(id)) continue;
+      if (pendingPeers_.count(id) != 0) continue;
+      if (std::find(drainingPeers_.begin(), drainingPeers_.end(), id) !=
+          drainingPeers_.end()) {
+        continue;
+      }
+      gone.push_back(id);
+    }
+    for (const int id : gone) {
+      erasePeerStateLocked(id);
+      peerRemoveQueue_.push_back(id);
+    }
+  }
+}
+
+// 给某个 peer 的复制作业：落后于快照边界 -> 一个快照块；否则 AppendEntries。
+// tick / propose / CatchUp 共用（M3 评审 B13：组提交路径不得绕过快照路由）。
+RaftNode::PeerJob RaftNode::buildPeerJobLocked(int peer) {
+  PeerJob job;
+  if (lastIncluded_ != kNoIndex && !snapshotBytes_.empty() &&
+      nextIndex_[peer] <= lastIncluded_) {
+    const uint64_t total = snapshotBytes_.size();
+    uint64_t start = snapshotSendOffset_[peer];
+    if (start >= total) start = 0;
+    const uint64_t remaining = total - start;
+    const uint64_t take = std::min<uint64_t>(cfg_.snapshotChunkBytes, remaining);
+    job.isSnapshot = true;
+    job.snapshot.term = currentTerm_;
+    job.snapshot.leaderId = cfg_.selfId;
+    job.snapshot.lastIncludedIndex = lastIncluded_;
+    job.snapshot.lastIncludedTerm = lastIncludedTerm_;
+    job.snapshot.offset = start;
+    job.snapshot.done = (start + take >= total);
+    job.snapshot.data.assign(snapshotBytes_.begin() + start,
+                             snapshotBytes_.begin() + start + take);
+    snapshotChunkEnd_[peer] = start + take;
+  } else {
+    job.append = buildAppendEntries(peer);
+  }
+  return job;
+}
+
+// L10：地址簿更新只在锁外执行
+void RaftNode::drainPeerQueues() {
+  std::vector<std::pair<int, std::string>> adds;
+  std::vector<int> removes;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    adds.swap(peerAddQueue_);
+    removes.swap(peerRemoveQueue_);
+  }
+  for (const auto& a : adds) transport_.addPeer(a.first, a.second);
+  for (const int id : removes) transport_.removePeer(id);
+}
+
+// add 的前置：把新节点追平到"拥有本节点全部日志"（非投票、不计多数派）。
+bool RaftNode::catchUpPeer(int peerId, uint64_t timeoutMs) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+  for (;;) {
+    PeerJob job;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (role_ != Role::kLeader) return false;
+      const auto it = matchIndex_.find(peerId);
+      if (it != matchIndex_.end() && it->second >= log_.lastIndex()) {
+        return true;  // 已追平
+      }
+      job = buildPeerJobLocked(peerId);
+    }
+    if (job.isSnapshot) {
+      transport_.sendInstallSnapshot(
+          peerId, job.snapshot,
+          [this, peerId](const InstallSnapshotReply& reply) {
+            onInstallSnapshotReply(peerId, reply);
+          });
+    } else {
+      transport_.sendAppendEntries(
+          peerId, job.append,
+          [this, peerId](const AppendEntriesReply& reply) {
+            onAppendEntriesReply(peerId, reply);
+          });
+    }
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+}
+
+// 成员变更：仅 Leader；一次一个（J1）；add 先 CatchUp 再追加配置条目，remove 直接追加。
+// 配置条目走普通 propose 路径（组提交 + 复制 + J2 双重多数派提交）。
 ClientReply RaftNode::changeMembership(MembershipOp op, int targetId,
                                        const std::string& targetAddr,
                                        uint64_t timeoutMs) {
-  (void)op;
-  (void)targetId;
-  (void)targetAddr;
-  (void)timeoutMs;
-  return {ClientStatus::kErr, "membership change not implemented (M4.2)", -1};
+  const bool add = (op == MembershipOp::kAdd);
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (role_ != Role::kLeader) return {ClientStatus::kNotLeader, "", leaderId_};
+    if (retiredLocked()) return {ClientStatus::kNotLeader, "", leaderId_};
+    if (targetId <= 0) return {ClientStatus::kErr, "invalid target id", -1};
+    // add self 无意义；remove self 合法（§5.7 Leader 自我移除）
+    if (add && targetId == cfg_.selfId) {
+      return {ClientStatus::kErr, "cannot add self", -1};
+    }
+    if (inFlightConfigIndex_ != kNoIndex) {
+      return {ClientStatus::kErr, "membership change already in flight", -1};
+    }
+    if (add) {
+      if (currConfig_.contains(targetId) || pendingPeers_.count(targetId) != 0) {
+        return {ClientStatus::kErr, "already a member", -1};
+      }
+      if (targetAddr.empty()) {
+        return {ClientStatus::kErr, "address required for add", -1};
+      }
+      pendingPeers_[targetId] = targetAddr;
+      peerAddQueue_.emplace_back(targetId, targetAddr);
+      nextIndex_[targetId] = log_.lastIndex() + 1;
+      matchIndex_[targetId] = kNoIndex;
+      lastSentEndIndex_[targetId] = kNoIndex;
+      snapshotSendOffset_[targetId] = 0;
+      snapshotChunkEnd_[targetId] = 0;
+    } else if (!currConfig_.contains(targetId)) {
+      return {ClientStatus::kErr, "not a member", -1};
+    }
+  }
+  drainPeerQueues();
+
+  if (add && !catchUpPeer(targetId, timeoutMs)) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      pendingPeers_.erase(targetId);
+      erasePeerStateLocked(targetId);
+      peerRemoveQueue_.push_back(targetId);
+    }
+    drainPeerQueues();
+    return {ClientStatus::kErr, "catch-up failed or timed out", -1};
+  }
+
+  ClusterConfig next;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (role_ != Role::kLeader) return {ClientStatus::kNotLeader, "", leaderId_};
+    if (inFlightConfigIndex_ != kNoIndex) {
+      return {ClientStatus::kErr, "membership change already in flight", -1};
+    }
+    next = currConfig_;
+    if (add) {
+      Member m;
+      m.id = targetId;
+      const auto it = pendingPeers_.find(targetId);
+      m.addr = (it != pendingPeers_.end()) ? it->second : targetAddr;
+      m.voting = true;
+      next.members.push_back(m);
+    } else {
+      next.members.erase(std::remove_if(next.members.begin(), next.members.end(),
+                                        [targetId](const Member& m) {
+                                          return m.id == targetId;
+                                        }),
+                         next.members.end());
+    }
+    std::sort(next.members.begin(), next.members.end(),
+              [](const Member& a, const Member& b) { return a.id < b.id; });
+    next.version = log_.lastIndex() + 1;  // 配置条目的 index（J3 单调）
+  }
+
+  ClientRequest req;
+  req.op = OpCode::kConfig;
+  const Bytes payload = encodeClusterConfig(next);
+  req.value.assign(reinterpret_cast<const char*>(payload.data()), payload.size());
+  req.clientId = 0;
+  req.requestId = 0;
+
+  const ClientReply reply = propose(req, timeoutMs);
+  if (reply.status != ClientStatus::kOk && add) {
+    std::lock_guard<std::mutex> lock(mu_);
+    pendingPeers_.erase(targetId);
+  }
+  return reply;
 }
 
 ClientReply RaftNode::linearizableGet(const std::string& key,
