@@ -541,9 +541,10 @@ int doMembership(Options& o, uint8_t action, int targetId,
     args.action = action;
     args.targetId = targetId;
     args.addr = addr;
-    // 节点侧要跑 CatchUp + 提交，放宽读超时（默认 500ms 不够）
+    // 节点侧要跑 CatchUp + 提交：服务端预算是 max(调用方超时, catchUpTimeoutMs=30s)，
+    // 因此客户端必须等得比它久（M4 评审 O6 的超时错配：15s 会让 add/remove 被误判为失败）。
     if (!requestWithTimeout(host, port, MsgType::kConfigRequest,
-                            encodeConfigRequest(args), rt, rp, 15000)) {
+                            encodeConfigRequest(args), rt, rp, 45000)) {
       // M4（决策⑦）：连不上 -> 失效重取拓扑，换一个已知节点重试一次
       if (!refreshed) {
         refreshed = true;

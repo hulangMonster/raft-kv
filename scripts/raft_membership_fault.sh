@@ -184,12 +184,27 @@ for i in $(seq 1 "$REPEAT"); do
 done
 
 echo "== C) 收尾：无故障下 add/remove 往返 =="
+# 收尾判据以**成员状态**为准，而不是单次 CLI 退出码：50 轮故障后 6 号可能落后很多，
+# 服务端 catch-up 预算是 30s，客户端若超时返回会被误判成"变更被拒"（M4 评审 O6）。
+ensure_member() { # <want: yes|no>
+  local want="$1" tries="$2" i
+  for i in $(seq 1 "$tries"); do
+    LEADER="$(require_leader)" || return 1
+    if [[ "$want" == "yes" ]]; then
+      node6_is_member "$LEADER" && return 0
+      cli --host 127.0.0.1 --port "${PORT[$LEADER]}" add 6 "127.0.0.1:${PORT[6]}" >/dev/null 2>&1 || true
+    else
+      node6_is_member "$LEADER" || return 0
+      cli --host 127.0.0.1 --port "${PORT[$LEADER]}" remove 6 >/dev/null 2>&1 || true
+    fi
+    sleep 2
+  done
+  return 1
+}
 LEADER="$(require_leader)"
-if ! node6_is_member "$LEADER"; then
-  cli --host 127.0.0.1 --port "${PORT[$LEADER]}" add 6 "127.0.0.1:${PORT[6]}" | grep -q '^OK'
-fi
+ensure_member yes 3 || { echo "FAIL: 收尾 add 6 未生效" >&2; exit 1; }
 wait_config_converged || { echo "FAIL: 收尾 add 未收敛" >&2; exit 1; }
-cli --host 127.0.0.1 --port "${PORT[$LEADER]}" remove 6 | grep -q '^OK'
+ensure_member no 3 || { echo "FAIL: 收尾 remove 6 未生效" >&2; exit 1; }
 wait_config_converged || { echo "FAIL: 收尾 remove 未收敛" >&2; exit 1; }
 fill_and_verify 100 8
 echo "raft_membership_fault: PASS ($REPEAT iterations)"

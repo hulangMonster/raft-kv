@@ -29,6 +29,7 @@
 #include "raft/message.h"
 #include "raft/raft_node.h"
 #include "raft/snapshot_store.h"
+#include "raft/transport_reactor.h"
 #include "raft/transport_tcp.h"
 
 using namespace raftkv;
@@ -273,6 +274,7 @@ int main(int argc, char** argv) {
   std::string peersArg;
   std::string dataDir;
   bool lockWaitMetrics = false;  // M5.1: 打开锁等待计时（默认关，零开销）
+  bool useReactor = false;       // M5.3: 异步 Reactor transport 引擎（默认仍是同步版）
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -291,6 +293,16 @@ int main(int argc, char** argv) {
       peersArg = next("--peers");
     } else if (a == "--data-dir") {
       dataDir = next("--data-dir");
+    } else if (a == "--transport") {
+      const std::string t = next("--transport");
+      if (t == "reactor") {
+        useReactor = true;
+      } else if (t == "sync") {
+        useReactor = false;
+      } else {
+        std::cerr << "unknown --transport: " << t << std::endl;
+        return 2;
+      }
     } else if (a == "--lock-wait-metrics") {
       lockWaitMetrics = true;
     } else if (a == "--snapshot-threshold") {
@@ -329,10 +341,23 @@ int main(int argc, char** argv) {
     FileSnapshotStore snapshots(dataDir);  // M3.4: durable snapshots
     KvStateMachine sm;
     SteadyClock clock;
-    // Short RPC timeout: a hung peer (e.g. SIGSTOP'd) must not block the
-    // ticker long enough to starve live peers of heartbeats. Proper async
-    // sends are a listed M5 improvement.
-    TcpTransport transport(transportPeers, /*rpcTimeoutMs=*/30);
+    // M5.3：transport 引擎可切换（--transport=reactor|sync 或 RAFKV_TRANSPORT 环境变量）。
+    //   sync     = 旧的同步阻塞实现（每 RPC 建连 + 全局锁），作为对照与回退路径
+    //   reactor  = epoll 事件循环 + 每 peer 长连接；sendX 入队即返回，回调在 reactor 线程
+    if (const char* envT = ::getenv("RAFTKV_TRANSPORT")) {
+      if (std::strcmp(envT, "reactor") == 0) useReactor = true;
+      else if (std::strcmp(envT, "sync") == 0) useReactor = false;
+    }
+    std::unique_ptr<TransportReactor> reactorTransport;
+    std::unique_ptr<TcpTransport> syncTransport;
+    if (useReactor) {
+      reactorTransport = std::make_unique<TransportReactor>(transportPeers, 30);
+    } else {
+      syncTransport = std::make_unique<TcpTransport>(transportPeers, 30);
+    }
+    Transport& transport = useReactor ? static_cast<Transport&>(*reactorTransport)
+                                      : static_cast<Transport&>(*syncTransport);
+    std::cerr << "[raftkv-node] transport=" << (useReactor ? "reactor" : "sync") << std::endl;
     // M4: --peers 是启动种子配置（version=0，含地址）；运行期由日志/快照推进
     ClusterConfig seed;
     seed.version = 0;
@@ -413,6 +438,9 @@ int main(int argc, char** argv) {
     ::close(lsock);
     g_running = false;
     ticker.join();
+    // M5.3（L15）：显式停止 reactor（停事件循环 + join + 丢弃在途回调），避免
+    // detached 连接线程/回调触及即将失效的对象。
+    if (reactorTransport) reactorTransport->stop();
     std::cerr << "[raftkv-node] id=" << id << " shutdown\n";
   } catch (const std::exception& e) {
     std::cerr << "fatal: " << e.what() << "\n";
