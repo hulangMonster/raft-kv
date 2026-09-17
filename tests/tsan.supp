@@ -1,0 +1,23 @@
+# M5.6：TSan 对 libstdc++ `std::condition_variable_any` 内部互斥量的**误报**抑制。
+#
+# 现象：A11（唯一一个"多 proposer 线程并发 + 同一个 cv_"的用例）下，TSan 报
+#   1) mutex:      double lock of a mutex     -> condition_variable_any::notify_all()
+#   2) deadlock:   lock-order-inversion       -> 环：RaftNode::mu_ <-> cv_ 的内部 _M_mutex
+#
+# 为什么是误报：libstdc++ 自己保证了**先释放内部互斥量、再重新获取用户锁**——
+#   /usr/include/c++/11/condition_variable:307-313
+#     shared_ptr<mutex> __mutex = _M_mutex;
+#     unique_lock<mutex> __my_lock(*__mutex);
+#     _Unlock<_Lock> __unlock(__lock);
+#     // *__mutex must be unlocked before re-locking __lock so move
+#     // ownership of *__mutex lock to an object with shorter lifetime.
+#     unique_lock<mutex> __my_lock2(std::move(__my_lock));
+#   局部量按声明逆序析构 -> __my_lock2（释放 _M_mutex）先于 __unlock（重新加用户锁）。
+#   即"持 _M_mutex 再去拿 mu_"这条边在实际执行中不存在，TSan 的锁序图把它算进去了。
+# 佐证：同一份代码在 sync/reactor 两种引擎下跑 100k 写 + 64 并发 + 50 轮故障注入从未挂起。
+#
+# 抑制范围刻意收窄到"栈里出现 condition_variable_any::notify_all"的这两类告警，
+# 其余任何 race / mutex / deadlock 依旧会报出来（例如 A11 早先真正抓到的
+# allocation-size-too-big，就是测试桩的数据竞争，已修）。
+mutex:condition_variable_any::notify_all
+deadlock:condition_variable_any::notify_all

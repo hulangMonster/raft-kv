@@ -478,11 +478,17 @@ class AsyncQueueTransport : public Transport {
   };
 
   bool isAsync() const override { return true; }
+  // 注意：`sendX` 会被**多个 proposer 线程**同时调用（awaitCommit 的 flusher 路径），
+  // 因此本桩必须自己加锁——否则队列/在途计数就是数据竞争（TSan 实测：测试线程
+  // 与 proposer 线程并发 swap/push_back 同一个 vector，读到半更新的 LogEntry，
+  // 连锁报出 allocation-size-too-big 与 double-lock）。
   void sendRequestVote(int peer, const RequestVoteArgs& a, VoteCb cb) override {
+    std::lock_guard<std::mutex> lk(mu_);
     voteJobs.push_back({peer, a, std::move(cb)});
   }
   void sendAppendEntries(int peer, const AppendEntriesArgs& a,
                          AppendCb cb) override {
+    std::lock_guard<std::mutex> lk(mu_);
     ++appendSends;
     const size_t nowInflight = ++inflight_[peer];
     if (nowInflight > maxInflightSeen) maxInflightSeen = nowInflight;
@@ -493,6 +499,7 @@ class AsyncQueueTransport : public Transport {
                            const AppendEntriesReply& r) {
       if (*counted) {
         *counted = false;
+        std::lock_guard<std::mutex> lk(mu_);
         --inflight_[peer];
       }
       cb(r);  // 上层回调（RaftNode::onAppendEntriesReplyWithContext）
@@ -502,12 +509,30 @@ class AsyncQueueTransport : public Transport {
   void sendInstallSnapshot(int, const InstallSnapshotArgs&, InstallCb) override {}
   void sendReadProbe(int, const ReadProbeArgs&, ReadProbeCb) override {}
 
+  // 测试线程用这些方法安全地取走待投递作业 / 读计数（内部加锁）。
+  std::vector<AppendJob> takeAppendJobs() {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<AppendJob> out;
+    out.swap(appendJobs);
+    return out;
+  }
+  std::vector<VoteJob> takeVoteJobs() {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<VoteJob> out;
+    out.swap(voteJobs);
+    return out;
+  }
+  size_t maxInflight() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return maxInflightSeen;
+  }
+
+ private:
+  std::mutex mu_;
   std::vector<VoteJob> voteJobs;
   std::vector<AppendJob> appendJobs;
   int appendSends = 0;
   size_t maxInflightSeen = 0;
-
- private:
   std::unordered_map<int, size_t> inflight_;
 };
 }  // namespace
@@ -548,8 +573,7 @@ TEST(RaftPerf, A11_SlidingWindowOutOfOrderAcksAreIdempotent) {
   for (int i = 0; i < 200 && leader.role() != Role::kLeader; ++i) {
     c->advance(10);
     leader.tick();
-    std::vector<AsyncQueueTransport::VoteJob> votes;
-    votes.swap(async->voteJobs);
+    std::vector<AsyncQueueTransport::VoteJob> votes = async->takeVoteJobs();
     for (auto& v : votes) {
       const RequestVoteReply r =
           (v.peer == 2) ? f2.onRequestVote(v.args) : f3.onRequestVote(v.args);
@@ -563,6 +587,9 @@ TEST(RaftPerf, A11_SlidingWindowOutOfOrderAcksAreIdempotent) {
   constexpr int kPerWriter = 6;
   constexpr int kTotal = kWriters * kPerWriter;
   std::vector<ClientReply> results(kTotal);
+  // 完成计数用原子量：主线程**必须**等所有 writer join 之后才能读 results，
+  // 否则就是"主线程读 / writer 线程写同一元素"的数据竞争（TSan 实测抓到）。
+  std::atomic<int> doneCount{0};
   std::vector<std::thread> writers;
   for (int w = 0; w < kWriters; ++w) {
     writers.emplace_back([&, w] {
@@ -574,20 +601,29 @@ TEST(RaftPerf, A11_SlidingWindowOutOfOrderAcksAreIdempotent) {
         req.clientId = 100 + static_cast<uint64_t>(w);
         req.requestId = static_cast<uint64_t>(k + 1);
         results[w * kPerWriter + k] = leader.propose(req, 8000);
+        doneCount.fetch_add(1, std::memory_order_release);
       }
     });
   }
 
   Index lastCommit = kNoIndex;
   bool commitMonotonic = true;
-  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  // TSan/ASan 下整体慢 10~100x，20s 会把"没跑完"误判成"丢写"；给足预算。
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
   for (;;) {
     c->advance(5);
     leader.tick();
 
-    // 按"线上顺序"让 follower 处理请求（wire 上天然有序），但**逆序**投递应答
-    std::vector<AsyncQueueTransport::AppendJob> jobs;
-    jobs.swap(async->appendJobs);
+    // 按"线上顺序"让 follower 处理请求（wire 上天然有序），但**逆序**投递应答。
+    // 先攒够 2 个作业再投递：这样"窗口被用满"是**确定性**的，不依赖线程调度时序
+    // （否则单线程恰好一次只发出 1 批时，maxInflight>=2 的断言会偶发失败）。
+    std::vector<AsyncQueueTransport::AppendJob> jobs = async->takeAppendJobs();
+    for (int waited = 0; jobs.size() < 2 && waited < 400 && doneCount.load() < kTotal;
+         ++waited) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      std::vector<AsyncQueueTransport::AppendJob> more = async->takeAppendJobs();
+      for (auto& m : more) jobs.push_back(std::move(m));
+    }
     std::vector<AppendEntriesReply> replies;
     std::vector<Transport::AppendCb> cbs;
     cbs.reserve(jobs.size());
@@ -606,15 +642,11 @@ TEST(RaftPerf, A11_SlidingWindowOutOfOrderAcksAreIdempotent) {
     if (ci < lastCommit) commitMonotonic = false;
     lastCommit = ci;
 
-    bool allDone = true;
-    for (const auto& r : results) {
-      if (r.status != ClientStatus::kOk) allDone = false;
-    }
-    if (allDone) break;
+    if (doneCount.load(std::memory_order_acquire) >= kTotal) break;
     if (std::chrono::steady_clock::now() >= deadline) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  for (auto& t : writers) t.join();
+  for (auto& t : writers) t.join();  // 之后才允许读 results（见上面的原子计数说明）
 
   size_t okCount = 0;
   for (const auto& r : results) {
@@ -623,10 +655,14 @@ TEST(RaftPerf, A11_SlidingWindowOutOfOrderAcksAreIdempotent) {
   EXPECT_EQ(okCount, static_cast<size_t>(kTotal))
       << "乱序/重复 ack 下不得丢写（ok=" << okCount << "/" << kTotal << ")";
   EXPECT_TRUE(commitMonotonic) << "commitIndex 不得回退";
-  EXPECT_GE(async->maxInflightSeen, 2u)
+  EXPECT_GE(async->maxInflight(), 2u)
       << "本用例必须真的出现多批在途（否则没测到滑动窗口）";
-  EXPECT_LE(async->maxInflightSeen, c1.maxInflightPerPeer)
-      << "在途批数不得超过 cfg.maxInflightPerPeer";
+  // 上界不是 maxInflightPerPeer：槽位 TTL（I15 的 inflightMuteGapMs）到期后会先回收，
+  // 而那一帧可能仍在飞（本桩不丢帧；生产里 reactor 自己的帧超时会丢并关连接）。
+  // 因此"未确认帧数"最多是 N 个未过期槽位 + 若干已过期但尚未回包的帧；
+  // 生产侧的硬约束由 reactor 帧超时（~rpcTimeoutMs）给出，这里按 3N 兜住回归。
+  EXPECT_LE(async->maxInflight(), c1.maxInflightPerPeer * 3)
+      << "在途批数（含 TTL 已过期但未回包的帧）超出兜底上界";
 }
 
 // M5.A7 [GUARD] R2 守门：两段式改造不得破坏成员变更语义（J1/J2 仍成立）。

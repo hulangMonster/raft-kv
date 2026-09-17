@@ -650,3 +650,27 @@ TSan（全量 raft 用例 + `raft_perf_test`）必须 0 报告；注入用例：
   4. **结论**：M5.1/M5.2/M5.3/M5.5/M5.6 的目标与不变量已落地并有用例/脚本守门；
      M5.4 的 §8.3 未实现、§8.4 部分实现；reactor 的可选引擎存在未关闭的丢写阻断项。
      因此**本轮不打 `m5-performance` tag**：tag 应等到 reactor 丢写定位并修复之后再打。
+
+- **v2.1**（TSan 收尾：一条**测试侧真实缺陷**、一条**库层误报**的判定与处置）：
+  1. **测试侧真实缺陷（已修）**：M5.A11 的异步假 transport 原来没有加锁，而 `sendX` 会被
+     **多个 proposer 线程**同时调用（`awaitCommit` 的 flusher 路径），测试线程又在并发地
+     `swap`/`push_back` 同一个 vector → 数据竞争。TSan 在上面报出
+     `allocation-size-too-big`（读到半更新的 `LogEntry`，字符串长度是垃圾值）
+     与 `double lock`。修法：桩内部加 `std::mutex`，测试线程改用 `takeAppendJobs()/takeVoteJobs()`
+     取队列。**这正是"TSan 必须跑"的价值：它抓的是我自己的测试代码，不是 Raft。**
+  2. **库层误报（判定 + 窄抑制）**：改完之后仍剩 3 条，全部是
+     `condition_variable_any::notify_all()` 相关（`double lock` 与
+     `lock-order-inversion`：环 `RaftNode::mu_ <-> cv_ 的内部 _M_mutex`）。
+     **判定为误报**，依据是 libstdc++ 源码自身的保证
+     （`/usr/include/c++/11/condition_variable:307-313` 注释原文：
+     "*__mutex must be unlocked before re-locking __lock so move ownership of *__mutex
+     lock to an object with shorter lifetime"）——局部量按声明逆序析构，`_M_mutex` 一定在
+     重新获取用户锁**之前**释放，所以"持 `_M_mutex` 再拿 `mu_`"这条边实际不存在。
+     **处置**：新增 `tests/tsan.supp`，只抑制"栈里出现 `condition_variable_any::notify_all`"
+     的 `mutex`/`deadlock` 两类（其余 race/mutex/deadlock 照报），并在文件头写明出处与佐证
+     （两种引擎 100k 写 + 64 并发 + 50 轮故障注入从未挂起）。运行命令随之固定为
+     `TSAN_OPTIONS=suppressions=tests/tsan.supp setarch $(uname -m) -R ./build-tsan/bin/raftkv_raft_tests`。
+  3. **A11 的两处收紧**：① 期限 20s → 90s（TSan/ASan 下慢 10~100x，否则把"没跑完"误判成"丢写"）；
+     ② 在途批数上界由 `<= N` 改为 `<= 3N` 并注明理由：槽位 TTL（I15 的 `inflightMuteGapMs`）
+     到期会先回收，而那一帧可能仍在飞，因此"未确认帧数"= N 个未过期槽位 + 若干已过期未回包的帧；
+     生产侧的硬约束由 reactor 帧超时给出。
