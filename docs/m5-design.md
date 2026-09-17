@@ -496,3 +496,54 @@ TSan（全量 raft 用例 + `raft_perf_test`）必须 0 报告；注入用例：
      * 指标 `onElection/setReplicationLag/setInflightRpc` 尚无生产调用点（status 三项恒 0）——
        接上 `startElection`/leader tick/`Reactor::inflight()`。
      * 仓库卫生：`build-tsan/`（114 个文件）曾被误提交，已加入 `.gitignore` 并从索引移除。
+
+- **v1.7**（M5.3/M5.4 收尾；**关闭 v1.6 列出的全部阻断项**，并新增两条实测不变量 I15/I16）：
+  1. **✅ I9 违约已闭合（v1.6 遗留项 3 的第一条）**。锁内冲突回滚改走 `truncateSuffixNoSync()`
+     （只 `ftruncate` + 内存截断），durability 交由同批的锁外 `sync()`；并新增 **M5.A9** 端到端用例
+     （2 节点注入 `term=99` 幽灵条目 → 驱动 conflict 回滚，断言 `truncates>0 && lockedTruncates==0
+     && lockedTruncateNoSyncs>0`）。**过程中 A9 抓到一个真实缺陷**：`MemoryLogStore::truncateSuffixNoSync()`
+     原来写的是无限定名 `truncateSuffix(fromIndex)` —— 那是**虚调用**，会落到子类覆写的"含 fsync"
+     版本上，于是"no-sync 变体"在持锁路径里照样做了同步截断（探针实测 `lockedTruncates=1`）。
+     修法：该处改限定名调用 `MemoryLogStore::truncateSuffix()`；`LogStore` 基类默认实现保留转调，
+     但在注释里写明"凡 `truncateSuffix()` 会 fsync 的实现都必须覆写 `truncateSuffixNoSync()`"。
+     同时 `erasePeerStateLocked` 补齐 `appendSentMs_/snapshotSentMs_/ackedTerm_` 回收（有界影响，见代码注释）。
+     证据：`raftkv_raft_tests` 83/83 全绿（原 81 + A9 + A10）。
+  2. **✅ ack 归因已收敛到闭包（v1.6 遗留项 3 的第二条）**：`onAppendEntriesReplyWithContext` /
+     `onInstallSnapshotReplyWithContext` + 4 个发送点全部改为闭包携带 `sentEnd`/`chunkEnd`。
+  3. **🔴→✅ I15：reactor 引擎的选举风暴（本轮新发现，此前从未归因）**。
+     现象：`RAFTKV_TRANSPORT=reactor` 下 `raft_fault.sh --repeat 50` 约 2/3 的轮次失败，
+     报 `write with one follower stopped returned 'NOT_LEADER'`；`status` 显示 term 每秒 +1.5
+     （`elections_total` 单轮 38 次）。**根因（用环境变量 `RAFTKV_TRACE=1` 的临时插桩定位，已回退）**：
+     `peerSendAllowedLocked()` 的静音窗口是 `2*rpcTimeoutMs = 200ms`，而 follower 的选举超时是
+     **150–300ms**。一旦某帧被 reactor 逐帧超时丢弃（**丢弃时不回调**），该 peer 的
+     `appendSentMs_` 会一直留到窗口结束 —— 健康的 follower 在 200ms 内收不到任何心跳，
+     自行竞选并顶掉 leader，随后客户端写就返回 `NOT_LEADER`。trace 实证：
+     node3 对 peer2 连续 `appendSkip (in-flight/mute)` 200ms，node2 恰在窗口末尾 `startElection term=63`。
+     **修复**：新增 `RaftNode::inflightMuteGapMs()`，窗口 = `min(2*rpcTimeoutMs, electionTimeoutMinMs/3)`
+     （默认 50ms，加 tick 10ms 粒度仍远小于 150ms），并用 **M5.A10** 钉住该不变量。
+     验证：reactor `raft_fault.sh --repeat 50` **连续 3 轮 PASS**（修复前 3 轮里 2 轮 FAIL）。
+  4. **🔴→✅ I16：reactor + 频繁 compact 下节点无日志静默死亡（本轮新发现）**。
+     现象：`raft_snapshot_fault.sh`（reactor）报 `node3 did not apply 100k entries`；
+     `raft_membership_fault.sh`（reactor）跑到第 47/48 轮无诊断退出。机制观测脚本显示
+     **node3 进程直接消失**（`kill -0` 失败、日志只有启动两行、无 OOM 记录），
+     而 1+2 仍构成多数派，所以 `fill` 甚至返回 rc=0。
+     **根因**：`maybeSnapshot()`（main/ticker 线程）与 `onInstallSnapshot()`（reactor 线程）
+     都在 `mu_` **之外**做 save/load/compact，二者**彼此没有任何互斥**；两处 `log_.compact()`
+     会并发改同一个 `FileLogStore`（rename/truncate/setBoundary），一旦互相踩到就 `compact` 返回
+     false，而这两条路径都是 `throw std::runtime_error(...)` —— 异常从 **reactor 回调**逃逸
+     → `std::terminate` → 节点静默死亡。
+     **修复**：① 新增叶子锁 `snapshotOpMu_`（L17），把"序列化/落盘 → compact → 推进边界"整段串行化
+     （`maybeSnapshot` 与 `onInstallSnapshot` 各持一次，锁序 `snapshotOpMu_ → mu_`，不违反 I9）；
+     ② `TransportReactor` 的回调包一层 catch：打印 `FATAL: reply callback threw: ...` 后**重新抛出**——
+     不改变"致命错误必须停"的语义，但把"静默死亡"变成可诊断的死亡。
+     验证：机制复现（reactor + `--snapshot-threshold 200` + `fill 20000 --pipeline 64`）**5/5 轮无节点死亡**
+     （修复前连续两轮各死一个节点）；修复后 reactor 引擎全量脚本一次通过：
+     `raft_snapshot_fault --repeat 20` / `raft_membership_fault --repeat 50` / `raft_snapshot_e2e` /
+     `raft_membership_e2e` / `raft_fault --repeat 50` **全部 rc=0**。
+  5. 构建告警清零：`src/server.cpp` 的 `switch (req.op)` 未处理 `OpCode::kConfig`（M4 引入的
+     `-Wswitch` 告警）。补显式 `case`（该分支不可达：kConfig 不在 M1 codec 白名单内，P3），
+     不用 `default:` 以免掩盖将来新增的 OpCode。**全量干净重建 0 warning**。
+  6. TSan（当前源码，含上述全部改动）：`83/83` 通过、**`WARNING: ThreadSanitizer` 0 条**、构建 0 warning。
+  7. **仍未关闭（进入 M5.5）**：① 双引擎 A/B（3 次中位数）与 `docs/m5-bench.md` §3 数据；
+     ② §8.2 滑动窗口的**触发判定**——若 M5.4 收尾后 pipeline=64 仍 < 1200 qps，则必须按 §8.2 落地；
+     ③ 默认引擎的最终选择（当前仍为 `sync`，reactor 已可全绿，待 A/B 数据决定）。

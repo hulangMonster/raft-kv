@@ -296,7 +296,7 @@ bool FileLogStore::appendNoSyncLocked(const std::vector<LogEntry>& entries) {
   for (const LogEntry& e : entries) {
     if (e.index <= lastIndex()) {
       if (termAt(e.index) == e.term) continue;  // already present
-      if (!truncateSuffixLocked(e.index)) return false;
+      if (!truncateSuffixLocked(e.index, /*sync=*/true)) return false;
     }
     if (e.index != lastIndex() + 1) return false;  // must be contiguous (D3)
     const int64_t off = static_cast<int64_t>(::lseek(logFd_, 0, SEEK_END));
@@ -318,10 +318,17 @@ bool FileLogStore::appendNoSyncLocked(const std::vector<LogEntry>& entries) {
 
 bool FileLogStore::truncateSuffix(Index fromIndex) {
   std::lock_guard<std::recursive_mutex> lock(mu_);
-  return truncateSuffixLocked(fromIndex);
+  return truncateSuffixLocked(fromIndex, /*sync=*/true);
 }
 
-bool FileLogStore::truncateSuffixLocked(Index fromIndex) {
+// M5.2（I9）：不做 fsync 的截断（供持 RaftNode::mu_ 的冲突回滚路径使用）。
+// 调用方必须在同一批里随后 log_.sync()，否则变短的日志在崩溃后可能复活。
+bool FileLogStore::truncateSuffixNoSync(Index fromIndex) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
+  return truncateSuffixLocked(fromIndex, /*sync=*/false);
+}
+
+bool FileLogStore::truncateSuffixLocked(Index fromIndex, bool sync) {
   if (fromIndex == kNoIndex) return true;
   if (fromIndex <= lastIncluded_) return false;  // cannot cut below boundary
   if (fromIndex > lastIndex() + 1) return false;
@@ -340,8 +347,9 @@ bool FileLogStore::truncateSuffixLocked(Index fromIndex) {
   }
   if (::ftruncate(logFd_, static_cast<off_t>(off)) != 0) return false;
   // Make the shorter log durable: otherwise a crash could resurrect the entries
-  // we just dropped.
-  if (::fsync(logFd_) != 0) return false;
+  // we just dropped. M5.2（I9）：持 mu_ 的路径传 sync=false，由同批的锁外
+  // log_.sync() 负责持久化（fsync 会一并覆盖 size 变更）。
+  if (sync && ::fsync(logFd_) != 0) return false;
 
   entries_.resize(static_cast<size_t>(fromIndex - firstIndex()));
   for (auto it = offsetOf_.begin(); it != offsetOf_.end();) {

@@ -168,6 +168,7 @@ void RaftNode::startElection(
     uint64_t now, std::vector<std::pair<int, RequestVoteArgs>>& voteJobs) {
   role_ = Role::kCandidate;
   ++currentTerm_;
+  if (metrics_ != nullptr) metrics_->onElection();  // M5.1 指标（M5.2 重写时曾丢失）
   votedFor_ = cfg_.selfId;
   leaderId_ = -1;
   votesGranted_ = 0;
@@ -303,7 +304,19 @@ void RaftNode::tick() {
     const uint64_t now = clock_.nowMs();
 
     if (role_ == Role::kLeader) {
-      purgeDrainsLocked();  // 送达目标确认完成/预算到期 -> 回收（O2 + 设计 v1.4(a)）
+      purgeDrainsLocked();
+      if (metrics_ != nullptr) {  // M5.1：复制 lag（commit 与最小 matchIndex 之差）
+        Index minMatched = commitIndex_;
+        for (const int peer : currConfig_.votingIds()) {
+          if (peer == cfg_.selfId) continue;
+          const auto it = matchIndex_.find(peer);
+          const Index m = (it == matchIndex_.end()) ? kNoIndex : it->second;
+          if (m < minMatched) minMatched = m;
+        }
+        metrics_->setReplicationLag(commitIndex_ > minMatched
+                                        ? commitIndex_ - minMatched
+                                        : 0);
+      }  // 送达目标确认完成/预算到期 -> 回收（O2 + 设计 v1.4(a)）
       // Raft §8: a leader must commit an entry from its own term before it
       // may advance the commit point over prior-term entries (and serve reads).
       if (cfg_.appendNoop && log_.lastTerm() != currentTerm_) {
@@ -403,10 +416,11 @@ void RaftNode::tick() {
   }
   for (auto& job : appendJobs) {
     if (!approveAppendSend(job.first, job.second)) continue;  // 该 peer 已有在途
+    const Index sentEnd = appendEndIndex(job.second);
     transport_.sendAppendEntries(
         job.first, job.second,
-        [this, peer = job.first](const AppendEntriesReply& reply) {
-          onAppendEntriesReply(peer, reply);
+        [this, peer = job.first, sentEnd](const AppendEntriesReply& reply) {
+          onAppendEntriesReplyWithContext(peer, sentEnd, reply);
         });
   }
   for (auto& job : snapJobs) {
@@ -530,12 +544,15 @@ AppendEntriesReply RaftNode::onAppendEntries(const AppendEntriesArgs& args) {
   }
 
   std::vector<LogEntry> toAppend;
+  bool truncated = false;
   for (const LogEntry& e : args.entries) {
     if (e.index <= log_.lastIndex()) {
       if (log_.termAt(e.index) == e.term) continue;  // already present
-      if (!log_.truncateSuffix(e.index)) {
+      // M5.2（I9）：持锁路径只做 ftruncate+内存截断（不 fsync）；随后强制本批 sync
+      if (!log_.truncateSuffixNoSync(e.index)) {
         return {currentTerm_, false, kNoIndex, kNoTerm};
       }
+      truncated = true;
       if (syncedIndex_ > log_.lastIndex()) syncedIndex_ = log_.lastIndex();
       // M4.5（设计 §5.2 回滚）：被截断的配置条目不得继续生效
       recomputeConfigLocked();
@@ -559,7 +576,7 @@ AppendEntriesReply RaftNode::onAppendEntries(const AppendEntriesArgs& args) {
   const Index lastMatched =
       args.entries.empty() ? args.prevLogIndex : args.entries.back().index;
   const Term term0 = currentTerm_;
-  const bool needSync = lastMatched > syncedIndex_;
+  const bool needSync = (lastMatched > syncedIndex_) || truncated;
 
   lock.unlock();
   bool syncOk = true;
@@ -619,6 +636,17 @@ void RaftNode::onRequestVoteReply(int peerId, const RequestVoteReply& reply) {
 }
 
 void RaftNode::onAppendEntriesReply(int peerId, const AppendEntriesReply& reply) {
+  Index fallback = kNoIndex;
+  {
+    std::lock_guard<ProbedMutex> lock(mu_);
+    const auto it = lastSentEndIndex_.find(peerId);
+    if (it != lastSentEndIndex_.end()) fallback = it->second;
+  }
+  onAppendEntriesReplyWithContext(peerId, fallback, reply);
+}
+
+void RaftNode::onAppendEntriesReplyWithContext(int peerId, Index sentEnd,
+                                               const AppendEntriesReply& reply) {
   std::lock_guard<ProbedMutex> lock(mu_);
   if (role_ != Role::kLeader) return;
   if (reply.term > currentTerm_) {
@@ -629,7 +657,7 @@ void RaftNode::onAppendEntriesReply(int peerId, const AppendEntriesReply& reply)
 
   appendSentMs_.erase(peerId);  // M5.3：释放该 peer 的发送槽位（下一批可以发了）
   if (reply.success) {
-    const Index end = lastSentEndIndex_[peerId];
+    const Index end = sentEnd;
     if (end > matchIndex_[peerId]) matchIndex_[peerId] = end;
     ackedTerm_[peerId] = currentTerm_;  // 追平判据：本任期已应答
     if (end != kNoIndex && end + 1 > nextIndex_[peerId]) {
@@ -774,18 +802,20 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
       }
       for (auto& job : jobs) {
         if (!approveAppendSend(job.first, job.second)) continue;  // 该 peer 已有在途
+        const Index sentEnd = appendEndIndex(job.second);
         transport_.sendAppendEntries(
             job.first, job.second,
-            [this, peer = job.first](const AppendEntriesReply& reply) {
-              onAppendEntriesReply(peer, reply);
+            [this, peer = job.first, sentEnd](const AppendEntriesReply& reply) {
+              onAppendEntriesReplyWithContext(peer, sentEnd, reply);
             });
       }
       for (auto& job : snapJobs) {
         if (!approveSnapshotSend(job.first, job.second)) continue;  // 该 peer 已有在途
+        const uint64_t chunkEnd = job.second.offset + job.second.data.size();
         transport_.sendInstallSnapshot(
             job.first, job.second,
-            [this, peer = job.first](const InstallSnapshotReply& reply) {
-              onInstallSnapshotReply(peer, reply);
+            [this, peer = job.first, chunkEnd](const InstallSnapshotReply& reply) {
+              onInstallSnapshotReplyWithContext(peer, chunkEnd, reply);
             });
       }
       continue;
@@ -872,6 +902,11 @@ void RaftNode::maybeSnapshot() {
   }
   if (!view) return;
 
+  // M5.4：从"序列化/落盘"到"compact + 推进边界"必须整体串行化，否则会与
+  // reactor 线程上的 onInstallSnapshot 竞争同一个 FileLogStore（见 header 说明）。
+  // 加锁点在释放 mu_ 之后、重新取 mu_ 之前，锁序 snapshotOpMu_ -> mu_。
+  std::lock_guard<std::mutex> snapOpLock(snapshotOpMu_);
+
   // Serialize + persist OUTSIDE the lock (lock discipline L8).
   SnapshotData data;
   data.lastIncludedIndex = snapIndex;
@@ -943,6 +978,11 @@ InstallSnapshotReply RaftNode::onInstallSnapshot(const InstallSnapshotArgs& args
     if (snapshots_ == nullptr) return {currentTerm_, false, 0};
   }
 
+  // M5.4：整段"收块 -> load -> restore -> compact -> 推进边界"与 maybeSnapshot 互斥
+  // （叶子锁，锁序 snapshotOpMu_ -> mu_）。缺了它，两处 compact 会并发改同一个
+  // FileLogStore，失败时 `throw` 从 reactor 回调逃逸 -> std::terminate -> 静默死亡。
+  std::lock_guard<std::mutex> snapOpLock(snapshotOpMu_);
+
   // L8: chunk I/O happens OUTSIDE mu_. receiveChunk() is idempotent for
   // retransmitted chunks and serialises concurrent transfers internally.
   if (!snapshots_->receiveChunk(args.lastIncludedIndex, args.lastIncludedTerm,
@@ -965,7 +1005,7 @@ InstallSnapshotReply RaftNode::onInstallSnapshot(const InstallSnapshotArgs& args
     // Raft §7: only keep the local suffix if our entry at the snapshot boundary
     // carries the same term; otherwise the whole suffix conflicts.
     if (log_.termAt(installed.lastIncludedIndex) != installed.lastIncludedTerm) {
-      if (!log_.truncateSuffix(log_.firstIndex())) {
+      if (!log_.truncateSuffixNoSync(log_.firstIndex())) {
         return {currentTerm_, false, 0};
       }
     }
@@ -1145,6 +1185,15 @@ void RaftNode::erasePeerStateLocked(int peerId) {
   snapshotSendOffset_.erase(peerId);
   snapshotChunkEnd_.erase(peerId);
   readAcks_.erase(peerId);  // 评审 O4：ReadIndex 应答表也要回收
+  // M5 评审遗留项：异步引擎的发送槽位时间戳与"本任期已应答"标记同样要回收。
+  // 影响面是**有界**的（不是崩溃源）：matchIndex_ 一并被清空，所以陈旧的
+  // ackedTerm_ 不可能单独让追平判据误判为真；appendSentMs_/snapshotSentMs_
+  // 残留只会让同一 peerId 被移出后重新加入时，首个发送被限流窗口多挡几毫秒。
+  // 仍然要清，否则 peer 频繁增删会让两个 map 无限增长，且重新加入的 peer 会
+  // 继承一个它并不拥有的"上次发送时刻"。
+  appendSentMs_.erase(peerId);
+  snapshotSentMs_.erase(peerId);
+  ackedTerm_.erase(peerId);
 }
 
 // 已彻底离开配置的 peer（评审 O2 抽出的单一入口，adoptConfigLocked 与
@@ -1268,6 +1317,18 @@ void RaftNode::recomputeConfigLocked() {
   }
 }
 
+// I15（M5.3 实测选举风暴）：在途静音窗口的硬上界。
+// 异步引擎下丢一帧（reactor 逐帧超时后丢弃队首、且**不回调**）会让
+// appendSentMs_[peer] 一直保留到窗口结束，其间该 peer 收不到任何 AE/心跳。
+// 一旦这个窗口 ≥ follower 的选举超时，健康的 follower 就会自行竞选、顶掉 leader：
+// M5.3 实测 raft_fault.sh（reactor）term 每秒 +1.5、随后客户端写返回 NOT_LEADER。
+// 因此窗口必须严格小于最小选举超时，取 1/3 以吸收 tick(10ms) 粒度与调度抖动。
+uint64_t RaftNode::inflightMuteGapMs(const RaftConfig& cfg) {
+  const uint64_t byRpc = cfg.rpcTimeoutMs == 0 ? 30 : cfg.rpcTimeoutMs * 2;
+  const uint64_t cap = cfg.electionTimeoutMinMs / 3;
+  return (cap != 0 && cap < byRpc) ? cap : byRpc;
+}
+
 // 给某个 peer 的复制作业：落后于快照边界 -> 一个快照块；否则 AppendEntries。
 // tick / propose / CatchUp 共用（M3 评审 B13：组提交路径不得绕过快照路由）。
 // M5.3：异步 transport 下同一 peer 只能有一批在途（见 header 说明）。
@@ -1276,7 +1337,7 @@ bool RaftNode::peerSendAllowedLocked(int peer) const {
   // 单测里 clock_ 是 FakeClock：catch-up 循环只做 2ms 真实 sleep 而不推进 fake 时间，
   // 若用 clock_ 判断"在途是否超时"，槽位将永不释放，catch-up 会空转到超时。
   const uint64_t now = lockprobe::nowUs() / 1000ULL;
-  const uint64_t gap = cfg_.rpcTimeoutMs == 0 ? 30 : cfg_.rpcTimeoutMs * 2;
+  const uint64_t gap = inflightMuteGapMs(cfg_);
   const auto a = appendSentMs_.find(peer);
   if (a != appendSentMs_.end() && now - a->second < gap) return false;
   const auto s = snapshotSentMs_.find(peer);
@@ -1294,11 +1355,6 @@ bool RaftNode::approveAppendSend(int peer, const AppendEntriesArgs& a) {
   // 处理完，因此同样精确）。
   lastSentEndIndex_[peer] =
       a.entries.empty() ? a.prevLogIndex : a.entries.back().index;
-  if (role_ == Role::kLeader && !snapshotBytes_.empty() &&
-      nextIndex_[peer] <= lastIncluded_) {
-    // 该 peer 走的是快照路由（build 时已判定），快照块末偏移在此登记
-    snapshotChunkEnd_[peer] = a.prevLogIndex;  // 占位，真实值由 approveSnapshotSend 登记
-  }
   return true;
 }
 
@@ -1346,6 +1402,12 @@ void RaftNode::drainPeerQueues() {
   }
   for (const auto& a : adds) transport_.addPeer(a.first, a.second);
   for (const int id : removes) transport_.removePeer(id);
+}
+
+// M5.1：注入在途 RPC 数提供者（main 传 Reactor::inflight；未注入时为 0）
+void RaftNode::setInflightMetricsProvider(std::function<size_t()> fn) {
+  std::lock_guard<ProbedMutex> lock(mu_);
+  if (metrics_ != nullptr) metrics_->setInflightProvider(std::move(fn));
 }
 
 // 送达目标收尾：已经确认收到移除条目的、或超出送达预算的，移出复制目标并回收
@@ -1397,10 +1459,11 @@ bool RaftNode::catchUpPeer(int peerId, uint64_t timeoutMs) {
         if (std::chrono::steady_clock::now() >= deadline) return false;
         continue;
       }
+      const uint64_t chunkEnd = job.snapshot.offset + job.snapshot.data.size();
       transport_.sendInstallSnapshot(
           peerId, job.snapshot,
-          [this, peerId](const InstallSnapshotReply& reply) {
-            onInstallSnapshotReply(peerId, reply);
+          [this, peerId, chunkEnd](const InstallSnapshotReply& reply) {
+            onInstallSnapshotReplyWithContext(peerId, chunkEnd, reply);
           });
     } else {
       if (!approveAppendSend(peerId, job.append)) {
@@ -1408,10 +1471,11 @@ bool RaftNode::catchUpPeer(int peerId, uint64_t timeoutMs) {
         if (std::chrono::steady_clock::now() >= deadline) return false;
         continue;
       }
+      const Index sentEnd = appendEndIndex(job.append);
       transport_.sendAppendEntries(
           peerId, job.append,
-          [this, peerId](const AppendEntriesReply& reply) {
-            onAppendEntriesReply(peerId, reply);
+          [this, peerId, sentEnd](const AppendEntriesReply& reply) {
+            onAppendEntriesReplyWithContext(peerId, sentEnd, reply);
           });
     }
     if (std::chrono::steady_clock::now() >= deadline) return false;
@@ -1690,6 +1754,17 @@ void RaftNode::onReadProbeReply(int peerId, const ReadProbeReply& reply) {
 
 void RaftNode::onInstallSnapshotReply(int peerId,
                                       const InstallSnapshotReply& reply) {
+  uint64_t chunkEnd = 0;
+  {
+    std::lock_guard<ProbedMutex> lock(mu_);
+    const auto it = snapshotChunkEnd_.find(peerId);
+    if (it != snapshotChunkEnd_.end()) chunkEnd = it->second;
+  }
+  onInstallSnapshotReplyWithContext(peerId, chunkEnd, reply);
+}
+
+void RaftNode::onInstallSnapshotReplyWithContext(
+    int peerId, uint64_t chunkEnd, const InstallSnapshotReply& reply) {
   std::lock_guard<ProbedMutex> lock(mu_);
   snapshotSentMs_.erase(peerId);  // M5.3：释放快照发送槽位
   if (role_ != Role::kLeader) return;
@@ -1711,7 +1786,7 @@ void RaftNode::onInstallSnapshotReply(int peerId,
     return;
   }
 
-  snapshotSendOffset_[peerId] = snapshotChunkEnd_[peerId];
+  snapshotSendOffset_[peerId] = chunkEnd;  // M5.3：上下文来自闭包
   if (!snapshotBytes_.empty() &&
       snapshotSendOffset_[peerId] >= snapshotBytes_.size()) {
     // Transfer complete: the peer now has the snapshot.

@@ -8,6 +8,7 @@
 // 因此"关掉锁等待计时"时零额外开销 —— M5.5 的"指标开销 < 1%"用开关对照验证。
 
 #include <atomic>
+#include <functional>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -36,6 +37,11 @@ class Metrics {
   // ---- 瞬时量（采样时写）----
   void setReplicationLag(Index lag);
   void setInflightRpc(size_t n);
+  // M5.1：注入在途 RPC 数提供者（Reactor::inflight）；渲染时读取，避免锁内成本
+  void setInflightProvider(std::function<size_t()> fn) {
+    inflightProvider_ = std::move(fn);
+  }
+  uint64_t inflightNow() const;
 
   // ---- 渲染 ----
   std::string statusFragment() const;   // status 一行内的新增字段（k=v）
@@ -74,6 +80,7 @@ class Metrics {
   std::atomic<uint64_t> lockWaitUsTotal_{0};
   std::atomic<uint64_t> lockWaitUsMax_{0};
   std::atomic<uint64_t> inflightRpc_{0};
+  std::function<size_t()> inflightProvider_;
   std::atomic<uint64_t> replLag_{0};
   // qps 窗口
   std::atomic<uint64_t> windowStartUs_{0};

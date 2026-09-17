@@ -215,13 +215,27 @@ class SpyLogStore : public MemoryLogStore {
     if (lockprobe::consensusHeld()) ++lockedAppendNoSyncs;  // 允许（I9：锁内只 write）
     return MemoryLogStore::appendNoSync(entries);
   }
+  // M5.2 评审 B1：含 fsync 的截断不得在持 mu_ 时发生；锁内只允许 no-sync 变体
+  bool truncateSuffix(Index fromIndex) override {
+    if (lockprobe::consensusHeld()) ++lockedTruncates;
+    ++truncates;
+    return MemoryLogStore::truncateSuffix(fromIndex);
+  }
+  bool truncateSuffixNoSync(Index fromIndex) override {
+    if (lockprobe::consensusHeld()) ++lockedTruncateNoSyncs;
+    ++noSyncTruncates;  // 无论是否持锁，都记录 no-sync 变体确实被用过
+    return MemoryLogStore::truncateSuffixNoSync(fromIndex);
+  }
 
   int lockedDurableCalls() const {
-    return lockedAppends + lockedSyncs + lockedMetaPersists + lockedCompacts;
+    return lockedAppends + lockedSyncs + lockedMetaPersists + lockedCompacts +
+           lockedTruncates;  // 含 fsync 的截断同样算 durable 调用
   }
-  int appends = 0, syncs = 0, metaPersists = 0, compacts = 0;
+  int appends = 0, syncs = 0, metaPersists = 0, compacts = 0, truncates = 0,
+      noSyncTruncates = 0;
   int lockedAppends = 0, lockedSyncs = 0, lockedMetaPersists = 0,
-      lockedCompacts = 0, lockedAppendNoSyncs = 0;
+      lockedCompacts = 0, lockedAppendNoSyncs = 0, lockedTruncates = 0,
+      lockedTruncateNoSyncs = 0;
 };
 
 // BlockingLogStore：在 sync()/persistMeta() 上升起"已进入"信号并阻塞，直到测试放行。

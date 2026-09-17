@@ -37,7 +37,18 @@ class LogStore {
   virtual bool sync() = 0;
 
   // Drop [fromIndex, lastIndex] (conflict overwrite).
+  // 含 fsync 的截断：只允许在**不持** RaftNode::mu_ 时调用（I9）。
   virtual bool truncateSuffix(Index fromIndex) = 0;
+  // M5.2（I9）：只做 ftruncate + 内存截断、不做 fsync 的变体，供持 mu_ 的路径使用
+  // （ftruncate 与 write 同属 page-cache/metadata 变更，不算 I9 禁止的 fsync/网络 IO）。
+  // durability 由同一批的锁外 log_.sync() 覆盖（fsync 会一并持久化 size 变更）。
+  // 只做 ftruncate/内存截断、不 fsync 的变体，供持 mu_ 的冲突回滚路径使用（I9）。
+  // 调用方必须在同一批里随后 sync()；否则崩溃后变短的日志可能复活。
+  // 默认实现转调 truncateSuffix()，因此**凡是 truncateSuffix() 会 fsync 的实现
+  // 都必须同时覆写本方法**（FileLogStore 已覆写；M5.A9 会抓住漏网者）。
+  virtual bool truncateSuffixNoSync(Index fromIndex) {
+    return truncateSuffix(fromIndex);
+  }
 
   virtual std::vector<LogEntry> slice(Index from, size_t maxEntries,
                                       size_t maxBytes) const = 0;
@@ -63,6 +74,7 @@ class MemoryLogStore : public LogStore {
   bool appendNoSync(const std::vector<LogEntry>& entries) override;
   bool sync() override;
   bool truncateSuffix(Index fromIndex) override;
+  bool truncateSuffixNoSync(Index fromIndex) override;
   std::vector<LogEntry> slice(Index from, size_t maxEntries,
                               size_t maxBytes) const override;
   Index lastIndex() const override;
@@ -103,6 +115,7 @@ class FileLogStore : public LogStore {
   bool appendNoSync(const std::vector<LogEntry>& entries) override;
   bool sync() override;
   bool truncateSuffix(Index fromIndex) override;
+  bool truncateSuffixNoSync(Index fromIndex) override;
   std::vector<LogEntry> slice(Index from, size_t maxEntries,
                               size_t maxBytes) const override;
   Index lastIndex() const override;
@@ -132,7 +145,7 @@ class FileLogStore : public LogStore {
   // 以下三个是公共入口的内部实现：调用方必须已持有 mu_。
   bool appendNoSyncLocked(const std::vector<LogEntry>& entries);
   bool syncLocked();
-  bool truncateSuffixLocked(Index fromIndex);
+  bool truncateSuffixLocked(Index fromIndex, bool sync);
 
   Term term_ = kNoTerm;
   int votedFor_ = -1;

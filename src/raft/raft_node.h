@@ -1,6 +1,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <functional>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -39,7 +40,11 @@ class RaftNode {
            const ClusterConfig& seed = ClusterConfig{},
            Metrics* metrics = nullptr);  // M5.1: 可选指标（nullptr = 零开销）
 
-  void tick();  // called by the ticker thread (or manually by unit tests)
+  void tick();
+
+  // I15：异步引擎下"该 peer 已有一批在途"的静音窗口（毫秒）。
+  // 必须是静态纯函数，便于单元测试直接钉住"严格小于最小选举超时"这条不变量。
+  static uint64_t inflightMuteGapMs(const RaftConfig& cfg);  // called by the ticker thread (or manually by unit tests)
 
   // Inbound RPC handlers (called by the transport on the receiving side).
   RequestVoteReply onRequestVote(const RequestVoteArgs& args);
@@ -48,6 +53,10 @@ class RaftNode {
   // Outbound RPC callbacks (called by the transport on the sending side).
   void onRequestVoteReply(int peerId, const RequestVoteReply& reply);
   void onAppendEntriesReply(int peerId, const AppendEntriesReply& reply);
+  // M5.3（评审）：应答上下文由回调闭包携带（sentEnd = 该次发送覆盖的日志末尾），
+  // 不再依赖共享的 lastSentEndIndex_，消除 ticker/flusher/异步队列交错造成的归因错配。
+  void onAppendEntriesReplyWithContext(int peerId, Index sentEnd,
+                                       const AppendEntriesReply& reply);
 
   // Client proposal. Blocks until committed / stepped down / timeout.
   ClientReply propose(const ClientRequest& req, uint64_t timeoutMs);
@@ -64,9 +73,13 @@ class RaftNode {
   Term lastIncludedTerm() const;
   InstallSnapshotReply onInstallSnapshot(const InstallSnapshotArgs& args);
   void onInstallSnapshotReply(int peerId, const InstallSnapshotReply& reply);
+  void onInstallSnapshotReplyWithContext(int peerId, uint64_t chunkEnd,
+                                         const InstallSnapshotReply& reply);
 
   // ---- M4: membership + linearizable read (m4-design.md v1.1 §4.3) ----
   ClusterConfig clusterConfig() const;   // 值拷贝（锁内读）
+  // M5.1：注入在途 RPC 数提供者（main 传 Reactor::inflight）
+  void setInflightMetricsProvider(std::function<size_t()> fn);
   uint64_t configVersion() const;
   bool retired() const;                  // self 不是当前配置的投票成员
   // add: 先 CatchUp 追平再追加配置条目；remove: 直接追加。非 Leader -> kNotLeader。
@@ -113,6 +126,9 @@ class RaftNode {
   // 必须在发送前登记而不是 build 时：build 与 send 之间可能被别的线程插队，且异步引擎会
   // 排队多批 -> 旧写法会把"最后 build 的那批"的范围算到前面批次的应答上（丢写）。
   bool approveAppendSend(int peer, const AppendEntriesArgs& a);
+  static Index appendEndIndex(const AppendEntriesArgs& a) {
+    return a.entries.empty() ? a.prevLogIndex : a.entries.back().index;
+  }
   bool approveSnapshotSend(int peer, const InstallSnapshotArgs& a);
   // M4 评审 B6：把「追加日志条目」与「等待提交」拆开，使成员变更能在同一个 mu_
   // 临界区内完成「J1 复查 + 构造配置 + 追加条目」（version 直接用真实条目 index）。
@@ -155,6 +171,14 @@ class RaftNode {
   MembershipMutex membershipMu_;
   // M5.2：串行化 meta 落盘（叶子锁，锁序 metaPersistMu_ -> mu_）；metaDirty_ 受 mu_ 保护。
   MetaMutex metaPersistMu_;
+  // M5.4：串行化"会改日志边界/快照文件"的整段操作（maybeSnapshot 的 save+compact、
+  // onInstallSnapshot 的 receive+load+compact）。这些操作都在 mu_ 之外做 IO，因此彼此
+  // 之间**没有**互斥：main 线程的 maybeSnapshot 与 reactor 线程的 onInstallSnapshot 会
+  // 同时 compact 同一个 FileLogStore（rename/truncate/setBoundary），一旦互相踩到，
+  // compact 返回 false -> 该路径 `throw` -> 异常从 reactor 回调逃逸 -> std::terminate
+  // -> 节点静默死亡（M5.3 实测：reactor + 频繁 compact 时 node 无日志消失）。
+  // 叶子锁：只在 mu_ 之外获取，锁序 snapshotOpMu_ -> mu_（绝不反向）。
+  std::mutex snapshotOpMu_;
   bool metaDirty_ = false;
   // M5.2：非选举场景的 meta 落盘限频（I5 只对授权/自投票要求严格）
   static constexpr uint64_t kMetaFlushMinGapMs = 50;
@@ -198,7 +222,8 @@ class RaftNode {
   // M5.3（异步 transport 的必要约束）：同一 peer 同时只能有**一批**在途。
   // 原因：应答没有序号，`onAppendEntriesReply` 用 `lastSentEndIndex_[peer]` 归因；
   // 若多批在途，后一批的范围会被算到前一批的 ack 上 -> over-count -> 已 ack 的写丢失
-  // （A/B 实测：pipeline=64 出现 missing 59）。超时（2*rpcTimeoutMs）后允许重发。
+  // （A/B 实测：pipeline=64 出现 missing 59）。超时后允许重发，超时长度见
+  // inflightMuteGapMs()（I15：必须严格小于最小选举超时，否则会引发选举风暴）。
   std::unordered_map<int, uint64_t> appendSentMs_;
   std::unordered_map<int, uint64_t> snapshotSentMs_;
   // M4：peer 在本任期是否成功应答过 AppendEntries（设计 §5.4 步骤 5 追平判据）

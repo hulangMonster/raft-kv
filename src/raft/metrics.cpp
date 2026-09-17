@@ -144,6 +144,11 @@ uint64_t Metrics::qps() const {
   return w * 1000000ULL / elapsed;
 }
 
+uint64_t Metrics::inflightNow() const {
+  if (inflightProvider_) return inflightProvider_();
+  return inflightRpc_.load(std::memory_order_relaxed);
+}
+
 std::string Metrics::statusFragment() const {
   const uint64_t batches = batches_.load(std::memory_order_relaxed);
   const uint64_t entries = batchEntries_.load(std::memory_order_relaxed);

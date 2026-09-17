@@ -1,6 +1,8 @@
 // M5.3：TransportReactor 实现（帧编解码复用 M2 的 encodeFrame/decodeFrame）。
 #include "raft/transport_reactor.h"
 
+#include <cstdio>
+#include <exception>
 #include <utility>
 
 #include "raft/message.h"
@@ -36,7 +38,25 @@ void TransportReactor::sendFrame(
                     return;
                   }
                   if (replyType != expect) return;
-                  onReply(replyPayload.data(), replyPayload.size());
+                  // M5.4：回调跑在 reactor 线程上。异常若逃逸出去就是
+                  // std::terminate -> 整个节点无日志静默死亡（M5.3 实测过这种失败形态）。
+                  // 这里捕获后**打印并重新抛出**：不改变"致命错误必须停"的语义，
+                  // 但把"静默死亡"变成可诊断的死亡（含原因）。
+                  try {
+                    onReply(replyPayload.data(), replyPayload.size());
+                  } catch (const std::exception& e) {
+                    std::fprintf(stderr,
+                                 "[raftkv-reactor] FATAL: reply callback threw: %s\n",
+                                 e.what());
+                    std::fflush(stderr);
+                    throw;
+                  } catch (...) {
+                    std::fprintf(stderr,
+                                 "[raftkv-reactor] FATAL: reply callback threw "
+                                 "(non-std exception)\n");
+                    std::fflush(stderr);
+                    throw;
+                  }
                 });
 }
 

@@ -351,6 +351,115 @@ TEST(RaftPerf, A8_NonMemberVoteRequestCannotBumpTerm) {
   EXPECT_EQ(leader->currentTerm(), term0 + 1) << "成员候选者的高 term 必须被采纳";
 }
 
+// M5.A9 [RED->GREEN] I9（评审 B1）：冲突回滚必须走 `truncateSuffixNoSync()`
+// （锁内只 ftruncate+内存截断，durability 交同批的锁外 sync），不得在持锁时做 fsync。
+TEST(RaftPerf, A9_ConflictTruncationDoesNotFsyncUnderLock) {
+  auto c = std::make_shared<FakeClock>();
+  auto transport = std::make_shared<MemoryTransport>();
+  auto llog = std::make_unique<SpyLogStore>();
+  auto flog = std::make_unique<SpyLogStore>();
+  SpyLogStore* followerLog = flog.get();
+  auto lsm = std::make_unique<KvStateMachine>();
+  auto fsm = std::make_unique<KvStateMachine>();
+  RaftConfig c1;
+  c1.selfId = 1;
+  c1.peerIds = {2};
+  RaftNode leader(c1, *llog, *lsm, *transport, *c);
+  RaftConfig c2;
+  c2.selfId = 2;
+  c2.peerIds = {1};
+  RaftNode follower(c2, *flog, *fsm, *transport, *c);
+  transport->addNode(1, &leader);
+  transport->addNode(2, &follower);
+
+  for (int i = 0; i < 60 && leader.role() != Role::kLeader; ++i) {
+    c->advance(10);
+    leader.tick();
+    follower.tick();
+  }
+  ASSERT_EQ(leader.role(), Role::kLeader);
+
+  // 选举循环一旦成为 leader 就退出，此时本任期 no-op 还没追加/复制出去。
+  // 再多驱动几轮，让 follower 拥有真实前缀（否则 base==0，冲突条目无处可冲突）。
+  for (int i = 0; i < 200 && followerLog->lastIndex() == 0; ++i) {
+    c->advance(10);
+    leader.tick();
+    follower.tick();
+  }
+  ASSERT_GT(followerLog->lastIndex(), 0)
+      << "leader 的本任期 no-op 应已复制到 follower";
+
+  // 冲突条目必须落在 follower 已有前缀 [1, lastIndex()] 之内：
+  // onAppendEntries 只在 `e.index <= log_.lastIndex()` 时才比较 term 并回滚，
+  // index 越过末尾的条目会被当作"新条目"直接追加，走不到截断分支。
+  const auto base = followerLog->lastIndex();
+  ASSERT_GT(base, 0) << "选举后 follower 至少应有一条日志";
+  {
+    LogEntry bogus;
+    bogus.index = base + 1;
+    bogus.term = 99;
+    bogus.op = OpCode::kPut;
+    bogus.key = "bogus";
+    bogus.value = "x";
+    ASSERT_TRUE(followerLog->appendNoSync({bogus}));
+  }
+  ASSERT_EQ(followerLog->lastTerm(), static_cast<Term>(99)) << "幽灵条目就位";
+
+  // prevLogIndex 必须落在 follower 日志的真实前缀上，否则 AE 会被拒（success=false）；
+  // 待追加条目与幽灵条目同 index、不同 term，才会触发 conflict 回滚。
+  AppendEntriesArgs ae;
+  ae.term = follower.currentTerm();
+  ae.leaderId = 1;
+  ae.prevLogIndex = base;
+  ae.prevLogTerm = followerLog->termAt(base);
+  LogEntry real;
+  real.index = base + 1;
+  real.term = follower.currentTerm();
+  real.op = OpCode::kPut;
+  real.key = "k";
+  real.value = "v";
+  ae.entries.push_back(real);
+  const auto rep = follower.onAppendEntries(ae);
+  EXPECT_TRUE(rep.success);
+
+  // 正向信号必须挂在 no-sync 探针上：修好之后含 fsync 的 truncateSuffix()
+  // 根本不该被进入，用它的计数当"确实截断过"的证据会永远为 0。
+  EXPECT_GT(followerLog->noSyncTruncates, 0)
+      << "本用例必须真的触发一次截断 (base=" << base
+      << " prevLogTerm=" << ae.prevLogTerm
+      << " followerTerm=" << follower.currentTerm() << ")";
+  EXPECT_GT(followerLog->lockedTruncateNoSyncs, 0)
+      << "冲突回滚应走锁内的 truncateSuffixNoSync（只 ftruncate + 内存截断）";
+  EXPECT_EQ(followerLog->lockedTruncates, 0)
+      << "I9：持 mu_ 时不得调用含 fsync 的 truncateSuffix";
+}
+
+// M5.A10 [GUARD] I15：异步引擎的"该 peer 已有一批在途"静音窗口必须严格小于
+// follower 的最小选举超时。否则丢一帧（reactor 逐帧超时后丢弃队首且不回调）就会
+// 让健康的 follower 在窗口内收不到心跳、自行竞选并顶掉 leader。
+// （M5.3 实测：reactor 引擎 raft_fault.sh 出现选举风暴 term 每秒 +1.5，
+//   随后客户端写返回 NOT_LEADER；根因即 2*rpcTimeoutMs=200ms > 150ms。）
+TEST(RaftPerf, A10_InFlightMuteWindowStaysBelowElectionTimeout) {
+  RaftConfig def;  // 默认 150/300/50(rpc=100)
+  const uint64_t gap = RaftNode::inflightMuteGapMs(def);
+  EXPECT_GT(gap, 0u);
+  // 加 10ms tick 粒度与调度抖动的余量后仍需小于最小选举超时
+  EXPECT_LT(gap + 10u, def.electionTimeoutMinMs)
+      << "mute gap=" << gap << " minElectionTimeout=" << def.electionTimeoutMinMs;
+
+  // rpcTimeoutMs 被调大时也要被夹住（不能退化成 2*rpcTimeoutMs）
+  RaftConfig slow = def;
+  slow.rpcTimeoutMs = 5000;
+  EXPECT_LT(RaftNode::inflightMuteGapMs(slow) + 10u, slow.electionTimeoutMinMs);
+
+  // 选举超时很小（快速选举配置）时仍须为正且小于它
+  RaftConfig tiny = def;
+  tiny.electionTimeoutMinMs = 30;
+  const uint64_t g2 = RaftNode::inflightMuteGapMs(tiny);
+  EXPECT_GT(g2, 0u);
+  EXPECT_LT(g2, tiny.electionTimeoutMinMs);
+}
+
 // M5.A7 [GUARD] R2 守门：两段式改造不得破坏成员变更语义（J1/J2 仍成立）。
 TEST(RaftPerf, A7_ConfigChangeStillCommits) {
   auto c = makeSpyCluster(3);

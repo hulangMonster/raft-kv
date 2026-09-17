@@ -390,6 +390,10 @@ int main(int argc, char** argv) {
     std::sort(seed.members.begin(), seed.members.end(),
               [](const Member& a, const Member& b) { return a.id < b.id; });
     RaftNode node(cfg, log, sm, transport, clock, &snapshots, seed, &metrics);
+    // M5.1：把 Reactor 的在途请求数接进指标（status/metrics 渲染时读取）
+    node.setInflightMetricsProvider([&reactorTransport]() -> size_t {
+      return reactorTransport ? reactorTransport->inflight() : 0;
+    });
 
     struct sigaction sa {};
     sa.sa_handler = onSignal;

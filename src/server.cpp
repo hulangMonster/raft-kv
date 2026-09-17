@@ -150,6 +150,14 @@ void handleConn(int fd, Store& store, ConnRegistry& registry) {
         }
         break;
       }
+      case OpCode::kConfig:
+        // 不可达：kConfig 不在 M1 codec 白名单内（parseRequest 会先拒绝），
+        // 客户端无法伪造配置条目（m4-prerequisites.md §7.1 P3）。
+        // 显式列出而非用 default:，既守住 -Wswitch 零告警，
+        // 也不会让将来新增的 OpCode 被静默吞掉。
+        resp.status = StatusCode::kErr;
+        resp.payload = "config entries are not accepted on this protocol";
+        break;
     }
 
     const Bytes out = encodeResponse(resp);

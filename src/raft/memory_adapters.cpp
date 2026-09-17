@@ -43,6 +43,14 @@ bool MemoryLogStore::appendNoSync(const std::vector<LogEntry>& entries) {
 
 bool MemoryLogStore::sync() { return true; }  // nothing to flush in memory
 
+// M5.2（I9）：内存适配器没有 fsync 语义差异，no-sync 变体直接复用内存截断。
+// 这里必须写限定名 MemoryLogStore::truncateSuffix()：不加限定的调用是虚调用，
+// 会落到子类覆写的"含 fsync"实现上——那正是 I9 禁止在持 mu_ 时发生的事
+// （M5.A9 实测：探针曾因此在锁内计入一次同步截断）。
+bool MemoryLogStore::truncateSuffixNoSync(Index fromIndex) {
+  return MemoryLogStore::truncateSuffix(fromIndex);
+}
+
 bool MemoryLogStore::truncateSuffix(Index fromIndex) {
   if (fromIndex == kNoIndex) return true;
   if (fromIndex <= lastIncluded_) return false;  // cannot cut below boundary
