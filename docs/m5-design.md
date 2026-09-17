@@ -723,3 +723,37 @@ TSan（全量 raft 用例 + `raft_perf_test`）必须 0 报告；注入用例：
      * 复现命令（约 1 分钟/轮，需保留数据目录以便对账）：
        `RAFTKV_TRANSPORT=reactor ./build/bin/raftkv_raft_node --id N --snapshot-threshold 5000 ...`
        + `./build/bin/raftkv_raft_cli --peers ... fill 10000 --pipeline 64` + `verify 10000`。
+
+- **v2.3**（reactor 丢写**根因确证**：异步应答被记到错误的在途请求上；sync 侧对照为 0 失误）：
+  1. **插桩手段（已全部回退，仓库不含诊断代码）**：
+     * 给每个 AppendEntries 帧算**内容签名**（term + prevLogIndex/prevLogTerm + entries 数量 +
+       首/末条目的 index/term），leader 发送时打 `[tx] sig=`、收到应答打 `[rx] sig=... ok=...`，
+       follower 处理完打 `[ae] sig=... -> ok=...`。签名不含 leaderCommit，但足以判定"这一批条目"。
+     * reactor 内部加**发送序号**：`[q]`（入队）、`[w]`（每次真正写出，含 wrote/want）、`[pop]`（收到
+       应答后弹出队首）。
+  2. **核心实验（可复现）**：对每个"被记功的应答"（leader 侧 `[rx] ok=1`）检查被记功的那个 peer
+     是否真的处理过同签名帧：
+     | 引擎 | 记功次数 | peer 从未处理该签名帧 | peer 只回过失败 |
+     |---|---|---|---|
+     | **sync** | 855 | **0** | **0** |
+     | **reactor**（6 轮） | ~1230–1290 /轮 | **14 / 27 / 17 / 22 / 20 / 21** | **14 / 20 / 20 / 9 / 19 / 35** |
+     → **sync 的"一次调用一个应答"归因是精确的；reactor 有 1–3% 的应答被记到了错误的在途请求上。**
+       这与"sync 3/3 干净、reactor 1/6~2/3 丢写"的现象完全吻合。
+  3. **独立的佐证**（同一轮故障日志）：node1 的 `[commit] … commit=4558 match={1:3438 2:4558 3:4530}`
+     说明它按 `matchIndex_[2]=4558` 提交；而 node2 自己在 term 9 的投票行写着
+     `myLast=(8,4530)` —— **node2 的日志从未到过 4558**。即那次"记功"是虚假的：
+     leader 据此提交并 ack 了客户端，随后这些条目被更高任期的合法分歧覆盖 → 已 ack 的写丢失。
+  4. **结论（阻断项性质）**：reactor 的请求/应答配对不满足"每个应答都对应它自己那一帧"这一前提；
+     在"超时丢帧 + 关连接 + 重连 + 队列重排"的组合下会错配。**这是 reactor 侧的传输层缺陷，
+     不是 Raft 层逻辑缺陷**（投票/提交/日志匹配规则经逐条核对均正确）。
+  5. **处置**：
+     * 出厂默认仍为 `sync`（v2.0 起），`--inflight-per-peer` 默认 1；reactor 明确标注**不可用于生产**。
+     * 修复方向（下一轮）：让配对**可验证**或在歧义时**不可能错配**——最保守可行的方案是
+       "每连接最多一个 Pending；任何超时/错误/部分写导致的不确定，一律关连接并**丢弃该 peer 全部
+       Pending**（不重排、不重用）"，由 Raft 层按既有重试逻辑重发。改动集中在 `reactor.cpp`，
+       不触碰 wire 格式（I14）。
+  6. 本轮同时修掉一个**真实崩溃**（插桩期间暴露）：`main_raft_node.cpp` 里 `ticker` 线程是 joinable 的，
+     而 socket/bind/listen 失败会直接 `return 1` → 析构 joinable thread → `std::terminate`
+     （实测日志 `bind :40002 failed: Address already in use` + `terminate called without an active
+     exception`）。已加 RAII 守卫（所有退出路径先停 ticker 再 join），并实测 bind 冲突时干净退出
+     （rc=1，仅一行错误信息，无 terminate）。

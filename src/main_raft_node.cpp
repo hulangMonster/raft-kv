@@ -430,6 +430,21 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
     });
+    // M5.6 修复（实测）：ticker 是 joinable 的，而下面 socket/bind/listen 失败都会
+    // 直接 `return 1`——那会在析构 ticker 时触发 std::terminate（日志里表现为
+    // "terminate called without an active exception"，节点无诊断地消失）。
+    // 用 RAII 守卫保证**所有**退出路径（含异常展开）都先停 ticker 再 join。
+    bool tickerJoined = false;
+    struct TickerStop {
+      std::thread& t;
+      bool& done;
+      ~TickerStop() {
+        if (done) return;
+        g_running = false;
+        if (t.joinable()) t.join();
+        done = true;
+      }
+    } tickerStop{ticker, tickerJoined};
 
     const int lsock = ::socket(AF_INET, SOCK_STREAM, 0);
     if (lsock < 0) {
@@ -479,7 +494,8 @@ int main(int argc, char** argv) {
 
     ::close(lsock);
     g_running = false;
-    ticker.join();
+    if (ticker.joinable()) ticker.join();
+    tickerJoined = true;  // 已显式 join，守卫不再重复
     // M5.3（L15）：显式停止 reactor（停事件循环 + join + 丢弃在途回调），避免
     // detached 连接线程/回调触及即将失效的对象。
     if (reactorTransport) reactorTransport->stop();
