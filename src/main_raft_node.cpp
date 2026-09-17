@@ -274,13 +274,11 @@ int main(int argc, char** argv) {
   std::string peersArg;
   std::string dataDir;
   bool lockWaitMetrics = false;  // M5.1: 打开锁等待计时（默认关，零开销）
-  // M5.3：Reactor 引擎**尚未作为默认**。它在 e2e/故障注入下全通过，但在 p=64 高并发基准里
-  // 仍出现 1-2 条"已 ack 的写不可见"（missing != 0）—— 根因是应答缺少关联号：
-  // `onAppendEntriesReply` 用 `lastSentEndIndex_[peer]` 归因，只要"迟到应答"落在下一批发送之后
-  // （门控超时 2*rpcTimeoutMs 后允许重发），归因就会错配 -> matchIndex_ over-count -> 丢写。
-  // 彻底修法（下一轮）：在 AppendEntries/InstallSnapshot 请求里带单调 seq，并在应答里回显，
-  // 用 (peer, seq) -> sentEndIndex 精确配对（只增字段，不动既有语义）。
-  // 在那之前默认走 sync（M2/M3/M4 已验证路径），reactor 用 --transport=reactor 显式开启。
+  // M5.3：默认仍为 **sync**。reactor 引擎的数据层已修好（`fill 20000 --pipeline 64` 连续 3 轮
+  // `verify missing 0`），但把它设为默认后 e2e/故障注入出现失败（`raft_snapshot_e2e`、
+  // `raft_membership_e2e` 的 verify、`raft_fault --repeat 50` 的 iter 32 NOT_LEADER），
+  // 日志显示节点进程消失（cannot reach）—— 与压测中观察到的间歇性 SIGSEGV 相关。
+  // 在崩溃定位并修复之前，默认保持 M4 已验证的 sync；reactor 用 --transport=reactor 显式开启。
   bool useReactor = false;
 
   for (int i = 1; i < argc; ++i) {

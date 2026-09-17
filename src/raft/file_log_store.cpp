@@ -164,7 +164,7 @@ FileLogStore::~FileLogStore() {
 }
 
 bool FileLogStore::load(Term& term, int& votedFor, Index& lastIndex) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   if (logFd_ < 0) return false;
   // 1. Metadata.
   term_ = kNoTerm;
@@ -244,7 +244,7 @@ bool FileLogStore::load(Term& term, int& votedFor, Index& lastIndex) {
 }
 
 bool FileLogStore::persistMeta(Term term, int votedFor) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   Bytes payload;
   payload.reserve(kMetaPayloadLen);
   putU64(payload, term);
@@ -272,12 +272,12 @@ bool FileLogStore::persistMeta(Term term, int votedFor) {
 }
 
 bool FileLogStore::append(const std::vector<LogEntry>& entries) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   return appendNoSyncLocked(entries) && syncLocked();
 }
 
 bool FileLogStore::sync() {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   return syncLocked();
 }
 
@@ -287,7 +287,7 @@ bool FileLogStore::syncLocked() {
 }
 
 bool FileLogStore::appendNoSync(const std::vector<LogEntry>& entries) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   return appendNoSyncLocked(entries);
 }
 
@@ -317,7 +317,7 @@ bool FileLogStore::appendNoSyncLocked(const std::vector<LogEntry>& entries) {
 }
 
 bool FileLogStore::truncateSuffix(Index fromIndex) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   return truncateSuffixLocked(fromIndex);
 }
 
@@ -356,6 +356,7 @@ bool FileLogStore::truncateSuffixLocked(Index fromIndex) {
 
 std::vector<LogEntry> FileLogStore::slice(Index from, size_t maxEntries,
                                           size_t maxBytes) const {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   std::vector<LogEntry> out;
   size_t bytes = 0;
   Index start = from;
@@ -372,16 +373,19 @@ std::vector<LogEntry> FileLogStore::slice(Index from, size_t maxEntries,
 }
 
 Index FileLogStore::lastIndex() const {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   return entries_.empty() ? lastIncluded_
                           : static_cast<Index>(entries_.back().index);
 }
 
 Term FileLogStore::lastTerm() const {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!entries_.empty()) return entries_.back().term;
   return (lastIncluded_ == kNoIndex) ? kNoTerm : lastIncludedTerm_;
 }
 
 Term FileLogStore::termAt(Index index) const {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   if (index == kNoIndex) return kNoTerm;
   if (index == lastIncluded_ && lastIncluded_ != kNoIndex) {
     return lastIncludedTerm_;  // boundary entry (D3)
@@ -394,6 +398,7 @@ Term FileLogStore::termAt(Index index) const {
 
 void FileLogStore::setBoundary(Index lastIncludedIndex,
                                Term lastIncludedTerm) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   lastIncluded_ = lastIncludedIndex;
   lastIncludedTerm_ = lastIncludedTerm;
   size_t drop = 0;
@@ -408,7 +413,7 @@ void FileLogStore::setBoundary(Index lastIncludedIndex,
 }
 
 bool FileLogStore::compact(Index upTo, Term termAtUpTo) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   if (upTo == kNoIndex) return true;
   if (upTo <= lastIncluded_) return true;  // already compacted: no-op
   // upTo may exceed lastIndex() (InstallSnapshot): the retained suffix is empty.
@@ -466,8 +471,11 @@ bool FileLogStore::compact(Index upTo, Term termAtUpTo) {
   return true;
 }
 
-Index FileLogStore::firstIndex() const { return lastIncluded_ + 1; }
-Index FileLogStore::lastIncludedIndex() const { return lastIncluded_; }
-Term FileLogStore::lastIncludedTerm() const { return lastIncludedTerm_; }
+Index FileLogStore::firstIndex() const {
+  std::lock_guard<std::recursive_mutex> lock(mu_); return lastIncluded_ + 1; }
+Index FileLogStore::lastIncludedIndex() const {
+  std::lock_guard<std::recursive_mutex> lock(mu_); return lastIncluded_; }
+Term FileLogStore::lastIncludedTerm() const {
+  std::lock_guard<std::recursive_mutex> lock(mu_); return lastIncludedTerm_; }
 
 }  // namespace raftkv::raft

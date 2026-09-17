@@ -171,10 +171,7 @@ class RaftNode {
   // maybeSnapshot() is discarded if this changed while it was being persisted
   // (the installed snapshot is newer and must win).
   uint64_t installEpoch_ = 0;
-  // M5.2：InstallSnapshot 的 compact 搬到锁外执行（I9），这里暂存待压缩边界。
-  bool pendingInstallCompact_ = false;
-  Index pendingInstallIndex_ = kNoIndex;
-  Term pendingInstallTerm_ = kNoTerm;
+
   std::unordered_map<int, uint64_t> snapshotSendOffset_;  // per-peer progress
   std::unordered_map<int, uint64_t> snapshotChunkEnd_;    // per-peer last chunk
 

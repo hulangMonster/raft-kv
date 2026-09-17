@@ -121,12 +121,14 @@ class FileLogStore : public LogStore {
   std::string metaPath_;
   std::string logPath_;
   int logFd_ = -1;
-  // B4 + M5.2: every operation that recreates/renames the log file, touches
-  // logFd_, or mutates entries_/offsetOf_ takes this lock —— including
-  // appendNoSync()。M5.2 起 compact() 在 RaftNode::mu_ **之外**执行（I9：锁内不做
-  // fsync），所以 appendNoSync() 不能再依赖 RaftNode::mu_ 来与 compact()/rename
-  // 互斥，否则会在 compact 关闭/重开 logFd_ 的同时往旧 fd 上写。
-  mutable std::mutex mu_;
+  // B4 + M5.2: **所有**触碰内部状态的入口都持这把锁，包括只读访问器
+  // （lastIndex/lastTerm/termAt/slice/firstIndex/lastIncluded*）。
+  // 原因：M5.2 把 compact() 移到 RaftNode::mu_ 之外（I9：锁内不做 fsync），原先
+  // "只读访问器由调用方的 RaftNode::mu_ 串行化"这一 M2 约定就被打破 ——
+  // compact 在 store 锁下改 entries_/offsetOf_/lastIncluded_ 时，别的线程仍在
+  // mu_ 下读它们 → 数据竞争 → UB/SIGSEGV（ASan 实测栈顶 termAt/slice）。
+  // 用 recursive_mutex：内部实现之间互相调用（compact→lastIndex 等）不会自死锁。
+  mutable std::recursive_mutex mu_;
   // 以下三个是公共入口的内部实现：调用方必须已持有 mu_。
   bool appendNoSyncLocked(const std::vector<LogEntry>& entries);
   bool syncLocked();

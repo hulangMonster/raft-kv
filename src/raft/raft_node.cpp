@@ -972,16 +972,14 @@ InstallSnapshotReply RaftNode::onInstallSnapshot(const InstallSnapshotArgs& args
     if (!sm_.restore(installed.payload)) return {currentTerm_, false, 0};
     // M5.2（I9）：compact（fsync + rename + fsyncDir）在锁外执行；状态机 restore 仍在
     // 锁内（状态机读路径受 mu_ 保护）。
-    pendingInstallCompact_ = true;
-    pendingInstallIndex_ = installed.lastIncludedIndex;
-    pendingInstallTerm_ = installed.lastIncludedTerm;
   }
-  if (pendingInstallCompact_) {
+  // B12 + 评审：compact 在锁外执行，但**用局部变量**承载边界（原来用成员变量，
+  // 并发 InstallSnapshot 会互相覆盖 idx/term -> 跳过 compact 或用错边界）。
+  {
     // B12: compaction must succeed before the boundary is advanced.
-    if (!log_.compact(pendingInstallIndex_, pendingInstallTerm_)) {
+    if (!log_.compact(installed.lastIncludedIndex, installed.lastIncludedTerm)) {
       throw std::runtime_error("raft: log compaction failed (InstallSnapshot)");
     }
-    pendingInstallCompact_ = false;
   }
   {
     std::lock_guard<ProbedMutex> lock(mu_);

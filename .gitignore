@@ -5,3 +5,5 @@ cmake-build-*/
 core.*
 *.log
 .cache/
+build-tsan/
+build-asan/

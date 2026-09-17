@@ -1,1 +1,0 @@
-/usr/bin/c++ -O2 -g -DNDEBUG -fsanitize=thread CMakeFiles/raftkv_cli.dir/src/main_client.cpp.o -o bin/raftkv_cli  libraftkv_core.a 

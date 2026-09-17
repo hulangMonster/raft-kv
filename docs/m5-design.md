@@ -468,3 +468,31 @@ TSan（全量 raft 用例 + `raft_perf_test`）必须 0 报告；注入用例：
      或明确记录未达成。
   4. **另有一处崩溃待查**：A/B 过程中出现 2 次 node `SIGSEGV`（core dumped），发生在两次压测之间，
      未影响该轮的 `verify` 结果（3 节点有 2 个存活即可提交）。下一轮用 ASan 构建复现并定位。
+
+- **v1.6**（M5 独立评审 #4 后的处置；**新增一条 UB/崩溃级修复**）：
+  1. **🔴 已修：FileLogStore 数据竞争 → SIGSEGV（UB）**。M5.2 把 `compact()` 移出 `RaftNode::mu_`
+     之后，M2 的隐含约定"只读访问器（`lastIndex/lastTerm/termAt/slice`）由调用方的 `mu_` 串行化"
+     被打破：compact 在 store 锁下改 `entries_/offsetOf_/lastIncluded_`，而其它线程仍在 `mu_` 下读
+     它们。ASan 实测 `SEGV in FileLogStore::termAt`（调用栈 `propose → 连接线程`），独立评审的
+     gdb 栈顶为 `FileLogStore::slice:368`。
+     **修复**：`FileLogStore::mu_` 改为 `std::recursive_mutex`，**所有**触碰内部状态的入口
+     （含 8 个只读访问器与 `setBoundary`）统一持锁；recursive 保证内部互调（compact→lastIndex）
+     不会自死锁。验证：ASan 构建下 3 节点 `fill 20000 --pipeline 64` ×2 轮 `missing 0`、
+     **ASan 报告 0 条**（修复前同一驱动必崩）。
+  2. 同时修掉 `pendingInstallCompact_` 成员变量的竞争（并发 InstallSnapshot 互相覆盖 idx/term）
+     → 改为锁外 compact 使用**局部**边界。
+  3. **评审提出的仍未关闭项（下一轮）**：
+     * **I9 仍有违约**：`onAppendEntries` 的冲突路径在持 `mu_` 时调 `log_.truncateSuffix()`，
+       其内部是 `ftruncate + fsync`（评审用 `/tmp/truncprobe2` + strace 实证）。修法：拆出
+       "只做 ftruncate + 内存截断"的 `truncateSuffixNoSync()` 供锁内使用，durability 交由同一批的
+       锁外 `sync()` 覆盖（fsync 会一并持久化 size 变更）；并扩展 `SpyLogStore`/A1 覆盖该路径。
+     * **ack 归因仍非严格原子**：`approveAppendSend` 只在异步引擎做门控，登记与 `sendX` 非原子；
+       sync 引擎下 ticker 与 flusher 交错时回调仍可能读到"别人的 end"；reactor 侧门控是计时器，
+       若 reactor 线程被长回调/等锁卡住，超时扫描未跑，第二批已入队 -> 旧应答按新批归因。
+       **真正闭合的做法**（下一轮）：把应答上下文放进**回调闭包**（`sendX(...,[this,peer,endIndex](reply){...})`），
+       不再依赖共享状态；`onXxxReply` 改为携带上下文参数。无需改 wire 格式。
+     * `erasePeerStateLocked` 未清理 M5.3 新增的 `appendSentMs_/snapshotSentMs_`；`approveAppendSend`
+       在 append 路由写 `snapshotChunkEnd_`（污染在途快照进度）—— 收敛到闭包方案后自然消失。
+     * 指标 `onElection/setReplicationLag/setInflightRpc` 尚无生产调用点（status 三项恒 0）——
+       接上 `startElection`/leader tick/`Reactor::inflight()`。
+     * 仓库卫生：`build-tsan/`（114 个文件）曾被误提交，已加入 `.gitignore` 并从索引移除。
