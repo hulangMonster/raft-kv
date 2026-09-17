@@ -1,0 +1,1 @@
+/usr/bin/c++ -O2 -g -DNDEBUG CMakeFiles/raftkv_tests.dir/tests/test_main.cpp.o CMakeFiles/raftkv_tests.dir/tests/test_store.cpp.o CMakeFiles/raftkv_tests.dir/tests/test_codec.cpp.o -o bin/raftkv_tests  libraftkv_core.a 

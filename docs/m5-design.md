@@ -605,3 +605,48 @@ TSan（全量 raft 用例 + `raft_perf_test`）必须 0 报告；注入用例：
      "reactor 引擎不稳定"。用 `RAFTKV_TRACE`/ERR trap 定位（`ERR at line 181`，而当时 5 节点
      `term=11 cv=1334` 全部收敛、leader 正常）。改为"有限次重试 + 明确诊断"（`read_key_retry`），
      `raft_membership_e2e.sh` 同类写法一并修。
+
+- **v2.0**（M5 收尾实测回填：**一条未关闭的阻断项 + 两项设计偏差 + 最终验收口径**）：
+  1. **🔴 未关闭的阻断项：reactor 引擎在 p=64 压测下偶发丢写（并在本轮复现过一次 abort）**。
+     * 现象：3 节点 + reactor + `fill 10000 --pipeline 64` → `verify` 报 `missing 1 / 12 / 34 / 36 / 49`
+       （约 1/3 的轮次非 0）；**多次重复 verify 结果完全一致**（1/1/1、12/12/12、34/34/34）
+       → 不是"读路径陈旧"，是**真的没进状态机**。
+     * 归属实验（每格 3 轮 × 10000）：
+       | 配置 | 结果 |
+       |---|---|
+       | sync（默认） | 0 / 0 / 0 —— 干净 |
+       | reactor + 窗口=1 | 1 / 0 / 0 |
+       | reactor + 窗口=4 | 0 / 0 / 0（但另一组 6 轮里出现 1 / 12 / 34） |
+       | reactor + **关闭快照压缩**（threshold 1e8） | 0 / **49** / 0 —— 仍复现 → 属 append/复制路径，与快照无关 |
+       另有 1 次 reactor 节点 **Aborted (core dumped)**（未捕获到栈）。
+     * 已排除：投票"日志新旧"判据（§5.4.1 实现正确）、跨轮次 (clientId,requestId) 复用
+       （每个 trial 都是全新集群 + 全新 CLI 进程，仍复现）、快照/InstallSnapshot 路径
+       （关掉压缩仍复现）、`MemoryLogStore::truncateSuffixNoSync` 虚调用（v1.7 已修）。
+     * 未定位的疑点（下一轮继续）：`advanceCommitAndApply()` 的 apply 循环在
+       `log_.slice(next,1,·)` 取不到条目时**静默 break**，而 `lastApplied_` 仍可能被
+       InstallSnapshot 路径置前；以及乐观 `nextIndex_` 与"失败应答清空槽位"的交互。
+       复现命令（约 1 分钟/轮）：
+       `RAFTKV_TRANSPORT=reactor ./build/bin/raftkv_raft_node ... --snapshot-threshold 5000`
+       + `./build/bin/raftkv_raft_cli --peers ... fill 10000 --pipeline 64` + `verify 10000`。
+     * **处置**：正确性优先 → **默认引擎保持 `sync`**（v2.0 起 `useReactor=false`），
+       reactor 作为可选引擎（`--transport=reactor`）保留全部功能与故障注入证据，
+       但**在修好之前不得作为默认、M5 也不据此宣称"性能里程碑达成"**。
+  2. **设计偏差（§8.3 / §8.4，未实现或部分实现，按"偏差必须入档"记录）**：
+     * **§8.3 快照流式序列化未实现**：`FileSnapshotStore::save()` 仍是一次性
+       `encodeSnapshotFile(data)` 全量缓冲后写盘，`SnapshotView` 没有 `nextChunk()`/增量 CRC，
+       因此内存峰值仍是 O(状态)，§8.3 要求的"RSS 增量 ≤ 块大小 × 常数"断言**也不存在**
+       （仓库内无任何 RSS/getrusage 测试）。当前 `--snapshot-threshold` 与本机规模下快照
+       仅数百 KB～数 MB，尚未造成问题，但它是一项**未完成的设计项**。
+     * **§8.4 断点续传仅进程内有效**：`.recv` 文件**没有** `(index, term, receivedLen, crcSoFar)`
+       头；续传状态 `recvIndex_/recvTerm_/recvEnd_` 只在内存里。行为是：同一进程内重传块幂等
+       （`offset + size <= recvEnd_` 直接认成功）、出现空洞则整段重启、`done` 时校验
+       (index,term) 后 rename。**跨进程重启的续传不成立**（重启后从头传）。
+  3. **最终验收口径（本轮实测，默认引擎 = sync）**：构建 0 warning；`raftkv_raft_tests` 84/84；
+     `raftkv_tests`(M1) 13/13；TSan 0 报告；`raft_snapshot_e2e` / `raft_membership_e2e` /
+     `raft_snapshot_fault --repeat 20` / `raft_fault --repeat 50` / `raft_membership_fault --repeat 50`
+     全 PASS（详见 `docs/m5-bench.md` §3 与提交信息）。
+     **未达标且已入档**：p=1 ≤8 ms/写、p=64 ≥1200 qps 在本机当前状态下不可达（冻结基线期 16.4 ms/写
+     → 本轮 M4 基线亦 28.7–41.5 ms/写），需在安静机器上复测。
+  4. **结论**：M5.1/M5.2/M5.3/M5.5/M5.6 的目标与不变量已落地并有用例/脚本守门；
+     M5.4 的 §8.3 未实现、§8.4 部分实现；reactor 的可选引擎存在未关闭的丢写阻断项。
+     因此**本轮不打 `m5-performance` tag**：tag 应等到 reactor 丢写定位并修复之后再打。

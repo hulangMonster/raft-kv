@@ -282,11 +282,14 @@ int main(int argc, char** argv) {
   // `raft_membership_e2e` 的 verify、`raft_fault --repeat 50` 的 iter 32 NOT_LEADER），
   // 日志显示节点进程消失（cannot reach）—— 与压测中观察到的间歇性 SIGSEGV 相关。
   // 在崩溃定位并修复之前，默认保持 M4 已验证的 sync；reactor 用 --transport=reactor 显式开启。
-  // M5.6（依据 docs/m5-bench.md §3.3 同轮交替实测）：**默认使用 reactor 引擎**。
-  // reactor 在 p=1 快 1.68×（13.4 vs 22.5 ms/写）、p=8 快 2.06×，p=64 持平；
-  // 且它把网络 IO 与共识锁解耦（慢/死 peer 不阻塞 tick，见 I15/I16 的故障注入证据）。
-  // `--transport=sync` / `RAFTKV_TRANSPORT=sync` 仍可切回同步引擎（保留作对照）。
-  bool useReactor = true;
+  // M5.6 收尾：默认**保持 sync**。reactor 的性能更好（p=1 快 1.68×、p=8 快 2.06×，
+  // 见 docs/m5-bench.md §3.3），故障注入/端到端脚本也全绿，但 M5.6 的压力复测发现它在
+  // p=64 下**偶发丢写**（`verify` 报 missing 1~49/10000，且关闭快照压缩后依然复现 ->
+  // 属 append/复制路径）并偶发 abort；同一批复测中 sync 3/3 干净。
+  // 正确性优先于性能，因此默认仍是 sync；reactor 作为**可选引擎**保留：
+  //   --transport=reactor / RAFTKV_TRANSPORT=reactor
+  // 该阻断项记录在 docs/m5-design.md §15 v2.0，未修好之前不得作为默认。
+  bool useReactor = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
