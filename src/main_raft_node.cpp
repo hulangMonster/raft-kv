@@ -259,6 +259,7 @@ std::unordered_map<int, std::string> parsePeers(const std::string& s) {
 
 void usage(const char* argv0) {
   std::cerr << "usage: " << argv0
+           << " [--group-linger-us N]"
             << " --id N --port P --peers \"1=host:port,...\""
             << " [--data-dir DIR]\n";
 }
@@ -271,6 +272,7 @@ int main(int argc, char** argv) {
   int id = 1;
   int port = 19601;
   size_t snapshotThreshold = 10000;
+  uint64_t groupLingerUs = 0;  // M5.4: --group-linger-us（0 = 不蓄批）
   std::string peersArg;
   std::string dataDir;
   bool lockWaitMetrics = false;  // M5.1: 打开锁等待计时（默认关，零开销）
@@ -322,6 +324,9 @@ int main(int argc, char** argv) {
       lockWaitMetrics = true;
     } else if (a == "--snapshot-threshold") {
       snapshotThreshold = std::stoul(next("--snapshot-threshold"));
+    } else if (a == "--group-linger-us") {
+      // M5.4（决策④ 批处理调优）：组提交蓄批窗口，用于 A/B 实测取值。
+      groupLingerUs = std::stoull(next("--group-linger-us"));
     } else {
       usage(argv[0]);
       return 2;
@@ -349,6 +354,7 @@ int main(int argc, char** argv) {
     cfg.selfId = id;
     cfg.peerIds = std::move(peerIds);
     cfg.snapshotThresholdEntries = snapshotThreshold;
+    cfg.groupCommitLingerUs = groupLingerUs;  // M5.4：0 = 不蓄批
 
     Metrics metrics;  // M5.1: 进程内指标（只读；不参与任何判定）
     if (lockWaitMetrics) lockprobe::setTimingEnabled(true);

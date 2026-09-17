@@ -94,6 +94,12 @@ struct RaftConfig {
   uint64_t electionTimeoutMaxMs = 300;
   uint64_t heartbeatMs = 50;
   uint64_t rpcTimeoutMs = 100;
+  // M5.4（决策④「批处理调优」）：组提交"蓄批"窗口。>0 时，被选为 flusher 的
+  // propose 会先短睡这么久再 fsync，让并发写汇入同一批 —— 每批的**往返成本**
+  // （leader fsync + follower fsync + RTT）被更多条目摊薄，吞吐近似线性提升。
+  // 仅当同时在等的写者数 ≥ lingerMinWaiters 时才蓄批，pipeline=1/2 不受影响。
+  uint64_t groupCommitLingerUs = 0;  // 0 = 关闭（默认；由 --group-linger-us 打开）
+  size_t lingerMinWaiters = 4;       // 并发放等者达到此数才蓄批
   size_t maxEntriesPerAppend = 128;
   size_t maxBytesPerAppend = 1u << 20;
   bool appendNoop = true;  // leader appends+commits a no-op entry on election

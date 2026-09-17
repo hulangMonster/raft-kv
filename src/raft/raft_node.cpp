@@ -735,6 +735,7 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
   for (;;) {
     bool iAmFlusher = false;
     Index flushTarget = kNoIndex;
+    uint64_t lingerUs = 0;  // M5.4：本轮作为 flusher 的蓄批时长（0 = 不蓄批）
     {
       std::lock_guard<ProbedMutex> lock(mu_);
       // 已提交即成功：Leader 自我移除（§5.7）会在配置条目提交的同一锁段内降级，
@@ -752,10 +753,24 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
         syncInFlight_ = true;
         flushTarget = log_.lastIndex();  // captured under the lock
         iAmFlusher = true;
+        // M5.4（决策④）：并发写者足够多时先蓄批再 fsync。蓄批期间我们**不持 mu_**，
+        // 因此新条目可以继续 appendNoSync（I9/L12 不变）；蓄批结束后重新取一次本批
+        // 范围，让这批 fsync 把它们一起变 durable（少一次往返，吞吐≈批量倍数）。
+        if (cfg_.groupCommitLingerUs > 0 &&
+            syncWaiters_ >= cfg_.lingerMinWaiters) {
+          lingerUs = cfg_.groupCommitLingerUs;
+        }
       }
     }
 
     if (iAmFlusher) {
+      if (lingerUs > 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(lingerUs));
+        std::lock_guard<ProbedMutex> lock(mu_);
+        if (role_ == Role::kLeader && currentTerm_ == term && syncInFlight_) {
+          flushTarget = log_.lastIndex();  // 蓄批期间汇入的条目一并覆盖
+        }
+      }
       const Index syncedBefore = syncedIndex_;
       const uint64_t fsyncT0Us = lockprobe::nowUs();
       const bool syncOk = log_.sync();  // ONE fsync for every entry so far
@@ -822,10 +837,12 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
     }
 
     std::unique_lock<ProbedMutex> lock(mu_);
+    ++syncWaiters_;  // M5.4：仅用于蓄批的自适应判定（近似计数即可）
     cv_.wait_until(lock, deadline, [&] {
       return index <= commitIndex_ || role_ != Role::kLeader ||
              currentTerm_ != term;
     });
+    --syncWaiters_;
     if (index <= commitIndex_) {
       if (metrics_ != nullptr) {
         metrics_->onWriteCompleted(lockprobe::nowUs() - metricT0Us);

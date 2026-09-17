@@ -171,6 +171,9 @@ class RaftNode {
   MembershipMutex membershipMu_;
   // M5.2：串行化 meta 落盘（叶子锁，锁序 metaPersistMu_ -> mu_）；metaDirty_ 受 mu_ 保护。
   MetaMutex metaPersistMu_;
+  // M5.4：组提交蓄批用——当前在 cv_ 上等提交的 propose 数（mu_ 保护）。
+  // 只用于**自适应**决定要不要蓄批，不参与任何正确性判定（I13 同款约束）。
+  size_t syncWaiters_ = 0;
   // M5.4：串行化"会改日志边界/快照文件"的整段操作（maybeSnapshot 的 save+compact、
   // onInstallSnapshot 的 receive+load+compact）。这些操作都在 mu_ 之外做 IO，因此彼此
   // 之间**没有**互斥：main 线程的 maybeSnapshot 与 reactor 线程的 onInstallSnapshot 会
