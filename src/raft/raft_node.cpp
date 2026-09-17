@@ -208,8 +208,11 @@ AppendEntriesArgs RaftNode::buildAppendEntries(int peer) {
   while (!entries.empty() && entries.back().index > syncedIndex_) {
     entries.pop_back();
   }
-  const Index endIndex = entries.empty() ? prevLogIndex : entries.back().index;
-  lastSentEndIndex_[peer] = endIndex;
+  (void)prevLogIndex;
+  // 注意（M5.3）：**不要**在这里写 `lastSentEndIndex_`。build 与 send 之间可能有别的线程
+  // 插入（ticker 的复制作业 / propose 的 flusher），且异步引擎会排队多批 —— 在 build 时登记
+  // 会让"后 build 的批次"覆盖在途请求的应答上下文，导致 ack 归因错配（over-count -> 丢写）。
+  // 应答上下文统一在 approve*Send() 里"真正发送前"登记（见 approveAppendSend）。
 
   AppendEntriesArgs args;
   args.term = currentTerm_;
@@ -399,6 +402,7 @@ void RaftNode::tick() {
         });
   }
   for (auto& job : appendJobs) {
+    if (!approveAppendSend(job.first, job.second)) continue;  // 该 peer 已有在途
     transport_.sendAppendEntries(
         job.first, job.second,
         [this, peer = job.first](const AppendEntriesReply& reply) {
@@ -406,6 +410,7 @@ void RaftNode::tick() {
         });
   }
   for (auto& job : snapJobs) {
+    if (!approveSnapshotSend(job.first, job.second)) continue;  // 该 peer 已有在途
     transport_.sendInstallSnapshot(
         job.first, job.second,
         [this, peer = job.first](const InstallSnapshotReply& reply) {
@@ -768,6 +773,7 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
         return {ClientStatus::kErr, "log sync failed", -1};
       }
       for (auto& job : jobs) {
+        if (!approveAppendSend(job.first, job.second)) continue;  // 该 peer 已有在途
         transport_.sendAppendEntries(
             job.first, job.second,
             [this, peer = job.first](const AppendEntriesReply& reply) {
@@ -775,6 +781,7 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
             });
       }
       for (auto& job : snapJobs) {
+        if (!approveSnapshotSend(job.first, job.second)) continue;  // 该 peer 已有在途
         transport_.sendInstallSnapshot(
             job.first, job.second,
             [this, peer = job.first](const InstallSnapshotReply& reply) {
@@ -1279,14 +1286,35 @@ bool RaftNode::peerSendAllowedLocked(int peer) const {
   return true;
 }
 
-RaftNode::PeerJob RaftNode::buildPeerJobLocked(int peer) {
-  PeerJob job;
-  // 只有**异步引擎**才需要"每 peer 单批在途"门控：同步引擎在 sendX 返回时已拿到应答，
-  // 天然只有一批在途（且既有单测大量依赖"丢包后立刻重试"的同步语义，不能门控）。
-  if (transport_.isAsync() && !peerSendAllowedLocked(peer)) {
-    job.skip = true;  // 已有在途：本 tick 不重复发送（避免 ack 归因错配）
-    return job;
+// M5.3：真正发送前登记应答上下文（锁内）。异步引擎下若该 peer 已有在途则拒绝本批。
+bool RaftNode::approveAppendSend(int peer, const AppendEntriesArgs& a) {
+  std::lock_guard<ProbedMutex> lock(mu_);
+  if (transport_.isAsync() && !peerSendAllowedLocked(peer)) return false;  // 已有在途
+  const uint64_t now = lockprobe::nowUs() / 1000ULL;
+  if (transport_.isAsync()) appendSentMs_[peer] = now;
+  // 应答上下文只在这里登记：与"这次发送"一一对应（同步引擎下 sendX 返回前回调已在本锁下
+  // 处理完，因此同样精确）。
+  lastSentEndIndex_[peer] =
+      a.entries.empty() ? a.prevLogIndex : a.entries.back().index;
+  if (role_ == Role::kLeader && !snapshotBytes_.empty() &&
+      nextIndex_[peer] <= lastIncluded_) {
+    // 该 peer 走的是快照路由（build 时已判定），快照块末偏移在此登记
+    snapshotChunkEnd_[peer] = a.prevLogIndex;  // 占位，真实值由 approveSnapshotSend 登记
   }
+  return true;
+}
+
+bool RaftNode::approveSnapshotSend(int peer, const InstallSnapshotArgs& a) {
+  std::lock_guard<ProbedMutex> lock(mu_);
+  if (transport_.isAsync() && !peerSendAllowedLocked(peer)) return false;
+  if (transport_.isAsync()) snapshotSentMs_[peer] = lockprobe::nowUs() / 1000ULL;
+  snapshotChunkEnd_[peer] = a.offset + a.data.size();  // 与本次发送一一对应
+  return true;
+}
+
+RaftNode::PeerJob RaftNode::buildPeerJobLocked(int peer) {
+  // 只构建作业；"能否发送/登记应答上下文"由 approve*Send() 在真正发送前完成（M5.3）。
+  PeerJob job;
   if (lastIncluded_ != kNoIndex && !snapshotBytes_.empty() &&
       nextIndex_[peer] <= lastIncluded_) {
     const uint64_t total = snapshotBytes_.size();
@@ -1303,11 +1331,8 @@ RaftNode::PeerJob RaftNode::buildPeerJobLocked(int peer) {
     job.snapshot.done = (start + take >= total);
     job.snapshot.data.assign(snapshotBytes_.begin() + start,
                              snapshotBytes_.begin() + start + take);
-    snapshotChunkEnd_[peer] = start + take;
-    snapshotSentMs_[peer] = lockprobe::nowUs() / 1000ULL;
   } else {
     job.append = buildAppendEntries(peer);
-    appendSentMs_[peer] = lockprobe::nowUs() / 1000ULL;
   }
   return job;
 }
@@ -1366,20 +1391,25 @@ bool RaftNode::catchUpPeer(int peerId, uint64_t timeoutMs) {
         return true;  // 已追平
       }
       job = buildPeerJobLocked(peerId);
-      if (job.skip) {
-        // M5.3：已有在途 -> 退避重试（避免 ack 归因错配）
+      if (job.skip) job = PeerJob{};  // 占位：下面统一在发送前做批准
+    }
+    if (job.isSnapshot) {
+      if (!approveSnapshotSend(peerId, job.snapshot)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
         if (std::chrono::steady_clock::now() >= deadline) return false;
         continue;
       }
-    }
-    if (job.isSnapshot) {
       transport_.sendInstallSnapshot(
           peerId, job.snapshot,
           [this, peerId](const InstallSnapshotReply& reply) {
             onInstallSnapshotReply(peerId, reply);
           });
     } else {
+      if (!approveAppendSend(peerId, job.append)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        continue;
+      }
       transport_.sendAppendEntries(
           peerId, job.append,
           [this, peerId](const AppendEntriesReply& reply) {

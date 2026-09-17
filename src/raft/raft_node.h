@@ -108,6 +108,12 @@ class RaftNode {
   PeerJob buildPeerJobLocked(int peer);
   // M5.3：该 peer 当前是否允许再发一批（无在途，或在途已超时）
   bool peerSendAllowedLocked(int peer) const;
+  // M5.3（关键修法）：**在真正发送前**登记本次发送的应答上下文（锁内），返回 false 表示
+  // 该 peer 已有在途（异步引擎）-> 本批跳过、下个 tick 重建。
+  // 必须在发送前登记而不是 build 时：build 与 send 之间可能被别的线程插队，且异步引擎会
+  // 排队多批 -> 旧写法会把"最后 build 的那批"的范围算到前面批次的应答上（丢写）。
+  bool approveAppendSend(int peer, const AppendEntriesArgs& a);
+  bool approveSnapshotSend(int peer, const InstallSnapshotArgs& a);
   // M4 评审 B6：把「追加日志条目」与「等待提交」拆开，使成员变更能在同一个 mu_
   // 临界区内完成「J1 复查 + 构造配置 + 追加条目」（version 直接用真实条目 index）。
   bool appendEntryLocked(const LogEntry& e);                        // 调用方持锁

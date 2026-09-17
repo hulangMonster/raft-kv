@@ -300,6 +300,16 @@ int main(int argc, char** argv) {
       peersArg = next("--peers");
     } else if (a == "--data-dir") {
       dataDir = next("--data-dir");
+    } else if (a.rfind("--transport=", 0) == 0) {
+      const std::string t = a.substr(std::string("--transport=").size());
+      if (t == "reactor") {
+        useReactor = true;
+      } else if (t == "sync") {
+        useReactor = false;
+      } else {
+        std::cerr << "unknown --transport: " << t << std::endl;
+        return 2;
+      }
     } else if (a == "--transport") {
       const std::string t = next("--transport");
       if (t == "reactor") {
