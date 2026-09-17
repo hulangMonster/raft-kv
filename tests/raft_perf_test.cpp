@@ -460,6 +460,175 @@ TEST(RaftPerf, A10_InFlightMuteWindowStaysBelowElectionTimeout) {
   EXPECT_LT(g2, tiny.electionTimeoutMinMs);
 }
 
+// ---- M5.A11（§8.2 滑动窗口）用的异步假 transport -------------------------------
+// sendX 只入队并返回；应答由测试线程手动投递（可乱序、可重复），
+// 从而精确复现"异步引擎下多批在途 + 乱序/重复 ack"这一最容易出错的场景。
+namespace {
+class AsyncQueueTransport : public Transport {
+ public:
+  struct AppendJob {
+    int peer;
+    AppendEntriesArgs args;
+    AppendCb cb;
+  };
+  struct VoteJob {
+    int peer;
+    RequestVoteArgs args;
+    VoteCb cb;
+  };
+
+  bool isAsync() const override { return true; }
+  void sendRequestVote(int peer, const RequestVoteArgs& a, VoteCb cb) override {
+    voteJobs.push_back({peer, a, std::move(cb)});
+  }
+  void sendAppendEntries(int peer, const AppendEntriesArgs& a,
+                         AppendCb cb) override {
+    ++appendSends;
+    const size_t nowInflight = ++inflight_[peer];
+    if (nowInflight > maxInflightSeen) maxInflightSeen = nowInflight;
+    // 计数只减一次：本用例会**故意重复投递**同一条应答来验证上层幂等，
+    // 而真实 transport 每条请求只会回调一次（否则统计本身会被注入的故障带偏）。
+    auto counted = std::make_shared<bool>(true);
+    AppendCb wrapped = [this, peer, counted, cb = std::move(cb)](
+                           const AppendEntriesReply& r) {
+      if (*counted) {
+        *counted = false;
+        --inflight_[peer];
+      }
+      cb(r);  // 上层回调（RaftNode::onAppendEntriesReplyWithContext）
+    };
+    appendJobs.push_back({peer, a, std::move(wrapped)});
+  }
+  void sendInstallSnapshot(int, const InstallSnapshotArgs&, InstallCb) override {}
+  void sendReadProbe(int, const ReadProbeArgs&, ReadProbeCb) override {}
+
+  std::vector<VoteJob> voteJobs;
+  std::vector<AppendJob> appendJobs;
+  int appendSends = 0;
+  size_t maxInflightSeen = 0;
+
+ private:
+  std::unordered_map<int, size_t> inflight_;
+};
+}  // namespace
+
+// M5.A11 [§8.2 滑动窗口] 多批在途 + 乱序/重复 ack：
+//   * 窗口确实被用满（观察到 ≥2 批同时在途），且不超过 cfg_.maxInflightPerPeer
+//   * 应答**逆序**投递、且每条重复投递一次 -> 全部写仍然成功（ack 幂等）
+//   * commitIndex 单调不减（matchIndex 只取 max 的可观测推论）
+//   * 槽位按"这一批"释放：窗口不会被永久占满
+TEST(RaftPerf, A11_SlidingWindowOutOfOrderAcksAreIdempotent) {
+  auto c = std::make_shared<FakeClock>();
+  auto async = std::make_shared<AsyncQueueTransport>();
+  auto idle2 = std::make_shared<MemoryTransport>();
+  auto idle3 = std::make_shared<MemoryTransport>();
+
+  auto llog = std::make_unique<SpyLogStore>();
+  auto lsm = std::make_unique<KvStateMachine>();
+  auto f2log = std::make_unique<MemoryLogStore>();
+  auto f2sm = std::make_unique<KvStateMachine>();
+  auto f3log = std::make_unique<MemoryLogStore>();
+  auto f3sm = std::make_unique<KvStateMachine>();
+
+  RaftConfig c1;
+  c1.selfId = 1;
+  c1.peerIds = {2, 3};
+  c1.maxInflightPerPeer = 4;  // 打开滑动窗口
+  RaftNode leader(c1, *llog, *lsm, *async, *c);
+  RaftConfig c2;
+  c2.selfId = 2;
+  c2.peerIds = {1, 3};
+  RaftNode f2(c2, *f2log, *f2sm, *idle2, *c);
+  RaftConfig c3;
+  c3.selfId = 3;
+  c3.peerIds = {1, 2};
+  RaftNode f3(c3, *f3log, *f3sm, *idle3, *c);
+
+  // 选举：手动把投票应答喂回去
+  for (int i = 0; i < 200 && leader.role() != Role::kLeader; ++i) {
+    c->advance(10);
+    leader.tick();
+    std::vector<AsyncQueueTransport::VoteJob> votes;
+    votes.swap(async->voteJobs);
+    for (auto& v : votes) {
+      const RequestVoteReply r =
+          (v.peer == 2) ? f2.onRequestVote(v.args) : f3.onRequestVote(v.args);
+      v.cb(r);
+    }
+  }
+  ASSERT_EQ(leader.role(), Role::kLeader);
+
+  // 8 个并发写者 x 6 条写：制造足够的并发以真正用满窗口
+  constexpr int kWriters = 8;
+  constexpr int kPerWriter = 6;
+  constexpr int kTotal = kWriters * kPerWriter;
+  std::vector<ClientReply> results(kTotal);
+  std::vector<std::thread> writers;
+  for (int w = 0; w < kWriters; ++w) {
+    writers.emplace_back([&, w] {
+      for (int k = 0; k < kPerWriter; ++k) {
+        ClientRequest req;
+        req.op = OpCode::kPut;
+        req.key = "w" + std::to_string(w) + "_" + std::to_string(k);
+        req.value = "v";
+        req.clientId = 100 + static_cast<uint64_t>(w);
+        req.requestId = static_cast<uint64_t>(k + 1);
+        results[w * kPerWriter + k] = leader.propose(req, 8000);
+      }
+    });
+  }
+
+  Index lastCommit = kNoIndex;
+  bool commitMonotonic = true;
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  for (;;) {
+    c->advance(5);
+    leader.tick();
+
+    // 按"线上顺序"让 follower 处理请求（wire 上天然有序），但**逆序**投递应答
+    std::vector<AsyncQueueTransport::AppendJob> jobs;
+    jobs.swap(async->appendJobs);
+    std::vector<AppendEntriesReply> replies;
+    std::vector<Transport::AppendCb> cbs;
+    cbs.reserve(jobs.size());
+    for (auto& j : jobs) {
+      const AppendEntriesReply r = (j.peer == 2) ? f2.onAppendEntries(j.args)
+                                                 : f3.onAppendEntries(j.args);
+      cbs.push_back(std::move(j.cb));
+      replies.push_back(r);
+    }
+    for (size_t i = cbs.size(); i-- > 0;) {  // 逆序投递
+      cbs[i](replies[i]);
+      cbs[i](replies[i]);  // 再重复投递一次（ack 幂等）
+    }
+
+    const Index ci = leader.commitIndex();
+    if (ci < lastCommit) commitMonotonic = false;
+    lastCommit = ci;
+
+    bool allDone = true;
+    for (const auto& r : results) {
+      if (r.status != ClientStatus::kOk) allDone = false;
+    }
+    if (allDone) break;
+    if (std::chrono::steady_clock::now() >= deadline) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  for (auto& t : writers) t.join();
+
+  size_t okCount = 0;
+  for (const auto& r : results) {
+    if (r.status == ClientStatus::kOk) ++okCount;
+  }
+  EXPECT_EQ(okCount, static_cast<size_t>(kTotal))
+      << "乱序/重复 ack 下不得丢写（ok=" << okCount << "/" << kTotal << ")";
+  EXPECT_TRUE(commitMonotonic) << "commitIndex 不得回退";
+  EXPECT_GE(async->maxInflightSeen, 2u)
+      << "本用例必须真的出现多批在途（否则没测到滑动窗口）";
+  EXPECT_LE(async->maxInflightSeen, c1.maxInflightPerPeer)
+      << "在途批数不得超过 cfg.maxInflightPerPeer";
+}
+
 // M5.A7 [GUARD] R2 守门：两段式改造不得破坏成员变更语义（J1/J2 仍成立）。
 TEST(RaftPerf, A7_ConfigChangeStillCommits) {
   auto c = makeSpyCluster(3);

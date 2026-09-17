@@ -94,6 +94,14 @@ struct RaftConfig {
   uint64_t electionTimeoutMaxMs = 300;
   uint64_t heartbeatMs = 50;
   uint64_t rpcTimeoutMs = 100;
+  // M5.6（设计 §8.2 滑动窗口）：异步引擎下每 peer 允许**同时在途**的 AppendEntries 批数。
+  // 1 = M5.3 的保守行为（单批在途）；>1 时 leader 不必等上一批的 ack 才发下一批，
+  // 复制往返得以流水线化（实测这是本机 p=64 的真正瓶颈：每批要串行等两个 follower 的
+  // fsync+RTT，约 51ms/批，而 fsync 只占 14%）。
+  // 安全前提：① 应答上下文由**闭包**携带（M5.3 已落地），乱序/重复 ack 幂等；
+  //          ② `matchIndex_` 只取 max（单调）；③ 每个槽位有 TTL 兜底（见 inflightMuteGapMs），
+  //          因此 reactor 丢帧（不回调）也不会永久占位；④ TTL < 最小选举超时（I15）。
+  size_t maxInflightPerPeer = 1;
   // M5.4（决策④「批处理调优」）：组提交"蓄批"窗口。>0 时，被选为 flusher 的
   // propose 会先短睡这么久再 fsync，让并发写汇入同一批 —— 每批的**往返成本**
   // （leader fsync + follower fsync + RTT）被更多条目摊薄，吞吐近似线性提升。

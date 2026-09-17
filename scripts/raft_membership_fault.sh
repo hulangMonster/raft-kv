@@ -102,6 +102,22 @@ wait_config_converged() {
   done
   return 1
 }
+# M5.6：`cli get` 在 key 不存在时返回非零，而脚本是 `set -e`：
+# 裸的 `out="$(cli ... get k)"` 一旦非零就**静默退出**（没有 FAIL 行、没有 dump），
+# 实测在 5 节点故障注入 50 轮里偶发（M5.6 定位：ERR at line 181）。
+# 这里做成"有限次重试 + 明确诊断"：读不到要报出来，而不是悄悄退出。
+# 参数：<leader id> <key>；成功时把值打到 stdout。
+read_key_retry() { # <leader id> <key>
+  local leader="$1" key="$2" out="" i
+  for i in $(seq 1 40); do
+    if out="$(cli --host 127.0.0.1 --port "${PORT[$leader]}" get "$key" 2>/dev/null)"; then
+      echo "$out"; return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 fill_and_verify() { # <n> <pipeline>
   local leader; leader="$(require_leader)"
   cli --host 127.0.0.1 --port "${PORT[$leader]}" fill "$1" --pipeline "$2" >/dev/null
@@ -178,7 +194,13 @@ for i in $(seq 1 "$REPEAT"); do
     done
     exit 1; }
   fill_and_verify 100 8 || { echo "FAIL iter $i: 压测/校验失败" >&2; exit 1; }
-  out="$(cli --host 127.0.0.1 --port "${PORT[$LEADER]}" get f5)"
+  if ! out="$(read_key_retry "$LEADER" f5)"; then
+    echo "FAIL iter $i: 线性一致读 f5 连续 10s 失败（leader=$LEADER）" >&2
+    for id in 1 2 3 4 5 6; do
+      echo "  node$id: role=$(field "$id" role) applied=$(field "$id" last_applied) commit=$(field "$id" commit_index)" >&2
+    done
+    exit 1
+  fi
   [[ "$out" == "v" ]] || { echo "FAIL iter $i: 线性一致读 f5 得到 '$out'" >&2; exit 1; }
   echo "iter $i OK ($MODE node$T, killed_leader=$KILLED_LEADER, cv=$(field "$LEADER" config_version))"
 done

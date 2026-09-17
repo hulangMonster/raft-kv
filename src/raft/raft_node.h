@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <functional>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -119,6 +120,10 @@ class RaftNode {
                          bool computeDraining);
   void recomputeConfigLocked();   // 日志截断后的配置回滚（设计 §5.2）
   PeerJob buildPeerJobLocked(int peer);
+  // M5.6：回收过期在途槽位，并把 nextIndex_ 回退到最早未确认批的起点——
+  // 乐观推进 nextIndex_ 之后，丢帧（reactor 超时丢弃且不回调）必须能"重新覆盖"该区间，
+  // 否则该 follower 会永久跳过这些条目（丢写）。只在 approveAppendSend 里调用（非 const）。
+  void pruneInflightLocked(int peer);
   // M5.3：该 peer 当前是否允许再发一批（无在途，或在途已超时）
   bool peerSendAllowedLocked(int peer) const;
   // M5.3（关键修法）：**在真正发送前**登记本次发送的应答上下文（锁内），返回 false 表示
@@ -222,12 +227,20 @@ class RaftNode {
   std::unordered_map<int, Index> nextIndex_;
   std::unordered_map<int, Index> matchIndex_;
   std::unordered_map<int, Index> lastSentEndIndex_;  // ack context per peer
-  // M5.3（异步 transport 的必要约束）：同一 peer 同时只能有**一批**在途。
-  // 原因：应答没有序号，`onAppendEntriesReply` 用 `lastSentEndIndex_[peer]` 归因；
-  // 若多批在途，后一批的范围会被算到前一批的 ack 上 -> over-count -> 已 ack 的写丢失
-  // （A/B 实测：pipeline=64 出现 missing 59）。超时后允许重发，超时长度见
-  // inflightMuteGapMs()（I15：必须严格小于最小选举超时，否则会引发选举风暴）。
-  std::unordered_map<int, uint64_t> appendSentMs_;
+  // M5.3/M5.6（异步 transport 的在途窗口）：每 peer 的在途 AppendEntries 批次槽位，
+  // 前端最旧。上限见 cfg_.maxInflightPerPeer（1 = 单批在途的保守行为）。
+  // 之所以能支持多批：应答上下文由**闭包**携带到 `onAppendEntriesReplyWithContext`，
+  // 不再依赖共享的 `lastSentEndIndex_` 归因（M5.3 的 over-count 缺陷正是共享状态造成的，
+  // 实测 pipeline=64 missing 59/206）。乱序/重复 ack 幂等：`matchIndex_` 只取 max。
+  // 槽位有 TTL 兜底（reactor 丢帧不回调）：长度见 inflightMuteGapMs()（I15）。
+  struct InflightSlot {
+    uint64_t sentMs;
+    Index end;
+    Index beginIdx;  // 本批第一条 entry 的 index（回退 nextIndex_ 用；心跳批为 kNoIndex）
+  };
+  // mutable：`peerSendAllowedLocked()` 是 const，但需要就地回收过期槽位（TTL 兜底），
+  // 这属于"缓存式清理"，不改变任何共识状态（与 mutable mu_ 同理）。
+  mutable std::unordered_map<int, std::deque<InflightSlot>> appendInflight_;
   std::unordered_map<int, uint64_t> snapshotSentMs_;
   // M4：peer 在本任期是否成功应答过 AppendEntries（设计 §5.4 步骤 5 追平判据）
   std::unordered_map<int, Term> ackedTerm_;

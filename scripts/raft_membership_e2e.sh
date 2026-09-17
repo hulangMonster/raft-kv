@@ -74,6 +74,22 @@ wait_config_lacks() { # <id> <member>
   done
   return 1
 }
+# M5.6：`cli get` 在 key 不存在时返回非零，而脚本是 `set -e`：
+# 裸的 `out="$(cli ... get k)"` 一旦非零就**静默退出**（没有 FAIL 行、没有 dump），
+# 实测在 5 节点故障注入 50 轮里偶发（M5.6 定位：ERR at line 181）。
+# 这里做成"有限次重试 + 明确诊断"：读不到要报出来，而不是悄悄退出。
+# 参数：<leader id> <key>；成功时把值打到 stdout。
+read_key_retry() { # <leader id> <key>
+  local leader="$1" key="$2" out="" i
+  for i in $(seq 1 40); do
+    if out="$(cli --host 127.0.0.1 --port "${PORT[$leader]}" get "$key" 2>/dev/null)"; then
+      echo "$out"; return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 fill_and_verify() { # <n> <pipeline>
   local leader; leader="$(require_leader)"
   cli --host 127.0.0.1 --port "$(node_port "$leader")" fill "$1" --pipeline "$2" >/dev/null
@@ -98,7 +114,11 @@ echo "add 4 OK（config_version=$(field "$LEADER" config_version)）"
 echo "== 3) 4 节点压测 + 线性一致读 =="
 fill_and_verify 400 16
 leader="$(require_leader)"
-out="$(cli --host 127.0.0.1 --port "$(node_port "$leader")" get f10)"
+out=""
+for _ in $(seq 1 40); do
+  if out="$(cli --host 127.0.0.1 --port "$(node_port "$leader")" get f10 2>/dev/null)"; then break; fi
+  sleep 0.25
+done
 [[ "$out" == "v" ]] || { echo "FAIL: 线性一致读 f10 期望 v 得到 '$out'" >&2; exit 1; }
 echo "读 f10 = $out"
 

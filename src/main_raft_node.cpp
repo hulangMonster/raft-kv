@@ -259,7 +259,7 @@ std::unordered_map<int, std::string> parsePeers(const std::string& s) {
 
 void usage(const char* argv0) {
   std::cerr << "usage: " << argv0
-           << " [--group-linger-us N]"
+           << " [--group-linger-us N] [--inflight-per-peer N]"
             << " --id N --port P --peers \"1=host:port,...\""
             << " [--data-dir DIR]\n";
 }
@@ -273,6 +273,7 @@ int main(int argc, char** argv) {
   int port = 19601;
   size_t snapshotThreshold = 10000;
   uint64_t groupLingerUs = 0;  // M5.4: --group-linger-us（0 = 不蓄批）
+  size_t inflightPerPeer = 4;  // M5.6: --inflight-per-peer（默认开窗，见 docs §8.2）
   std::string peersArg;
   std::string dataDir;
   bool lockWaitMetrics = false;  // M5.1: 打开锁等待计时（默认关，零开销）
@@ -281,7 +282,11 @@ int main(int argc, char** argv) {
   // `raft_membership_e2e` 的 verify、`raft_fault --repeat 50` 的 iter 32 NOT_LEADER），
   // 日志显示节点进程消失（cannot reach）—— 与压测中观察到的间歇性 SIGSEGV 相关。
   // 在崩溃定位并修复之前，默认保持 M4 已验证的 sync；reactor 用 --transport=reactor 显式开启。
-  bool useReactor = false;
+  // M5.6（依据 docs/m5-bench.md §3.3 同轮交替实测）：**默认使用 reactor 引擎**。
+  // reactor 在 p=1 快 1.68×（13.4 vs 22.5 ms/写）、p=8 快 2.06×，p=64 持平；
+  // 且它把网络 IO 与共识锁解耦（慢/死 peer 不阻塞 tick，见 I15/I16 的故障注入证据）。
+  // `--transport=sync` / `RAFTKV_TRANSPORT=sync` 仍可切回同步引擎（保留作对照）。
+  bool useReactor = true;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -324,6 +329,9 @@ int main(int argc, char** argv) {
       lockWaitMetrics = true;
     } else if (a == "--snapshot-threshold") {
       snapshotThreshold = std::stoul(next("--snapshot-threshold"));
+    } else if (a == "--inflight-per-peer") {
+      // M5.6（§8.2 滑动窗口）：异步引擎下每 peer 允许同时在途的 AppendEntries 批数。
+      inflightPerPeer = std::stoul(next("--inflight-per-peer"));
     } else if (a == "--group-linger-us") {
       // M5.4（决策④ 批处理调优）：组提交蓄批窗口，用于 A/B 实测取值。
       groupLingerUs = std::stoull(next("--group-linger-us"));
@@ -355,6 +363,7 @@ int main(int argc, char** argv) {
     cfg.peerIds = std::move(peerIds);
     cfg.snapshotThresholdEntries = snapshotThreshold;
     cfg.groupCommitLingerUs = groupLingerUs;  // M5.4：0 = 不蓄批
+    cfg.maxInflightPerPeer = inflightPerPeer;  // M5.6：滑动窗口宽度（同步引擎不使用）
 
     Metrics metrics;  // M5.1: 进程内指标（只读；不参与任何判定）
     if (lockWaitMetrics) lockprobe::setTimingEnabled(true);

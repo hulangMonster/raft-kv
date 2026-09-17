@@ -133,7 +133,7 @@ void RaftNode::becomeFollower(Term newTerm) {
   matchIndex_.clear();
   lastSentEndIndex_.clear();
   ackedTerm_.clear();  // 新任期/新角色：旧的应答不作数
-  appendSentMs_.clear();     // M5.3：旧任期的在途归因全部作废
+  appendInflight_.clear();   // M5.3/M5.6：旧任期的在途归因全部作废
   snapshotSentMs_.clear();
   snapshotSendOffset_.clear();
   snapshotChunkEnd_.clear();
@@ -655,7 +655,21 @@ void RaftNode::onAppendEntriesReplyWithContext(int peerId, Index sentEnd,
   }
   if (reply.term < currentTerm_) return;  // stale ack
 
-  appendSentMs_.erase(peerId);  // M5.3：释放该 peer 的发送槽位（下一批可以发了）
+  // M5.6：只释放**这一批**占的槽位（不是整条队列）——闭包上下文精确对应本次发送，
+  // 因此乱序/重复 ack 各自释放各自的槽位；重复 ack 找不到槽位时是无害的 no-op。
+  {
+    auto qit = appendInflight_.find(peerId);
+    if (qit != appendInflight_.end()) {
+      std::deque<InflightSlot>& q = qit->second;
+      for (auto sit = q.begin(); sit != q.end(); ++sit) {
+        if (sit->end == sentEnd) {
+          q.erase(sit);
+          break;
+        }
+      }
+      if (q.empty()) appendInflight_.erase(qit);
+    }
+  }
   if (reply.success) {
     const Index end = sentEnd;
     if (end > matchIndex_[peerId]) matchIndex_[peerId] = end;
@@ -673,6 +687,9 @@ void RaftNode::onAppendEntriesReplyWithContext(int peerId, Index sentEnd,
     //   * the hint may also be AHEAD of what we thought (the peer reports where
     //     its own compacted log starts), so jump there instead of crawling one
     //     index at a time.
+    // M5.6：失败说明前缀不匹配，窗口里那些"乐观推进"出去的批都建立在错误前缀上，
+    // 全部作废，让它们从冲突提示点重发（否则会与回退后的 nextIndex_ 互相打架）。
+    appendInflight_.erase(peerId);
     Index target = reply.conflictIndex;
     if (target == kNoIndex || target < 1) target = 1;
     if (lastIncluded_ != kNoIndex && target < lastIncluded_) {
@@ -1204,11 +1221,11 @@ void RaftNode::erasePeerStateLocked(int peerId) {
   readAcks_.erase(peerId);  // 评审 O4：ReadIndex 应答表也要回收
   // M5 评审遗留项：异步引擎的发送槽位时间戳与"本任期已应答"标记同样要回收。
   // 影响面是**有界**的（不是崩溃源）：matchIndex_ 一并被清空，所以陈旧的
-  // ackedTerm_ 不可能单独让追平判据误判为真；appendSentMs_/snapshotSentMs_
+  // ackedTerm_ 不可能单独让追平判据误判为真；appendInflight_/snapshotSentMs_
   // 残留只会让同一 peerId 被移出后重新加入时，首个发送被限流窗口多挡几毫秒。
   // 仍然要清，否则 peer 频繁增删会让两个 map 无限增长，且重新加入的 peer 会
   // 继承一个它并不拥有的"上次发送时刻"。
-  appendSentMs_.erase(peerId);
+  appendInflight_.erase(peerId);
   snapshotSentMs_.erase(peerId);
   ackedTerm_.erase(peerId);
 }
@@ -1336,7 +1353,7 @@ void RaftNode::recomputeConfigLocked() {
 
 // I15（M5.3 实测选举风暴）：在途静音窗口的硬上界。
 // 异步引擎下丢一帧（reactor 逐帧超时后丢弃队首、且**不回调**）会让
-// appendSentMs_[peer] 一直保留到窗口结束，其间该 peer 收不到任何 AE/心跳。
+// 该 peer 的在途槽位会一直保留到窗口结束（或收到 ack），其间它收不到任何 AE/心跳。
 // 一旦这个窗口 ≥ follower 的选举超时，健康的 follower 就会自行竞选、顶掉 leader：
 // M5.3 实测 raft_fault.sh（reactor）term 每秒 +1.5、随后客户端写返回 NOT_LEADER。
 // 因此窗口必须严格小于最小选举超时，取 1/3 以吸收 tick(10ms) 粒度与调度抖动。
@@ -1355,23 +1372,72 @@ bool RaftNode::peerSendAllowedLocked(int peer) const {
   // 若用 clock_ 判断"在途是否超时"，槽位将永不释放，catch-up 会空转到超时。
   const uint64_t now = lockprobe::nowUs() / 1000ULL;
   const uint64_t gap = inflightMuteGapMs(cfg_);
-  const auto a = appendSentMs_.find(peer);
-  if (a != appendSentMs_.end() && now - a->second < gap) return false;
+  // 快照块必须严格串行：offset 连续性依赖"上一块已被接收方确认"。
   const auto s = snapshotSentMs_.find(peer);
   if (s != snapshotSentMs_.end() && now - s->second < gap) return false;
-  return true;
+  // AppendEntries：允许最多 cfg_.maxInflightPerPeer 批在途（M5.6 §8.2 滑动窗口）。
+  // 超过 TTL 的槽位先回收——reactor 逐帧超时会**丢弃且不回调**，没有这道兜底，
+  // 丢一帧就永久占掉一个槽位（与 M5.3 选举风暴同源）。
+  const auto it = appendInflight_.find(peer);
+  if (it == appendInflight_.end()) return true;
+  // 只统计"未过期"的槽位；过期槽位的回收与 nextIndex_ 回退在 pruneInflightLocked()
+  // 里做（本函数是 const，且回退需要写 nextIndex_）。
+  size_t live = 0;
+  for (const InflightSlot& slot : it->second) {
+    if (now - slot.sentMs < gap) ++live;
+  }
+  return live < cfg_.maxInflightPerPeer;
+}
+
+// M5.6（§8.2）：过期槽位回收 + nextIndex_ 回退。
+// 为什么必须回退：窗口 >1 时 nextIndex_ 会"乐观推进"到已发出但未确认的位置；
+// 若该批被 reactor 丢弃（超时丢弃且不回调），没有回退就再也没有人重发这段区间，
+// follower 会永久缺条目（丢写）。回退到最早未确认批的**起点**，保证覆盖完整区间。
+void RaftNode::pruneInflightLocked(int peer) {
+  auto it = appendInflight_.find(peer);
+  if (it == appendInflight_.end()) return;
+  const uint64_t now = lockprobe::nowUs() / 1000ULL;
+  const uint64_t gap = inflightMuteGapMs(cfg_);
+  std::deque<InflightSlot>& q = it->second;
+  Index rollback = kNoIndex;
+  while (!q.empty() && now - q.front().sentMs >= gap) {
+    const InflightSlot& slot = q.front();
+    if (slot.beginIdx != kNoIndex &&
+        (rollback == kNoIndex || slot.beginIdx < rollback)) {
+      rollback = slot.beginIdx;
+    }
+    q.pop_front();
+  }
+  if (q.empty()) appendInflight_.erase(it);
+  if (rollback != kNoIndex) {
+    const auto nit = nextIndex_.find(peer);
+    if (nit != nextIndex_.end() && nit->second > rollback) {
+      nit->second = rollback;  // 重新覆盖未确认区间（可能重发已送达的，安全）
+    }
+  }
 }
 
 // M5.3：真正发送前登记应答上下文（锁内）。异步引擎下若该 peer 已有在途则拒绝本批。
 bool RaftNode::approveAppendSend(int peer, const AppendEntriesArgs& a) {
   std::lock_guard<ProbedMutex> lock(mu_);
-  if (transport_.isAsync() && !peerSendAllowedLocked(peer)) return false;  // 已有在途
+  if (transport_.isAsync()) pruneInflightLocked(peer);  // M5.6：先回收过期槽位与 nextIndex_
+  if (transport_.isAsync() && !peerSendAllowedLocked(peer)) return false;  // 窗口已满
   const uint64_t now = lockprobe::nowUs() / 1000ULL;
-  if (transport_.isAsync()) appendSentMs_[peer] = now;
+  const Index end = a.entries.empty() ? a.prevLogIndex : a.entries.back().index;
+  if (transport_.isAsync()) {
+    const Index begin = a.entries.empty() ? kNoIndex : a.entries.front().index;
+    appendInflight_[peer].push_back({now, end, begin});
+    // §8.2「nextIndex_ 乐观推进」：立刻把 nextIndex_ 推到本批之后，下一批才能装**新**条目
+    // （否则窗口里的多批都是同一批的重复发送，窗口毫无意义——M5.6 实测：只开窗不推进时
+    //  p=64 无任何改善）。提交安全不受影响：commit 只看 matchIndex_（收到 ack 才推进）。
+    if (begin != kNoIndex) {
+      const auto nit = nextIndex_.find(peer);
+      if (nit != nextIndex_.end() && end + 1 > nit->second) nit->second = end + 1;
+    }
+  }
   // 应答上下文只在这里登记：与"这次发送"一一对应（同步引擎下 sendX 返回前回调已在本锁下
   // 处理完，因此同样精确）。
-  lastSentEndIndex_[peer] =
-      a.entries.empty() ? a.prevLogIndex : a.entries.back().index;
+  lastSentEndIndex_[peer] = end;
   return true;
 }
 

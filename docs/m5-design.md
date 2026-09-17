@@ -571,3 +571,37 @@ TSan（全量 raft 用例 + `raft_perf_test`）必须 0 报告；注入用例：
   5. **§8.2 触发判定：成立**（pipeline=64 < 1200 qps，且 reactor 在 p=64 明确落后）。
      故 **M5.6 落地滑动窗口**（每 peer N 批在途 + `nextIndex_` 乐观推进 + 乱序/重复 ack 幂等用例）。
      在此之前不切默认引擎、不打 tag。
+
+- **v1.9**（M5.6：按 §8.2 触发条件落地**滑动窗口**，并新增 I17/L18）：
+  1. **实现**（`--inflight-per-peer N`，默认 4；`cfg.maxInflightPerPeer`）：
+     * `appendInflight_[peer]` 从"单个时间戳"升级为**槽位队列** `{sentMs, end, beginIdx}`；
+       `peerSendAllowedLocked()` 改为"未过期槽位数 < N"。
+     * **乐观推进**：`approveAppendSend()` 登记槽位后立即把 `nextIndex_[peer]` 推到本批之后——
+       否则窗口里的多批都是同一批的重复发送，窗口毫无意义（实测：只开窗不推进时 p=64 无改善）。
+     * **回退路径（I17，安全性要点）**：① `pruneInflightLocked()` 在槽位 TTL 过期时把
+       `nextIndex_` 回退到最早未确认批的**起点**（丢帧必须能重发）；② 收到失败应答时清空该
+       peer 的全部在途槽位（它们都建立在错误前缀上），再从冲突点重发。
+     * ack 只释放**自己那一批**的槽位（闭包上下文精确对应），乱序/重复 ack 各自幂等。
+     * 槽位 TTL 复用 I15 的 `inflightMuteGapMs()` → "窗口满"的静音仍 < 最小选举超时，不会
+       重新引入 v1.7 的选举风暴。
+  2. **测试 M5.A11**（§8.2 要求）：自建异步假 transport（`sendX` 只入队、应答由测试投递），
+     8 写者 × 6 写并发；**逆序**投递全部应答且每条第 2 次重复投递。断言：48/48 写仍成功、
+     `commitIndex` 单调不减、`maxInflightSeen ∈ [2, cfg.maxInflightPerPeer]`。
+     **RED 证据**：把 `c1.maxInflightPerPeer` 改回 1 后该用例失败
+     （`Expected: maxInflightSeen >= 2u, actual: 1`），证明它确实在测这条窗口。
+  3. **实测收益**（reactor，同轮交替，每格 2 次，全部 `verify missing 0`）：
+
+     | pipeline | 窗口=1 ms/写 | 窗口=4 ms/写 | 结论 |
+     |---|---|---|---|
+     | 1 | 23.337 / 21.730 | **13.682 / 13.206** | 窗口 4 快 **1.68×**（p=1 是验收关注点） |
+     | 8 | 5.966 / 5.331 | 5.920 / 6.049 | 持平 |
+     | 64 | 4.134 / 4.057 | 4.103 / 4.264 | 持平 |
+     p=1 的收益来自"不必等上一批（含心跳/no-op）的 ack 才发下一批"。
+     p=64 持平说明**本机瓶颈仍是 follower fsync 的串行往返**，不是窗口宽度——真正的上限
+     受限于"每连接一次只有一个请求-应答在飞"（reactor 队首配对），要再进一步需要多连接/多路复用。
+  4. **脚本健壮性修复（与 Raft 无关，但会伪装成里程碑失败）**：`raft_membership_fault.sh`
+     第 181 行 `out="$(cli ... get f5)"` 是**裸命令替换**，而 `cli get` 在 key 不存在时返回非零，
+     `set -e` 下会**静默退出**（无 FAIL 行、无 dump）——50 轮故障注入里偶发，曾被误读成
+     "reactor 引擎不稳定"。用 `RAFTKV_TRACE`/ERR trap 定位（`ERR at line 181`，而当时 5 节点
+     `term=11 cv=1334` 全部收敛、leader 正常）。改为"有限次重试 + 明确诊断"（`read_key_retry`），
+     `raft_membership_e2e.sh` 同类写法一并修。

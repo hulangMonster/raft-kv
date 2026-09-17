@@ -29,6 +29,7 @@
 | **I13** | 指标只读、无副作用、不得成为任何正确性判定的输入 | M5.A7：指标单调；关闭指标的全部用例行为不变；指标不在任何分支条件里 |
 | **I14** | 不改变 wire 格式、磁盘格式与对外错误码语义（`RKS1` v1 仍可解） | M5.B2 + 既有 B4（`Rks1V1SnapshotStillLoads`）保持绿 |
 | **I15** | （M5.3 实测新增）异步引擎下"该 peer 已有一批在途"的**静音窗口必须严格小于 follower 的最小选举超时**（取 `electionTimeoutMinMs/3`，且不超过 `2*rpcTimeoutMs`） | M5.A10 钉住不变量（含 tick 10ms 余量与极端配置）；reactor 引擎 `raft_fault.sh --repeat 50` 连续 3 轮通过 |
+| **I17** | （M5.6 新增）滑动窗口下 `nextIndex_` 允许**乐观推进**（发出即推进），但每一批的"未确认区间"必须始终存在回退/重发路径：① 槽位 TTL 过期 → `nextIndex_` 回退到该批起点；② 收到失败应答 → 清空该 peer 全部在途槽位并从冲突点重发。否则丢一帧（reactor 超时丢弃且不回调）= **丢写** | M5.A11（乱序/重复 ack 幂等 + `matchIndex_` 单调 + 窗口宽度不超限）；reactor 故障注入 3 脚本通过 |
 | **I16** | （M5.3 实测新增）**会改日志边界/快照文件的整段操作必须彼此串行**（`maybeSnapshot` 的 save+compact 与 `onInstallSnapshot` 的 receive+load+compact）；且 **transport 回调中逃逸的异常不得让节点无诊断地静默死亡** | 机制复现脚本（reactor + `--snapshot-threshold 200` + `fill 20000 --pipeline 64`）×5 全部无节点死亡；reactor 全量 e2e/fault 五个脚本全绿 |
 
 ## 2. 线程安全契约与锁纪律
@@ -39,7 +40,7 @@
 `cv_` 谓词含 role/term；序列化与 IO 在锁外（L8）；fd 生命周期归 `FileLogStore::mu_`（L9）；
 地址簿更新只在锁外（L10）；锁序 `RaftNode::mu_ → Transport::mu_ → LogStore::mu_`（L11）。
 
-### 2.2 新增 L12–L17
+### 2.2 新增 L12–L18
 
 | # | 契约 |
 |---|---|
@@ -48,7 +49,7 @@
 | **L14** | `Reactor` 线程**从不持有 `mu_`**；它只触发回调，回调入口自己取 `mu_`（与今日同步回调一致）。`Transport` 内部锁序列保持在 `mu_` 之外，锁序不变 |
 | **L15** | 关闭顺序：`Reactor::stop()`（停 epoll → 关连接 → 丢弃在途回调）→ join reactor → join ticker → 再析构 `RaftNode`/store；**禁止再用 `std::_Exit(0)` 绕过析构** |
 | **L16** | （M5.2 实测新增）任何"把 IO 移出 `mu_`"的改动，必须确认被移出方与**仍留在锁内**的调用方之间原有的互斥/顺序关系是否被打破；被移出方若曾借用 `mu_` 互斥，必须自己补锁（例：`FileLogStore::appendNoSync` 依赖 `mu_` 与 `compact()` 互斥，出锁后必须改为 store 自持锁） |
-| **L17** | （M5.3 实测新增）`snapshotOpMu_` 是叶子锁，锁序 **`snapshotOpMu_ → RaftNode::mu_`**；只在 `mu_` 之外获取，持 `mu_` 时绝不获取它。持它期间做的是 save/load/compact/install（含 fsync），因此**不违反 I9**（共识锁仍未被长 IO 占住） |
+| **L18** | （M5.6 新增）在途槽位表 `appendInflight_` 受 `mu_` 保护；`peerSendAllowedLocked()` 只**读**（统计未过期槽位），回收与 `nextIndex_` 回退只在非 const 的 `pruneInflightLocked()` 里做（`approveAppendSend` 开头调用）。槽位 TTL 复用 I15 的 `inflightMuteGapMs()`，因此"窗口满"的静音时长仍严格小于最小选举超时 | （M5.3 实测新增）`snapshotOpMu_` 是叶子锁，锁序 **`snapshotOpMu_ → RaftNode::mu_`**；只在 `mu_` 之外获取，持 `mu_` 时绝不获取它。持它期间做的是 save/load/compact/install（含 fsync），因此**不违反 I9**（共识锁仍未被长 IO 占住） |
 
 ### 2.3 原子性与可见性
 
