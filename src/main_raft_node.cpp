@@ -273,7 +273,12 @@ int main(int argc, char** argv) {
   int port = 19601;
   size_t snapshotThreshold = 10000;
   uint64_t groupLingerUs = 0;  // M5.4: --group-linger-us（0 = 不蓄批）
-  size_t inflightPerPeer = 4;  // M5.6: --inflight-per-peer（默认开窗，见 docs §8.2）
+  // M5.6 收尾：**默认 1（= M5.3 的单批在途保守行为）**。窗口=4 能显著改善 p=1 延迟
+  // （22.5 -> 13.4 ms/写），但 M5.6 的深度复测证明：窗口放大了异步引擎的 ack 归因风险，
+  // 使"同一 index 出现两个都被提交的条目"这类分歧更容易出现（详见 docs/m5-design.md v2.2 的证据链）。
+  // reactor 引擎目前是**可选**且不推荐开窗，故默认 1；需要复现该性能实验时显式传
+  // `--inflight-per-peer 4`。
+  size_t inflightPerPeer = 1;  // M5.6: --inflight-per-peer
   std::string peersArg;
   std::string dataDir;
   bool lockWaitMetrics = false;  // M5.1: 打开锁等待计时（默认关，零开销）

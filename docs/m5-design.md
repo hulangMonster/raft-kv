@@ -674,3 +674,52 @@ TSan（全量 raft 用例 + `raft_perf_test`）必须 0 报告；注入用例：
      ② 在途批数上界由 `<= N` 改为 `<= 3N` 并注明理由：槽位 TTL（I15 的 `inflightMuteGapMs`）
      到期会先回收，而那一帧可能仍在飞，因此"未确认帧数"= N 个未过期槽位 + 若干已过期未回包的帧；
      生产侧的硬约束由 reactor 帧超时给出。
+
+- **v2.2**（reactor 丢写的**根因深挖**：证据链已到"同一 index 出现两个都被提交的条目"，
+  仍未定位到具体代码路径；据此收紧 reactor 默认配置）：
+  1. **观测手段**：`RAFTKV_TRACE=1` 的临时插桩（`[prop]` 收到写请求 / `[kv] APPLY`+`DROP` 状态机应用 /
+     `[term]` 角色与任期 / `[vote]` 投票输入输出 / `[trunc]` 冲突截断 / `[snap]` 快照安装 /
+     `[send]`+`[ack]` 复制与 matchIndex 推进 / `[commit]` 提交推进时的各投票者 matchIndex），
+     跑 `reactor + --snapshot-threshold 5000 + fill 10000 --pipeline 64` 直到复现；定位后**已全部回退**
+     （`git status` 干净，仓库不含诊断代码）。
+  2. **已经确证的事实**（不是推测）：
+     * 丢的是**已 ack 的写**：`fill` 成功、`verify` 报 `missing 1/12/34/36/43/49`，
+       且**重复 verify 三次结果完全一致**（1/1/1、12/12/12、34/34/34）→ 不是读路径陈旧。
+     * **每个节点缺的是不同的 ~30-40 个 key，而三节点并集恰好 = 10000** → 所有写都被"某处"提交过，
+       集群日志发生了**分歧**（不是单点丢数据）。
+     * 具体到同一个 index：**index 4534 上有两个不同条目都进入了"已提交且已应用"状态**——
+       node1 的版本 `key=f4437 rid=4438`（term 8，`[commit] node1 ADVANCE commit=4558
+       match={1:3438 2:4558 3:4530}` → 多数派 {1,2} 提交），
+       node3 的版本 `key=f4442 rid=4443`（term 9，`[commit] node3 ADVANCE commit=4586
+       match={1:4206 2:4586 3:4531}` → 多数派 {2,3} 提交）；
+       node1 应用了前者、node2/node3 应用了后者。
+     * 两轮 leader 都在**不同任期**（node1: term 5/8/12；node3: term 1/9/13），
+       **没有任何"同任期双 leader"**；`[vote]` 行显示 `upToDate` 判据的输入输出都符合 §5.4.1
+       （34 次 `upToDate=0` 全部拒绝，未见"该拒不拒"）。
+     * 本轮**没有任何 `[snap] INSTALL`**（无快照安装），排除快照路径。
+     * **node2 从未发生冲突截断**（`[trunc]` 计数 0），却只应用了 node3 的版本；
+       而 node1 的 `[ack] node1 matchIndex[2]: 4530 -> 4558 (term=8)` 说明它把 node2 记成了
+       "已拥有 4558"。→ **匹配到 node1 视角的 matchIndex 被高估**（一次不真实的 success ack）。
+  3. **已排除的嫌疑**（逐条查过代码/实证）：投票"日志新旧"判据；同任期双 leader；
+     快照安装导致的 `lastApplied_` 前移；`MemoryLogStore`/`FileLogStore::appendNoSync` 的
+     连续性检查（两者都有 `e.index != lastIndex()+1 → false` 与冲突截断）；
+     leader 侧闭包式 ack 归因（两处发送点都带 `sentEnd` 闭包，`onAppendEntriesReply` 旧路径**已无调用者**）；
+     reactor 的"答复与队首请求配对"（同一连接上严格串行、按队列顺序触发回调）。
+  4. **仍未定位的疑点**（下一轮继续，需要更强的观测手段）：
+     * reactor 在"超时丢帧 + 关连接 + 重连 + 队列重排"组合下是否可能把某帧的答复记到另一帧上
+       （需要给帧编号并在两端核对，而不是只看 matchIndex 结果）。
+     * `matchIndex_` 被高估的那一次 ack 究竟对应哪一帧（需要给 `[send]`/`[ack]` 加帧序号与时间戳，
+       并把 reactor 内部的 `queue` 变化也打出来）。
+  5. **据此的处置（本轮）**：
+     * reactor 引擎**默认窗口从 4 降回 1**（`--inflight-per-peer` 默认 1，仅显式传参才开窗）——
+       窗口=4 会显著改善 p=1 延迟（22.5 → 13.4 ms/写），但也**放大了暴露面**（分歧更容易出现）。
+       **实测残留率**（同机、每轮 10000 写 + verify）：`sync` 3/3 干净；`reactor --inflight-per-peer 1`
+       **1/6 轮出现丢写（missing 29）**；`reactor` 默认窗口=4 时 ~2/3 轮出现。
+       → 结论：**根因在 reactor 的异步 ack 归因，窗口只是放大器**；把窗口降回 1 只是收缩暴露面，
+       不是修复。reactor 因此在修复前**不适合作为默认引擎**（出厂默认 sync）。
+       保留窗口的实现与 A11 用例（A11 自己显式设 `maxInflightPerPeer=4`）。
+     * 出厂默认仍是 `sync`（v2.0 起），reactor 为可选且标注"存在未关闭的丢写阻断项"。
+     * **仍不打 `m5-performance` tag**。
+     * 复现命令（约 1 分钟/轮，需保留数据目录以便对账）：
+       `RAFTKV_TRANSPORT=reactor ./build/bin/raftkv_raft_node --id N --snapshot-threshold 5000 ...`
+       + `./build/bin/raftkv_raft_cli --peers ... fill 10000 --pipeline 64` + `verify 10000`。
