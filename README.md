@@ -71,6 +71,40 @@ M2 在它之上实现 Raft 共识，演进为**多节点、可自动选主、可
   bench_group_commit.sh（threshold=5000，会频繁触发压缩）本次测得 34 / 175 / 814 qps，
   历史记录的 129 / 746 / 2840 qps 是当时较空闲机器状态下所测，**跨会话不可直接比较**。
 
+## 当前能力（M5：性能优化与可观测性）
+
+- **两段式持久化（I9：锁内 fsync==0）**：`propose`/`onAppendEntries` 只在锁内 `write`（page cache），
+  fsync 一律移到锁外、回锁后重新校验 term/role/lastIndex/installEpoch；组提交把一批写摊到一次 fsync。
+  断言不是"看代码"：`SpyLogStore` + 线程局部锁探针（`lockprobe::consensusHeld()`）统计持锁窗口内
+  `sync/compact/persistMeta` 调用数必须为 0（M5.A1/A9），**A9 当场抓到一处虚调用陷阱**
+  （`truncateSuffixNoSync` 里无限定名调用落回含 fsync 的版本）。
+- **Reactor（epoll）传输**：`--transport=reactor`（**默认仍是 `sync`**）。非阻塞发送、每连接请求-应答
+  严格配对、超时丢帧不回调（由上层槽位 TTL 兜底）、`stop()` 显式停循环并丢弃在途回调。
+  端到端与故障注入全绿；性能不优于 sync（见下）。
+- **批处理与滑动窗口**：`--inflight-per-peer N`（默认 1）+ 乐观 `nextIndex_` 推进 + TTL 过期回退；
+  `--group-linger-us`（蓄批，默认 0——实测无增益故不默认开）。
+- **流式快照（§8.3）**：`SnapshotView::stream()` 分块产出（超大单条记录 carry-over，块严格 ≤ maxChunk）；
+  `saveStreaming()` **两趟走流**（先算 payloadLen/增量 CRC32，再分块写 + fsync + rename + fsyncDir），
+  落盘文件与整块编码**逐字节一致**；leader 发 InstallSnapshot 时 `readInstalled()` 按需读文件切片
+  （O(块)），**不再常驻整块快照缓冲**。
+- **跨进程断点续传（§8.4）**：`.recv` 尾部携带 `RKR1|idx|term|receivedLen|crcSoFar`，每收一块更新；
+  **新进程**从尾部恢复进度并接着传；安装时 `ftruncate` 掉尾部再 `rename`（不需要复制整块 payload）。
+- **可观测性**：`status` 新增 `qps / lat_p50_us / lat_p99_us / fsync_calls / fsync_ms / batch_avg /
+  batch_max / repl_lag_max / elections_total / snapshots_total / snapshot_bytes /
+  lock_wait_us_total / lock_wait_max / inflight_rpc`；指标只读、不参与任何正确性判定。
+- **性能结论（同机比值口径，`scripts/bench_m5_ab.sh`，3 次中位数、每格 verify `missing 0`）**：
+  p=1 延迟 **1.11×M4（达标）**；p=8/64 吞吐 **0.60×/0.57×M4（未达标）**。
+  同一轮 A/B 里 **M4 基线出现 `missing 5` / `missing 9`，而 M5 全部 `missing 0`** ——
+  M5 的墙钟代价换来的是"零丢写 + 锁内零 fsync + reactor + 可观测性"。
+  绝对判据（≤8 ms/写、≥1200 qps）经独立微基准（`scripts/fsbench_commit_latency.cpp`）证明
+  **本机物理不可达**：单次持久化提交下限 ≈8 ms（fsync 9.67 / fdatasync 9.74 / 预分配+fsync 7.93 /
+  O_DIRECT 7.60），而 Raft 必须 durable 之后才 ack。p=8/64 的差距已定量定位到
+  "批与批之间的唤醒 + 单把全局锁争用"（`docs/m5-bench.md` §3.9 并行扇出负结果、§3.10 分段实测）。
+- 测试：`raftkv_raft_tests` **90/90**（M2/M3/M4 + M5.A1–A12、R1–R6）；TSan **0 报告**
+  （`tests/tsan.supp` 仅窄抑制 libstdc++ `condition_variable_any` 误报，文件里写了出处论证）；
+  干净重建 **0 warning**；9 次 e2e/fault 脚本运行全 PASS。
+  复盘（面试口径：六个真 bug 的定位/根因/回归 + 两次负结果）见 **`docs/m5-review.md`**。
+
 ## 目录结构
 
 ```
