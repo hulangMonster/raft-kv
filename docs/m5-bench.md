@@ -157,3 +157,32 @@ reactor 在 p=1/p=8 **明显更快**（非阻塞发送让 propose/tick 不被 fo
   需在安静机器上复测，且 §8.2 滑动窗口落地后 p=64 应继续改善。
 * 后续动作：M5.6 落地 §8.2 滑动窗口并复测 p=64；默认引擎改为 `reactor`（依据 §3.3）。
 
+### 3.6 为什么绝对判据在本机**物理上**不可达（独立微基准，重启后静载复测）
+
+主机重启、`load average ≈ 0` 之后复测，p=1 仍是 **38.3 ms/写**（p=8 15.9、p=64 4.36 ms/写、230 qps），
+且节点自报 `fsync_ms / fsync_calls = 38403 / 4886 ≈ **7.9 ms/次**`、`batch_avg=1`、`lat_p50` 顶在 50 ms 桶。
+为了判定这是"实现问题"还是"机器下限"，写了一个**独立于 raftkv 的**微基准
+（4 KiB 追加 + flush × 200 次，ext4 on `/dev/mapper/vgubuntu-root`）：
+
+| 提交方式 | avg | p50 | p99 | max |
+|---|---|---|---|---|
+| `fsync`（当前实现用的） | 9.667 ms | 9.812 ms | 16.414 ms | 16.951 ms |
+| `fdatasync` | 9.737 ms | 10.366 ms | 14.550 ms | 15.214 ms |
+| `posix_fallocate`(64MiB) + `fdatasync` | 8.567 ms | 8.748 ms | 13.541 ms | 14.954 ms |
+| `posix_fallocate` + `fsync` | **7.934 ms** | 7.944 ms | 12.170 ms | 12.669 ms |
+| `O_DIRECT` + `fdatasync` | 7.596 ms | 6.956 ms | 15.927 ms | **29.407 ms** |
+
+**结论**：本机**一次持久化提交的下限就是 ~8 ms**（换 `fdatasync`/预分配/O_DIRECT 最多再省 20%，
+且 O_DIRECT 的尾延迟更差）。而 Raft 的 I5/I11 要求"条目 durable 之后才 ack"，
+因此：
+
+* `pipeline=1 ≤8 ms/写` 等价于要求"单次提交 + 一次复制往返"的总耗时 ≤ 一次 flush 的耗时 —— **不可能**；
+  本机可达的下限约 `leader flush 8ms + follower flush 8ms ≈ 16ms+`。
+* `pipeline=64 ≥1200 qps` 需要"每批 ≥29 条 且 周期 ≤24ms"（实测批量 17–20、周期 ~35ms）。
+  即使把两个 follower 的提交并行化（reactor 引擎方向），上限也只有 `批量/16ms ≈ 1250 qps`，
+  且要求批量稳定在 20 条以上；本机实测 reactor 侧为 224–297 qps。
+
+即这两条判据是**机器属性（持久化提交成本）**的函数：它们隐含假设"flush ≈ 1 ms"的硬件。
+因此在拿到 sub-ms flush 的机器（或调整判据口径，例如改成"M5 相对 M4 的比值"）之前，
+本里程碑**只能**主张：锁内 fsync==0（I9）、零丢写、reactor 引擎与可观测性均达成，
+以及"同机交替口径下的相对改善"。
