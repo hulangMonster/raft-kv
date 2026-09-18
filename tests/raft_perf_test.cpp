@@ -537,6 +537,40 @@ class AsyncQueueTransport : public Transport {
 };
 }  // namespace
 
+// M5.A12 用：只把**第一次** sync 挡住的 log store。
+// BlockingLogStore::release() 是粘性的：本用例里 propose 的锁外 fsync 必须停住，
+// 而随后 onAppendEntries 自己的 sync 必须放行，否则两者会互相卡死。
+class OnceBlockingLogStore : public MemoryLogStore {
+ public:
+  // 默认"未武装"（blocked_=true 表示已消耗），避免把前面 no-op 的 fsync 当成目标那次。
+  void arm() {
+    released_.store(false);
+    blocked_.store(false);
+  }
+  bool sync() override {
+    if (!blocked_.exchange(true)) {
+      inSync_.store(true);
+      while (!released_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      inSync_.store(false);
+    }
+    return MemoryLogStore::sync();
+  }
+  bool waitInsideSync(uint64_t timeoutMs) {
+    for (uint64_t w = 0; w < timeoutMs; w += 2) {
+      if (inSync_.load()) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return inSync_.load();
+  }
+  void release() { released_.store(true); }
+
+ private:
+  std::atomic<bool> blocked_{true};  // 未武装：不挡
+  std::atomic<bool> inSync_{false};
+  std::atomic<bool> released_{false};
+};
 // M5.A11 [§8.2 滑动窗口] 多批在途 + 乱序/重复 ack：
 //   * 窗口确实被用满（观察到 ≥2 批同时在途），且不超过 cfg_.maxInflightPerPeer
 //   * 应答**逆序**投递、且每条重复投递一次 -> 全部写仍然成功（ack 幂等）
@@ -665,6 +699,92 @@ TEST(RaftPerf, A11_SlidingWindowOutOfOrderAcksAreIdempotent) {
       << "在途批数（含 TTL 已过期但未回包的帧）超出兜底上界";
 }
 
+
+// M5.A12 [RED->GREEN] 「已提交」必须确认 index 上的条目仍是本次追加的那一条。
+//
+// 真实序列（M5.6 残留丢写实测）：leader 在 term T 把客户端条目追加到 index I（未提交）->
+// 失去领导权 -> 新 leader 用**不同的条目**覆盖 I -> 随后 I 被提交（提交的是新条目）。
+// 修复前 awaitCommit 只看 `index <= commitIndex_` 就回 kOk，客户端于是被告知"写成功"，
+// 而那次写从未被任何节点应用（实测 fill 报 filled 10000、verify 却 missing 1）。
+//
+// 关键时序：必须让覆盖+提交发生在 propose **已把锁放出、正在锁外 fsync** 的窗口里——
+// 这样 propose 回锁后第一件事就是"轮询开头"的 `index <= commitIndex_` 判断（而不是先撞上
+// role 变化的早退分支）。用 BlockingLogStore 把 fsync 卡住即可确定性地复现。
+TEST(RaftPerf, A12_OverwrittenEntryIsNotReportedAsCommitted) {
+  auto c = std::make_shared<FakeClock>();
+  auto async = std::make_shared<AsyncQueueTransport>();
+  auto log = std::make_unique<OnceBlockingLogStore>();
+  OnceBlockingLogStore* slog = log.get();
+  auto lsm = std::make_unique<KvStateMachine>();
+  RaftConfig c1;
+  c1.selfId = 1;
+  c1.peerIds = {2, 3};  // 有投票者，但 transport 里没有节点 -> 复制不到多数派
+  RaftNode node1(c1, *log, *lsm, *async, *c);
+
+  for (int i = 0; i < 200 && node1.role() != Role::kLeader; ++i) {
+    c->advance(10);
+    node1.tick();
+    for (auto& v : async->takeVoteJobs()) {
+      RequestVoteReply r;
+      r.term = v.args.term;
+      r.voteGranted = true;
+      v.cb(r);
+    }
+  }
+  ASSERT_EQ(node1.role(), Role::kLeader);
+  const Term termT = node1.currentTerm();
+  c->advance(10);
+  node1.tick();  // 本任期 no-op
+
+  // 让 propose 的锁外 fsync 停住，好让"覆盖 + 提交"恰好落在它的解锁窗口里
+  slog->arm();  // 只挡接下来这**一次** sync（= propose 的锁外 fsync）
+  std::atomic<int> status{-1};
+  std::thread writer([&] {
+    ClientRequest req;
+    req.op = OpCode::kPut;
+    req.key = "victim";
+    req.value = "v";
+    req.clientId = 77;
+    req.requestId = 1;
+    const ClientReply r = node1.propose(req, 5000);
+    status.store(static_cast<int>(r.status));
+  });
+  ASSERT_TRUE(slog->waitInsideSync(3000)) << "propose 应已进入锁外 fsync";
+
+  const Index idx = log->lastIndex();
+  ASSERT_NE(idx, kNoIndex);
+  const Term myTerm = log->termAt(idx);
+  ASSERT_EQ(myTerm, termT);
+
+  // 更高任期的新 leader：用**不同条目**覆盖 idx，并在同一个 AE 里把 leaderCommit 推到 idx
+  AppendEntriesArgs ae;
+  ae.term = termT + 1;
+  ae.leaderId = 2;
+  ae.prevLogIndex = idx - 1;
+  ae.prevLogTerm = log->termAt(idx - 1);
+  LogEntry other;
+  other.index = idx;
+  other.term = termT + 1;
+  other.op = OpCode::kPut;
+  other.key = "OTHER";
+  other.value = "x";
+  ae.entries.push_back(other);
+  ae.leaderCommit = idx;
+  const AppendEntriesReply rep = node1.onAppendEntries(ae);
+  ASSERT_TRUE(rep.success);
+  ASSERT_EQ(static_cast<int>(node1.role()), static_cast<int>(Role::kFollower));
+  ASSERT_EQ(node1.commitIndex(), idx) << "该 index 已被提交（提交的是新条目）";
+  ASSERT_EQ(log->termAt(idx), termT + 1) << "本节点原来那条已被覆盖";
+
+  slog->release();  // 放行 propose 的 fsync
+  for (int i = 0; i < 1000 && status.load() < 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  EXPECT_EQ(status.load(), static_cast<int>(ClientStatus::kNotLeader))
+      << "条目已被覆盖：必须回 kNotLeader 让客户端重试，绝不能报 kOk"
+      << "（ClientStatus: kOk=0, kNotLeader=3；修复前这里会是 0=kOk）";
+  writer.join();
+}
 // M5.A7 [GUARD] R2 守门：两段式改造不得破坏成员变更语义（J1/J2 仍成立）。
 TEST(RaftPerf, A7_ConfigChangeStillCommits) {
   auto c = makeSpyCluster(3);

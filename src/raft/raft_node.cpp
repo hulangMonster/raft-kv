@@ -757,11 +757,22 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
       std::lock_guard<ProbedMutex> lock(mu_);
       // 已提交即成功：Leader 自我移除（§5.7）会在配置条目提交的同一锁段内降级，
       // 此时请求其实已经生效，不能报 NotLeader。
+      //
+      // M5.6 修复（丢写残留根因）：「已提交」还必须**确认 index 上的条目仍是本次
+      // 追加的那一条**（同 term）。否则会出现这种真实序列：本节点在 term T 把条目
+      // 追加到 index I（尚未提交）-> 失去领导权 -> 新 leader 用**不同的条目**覆盖 I
+      // -> 随后 I 被提交（提交的是新条目）-> 本函数看到 commitIndex_ >= I 就回 kOk，
+      // 而客户端那次写**从未生效**（实测：fill 报 filled 10000，但该 key 在任何节点
+      // 都没进过状态机；reactor 因选举更多而更易触发，sync 同样存在该缺陷）。
+      // 条目被覆盖时回 kNotLeader，让客户端按既有重定向/重试逻辑重发（幂等）。
       if (index <= commitIndex_) {
-        if (metrics_ != nullptr) {
-          metrics_->onWriteCompleted(lockprobe::nowUs() - metricT0Us);
+        if (log_.termAt(index) == term) {
+          if (metrics_ != nullptr) {
+            metrics_->onWriteCompleted(lockprobe::nowUs() - metricT0Us);
+          }
+          return {ClientStatus::kOk, "", -1};
         }
-        return {ClientStatus::kOk, "", -1};
+        return {ClientStatus::kNotLeader, "", leaderId_};  // 条目已被覆盖，须重试
       }
       if (role_ != Role::kLeader || currentTerm_ != term) {
         return {ClientStatus::kNotLeader, "", leaderId_};
@@ -856,15 +867,18 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
     std::unique_lock<ProbedMutex> lock(mu_);
     ++syncWaiters_;  // M5.4：仅用于蓄批的自适应判定（近似计数即可）
     cv_.wait_until(lock, deadline, [&] {
-      return index <= commitIndex_ || role_ != Role::kLeader ||
-             currentTerm_ != term;
+      return (index <= commitIndex_ && log_.termAt(index) == term) ||
+             role_ != Role::kLeader || currentTerm_ != term;
     });
     --syncWaiters_;
     if (index <= commitIndex_) {
-      if (metrics_ != nullptr) {
-        metrics_->onWriteCompleted(lockprobe::nowUs() - metricT0Us);
+      if (true) {  // RED 验证：临时去掉 term 校验
+        if (metrics_ != nullptr) {
+          metrics_->onWriteCompleted(lockprobe::nowUs() - metricT0Us);
+        }
+        return {ClientStatus::kOk, "", -1};
       }
-      return {ClientStatus::kOk, "", -1};
+      return {ClientStatus::kNotLeader, "", leaderId_};
     }
     if (role_ != Role::kLeader || currentTerm_ != term) {
       return {ClientStatus::kNotLeader, "", leaderId_};

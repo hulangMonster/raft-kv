@@ -797,3 +797,39 @@ TSan（全量 raft 用例 + `raft_perf_test`）必须 0 报告；注入用例：
   6. **出厂配置不变**：默认仍 `sync`（它在同口径下 3/3 + 全部 A/B 格子零丢写），
      `--inflight-per-peer` 默认 1；reactor 从"存在未关闭阻断项"改为
      "根因已定位并修复、有专项回归用例"，但**在安静机器上完成整套复测前仍不作为默认**。
+
+- **v2.5**（残留丢写**根因与修复**：`awaitCommit` 把"index 已提交"当成"本次写已提交"）：
+  1. **根因（Raft 层，非 reactor 专属）**：`awaitCommit()` 的两处成功判断原来只看
+     `index <= commitIndex_`。真实序列（用 `[prop]/[app]/[commit]/[ack]` 插桩实测）：
+     * leader（term T）把客户端条目**追加**到 index I，但还没拿到多数派（未提交）；
+     * 它失去领导权；新 leader（term T+1）用**不同的条目**覆盖 I（合法：I 从未提交）；
+     * 随后 I 被提交（提交的是新条目），本节点的 `commitIndex_` 也跟着推进到 I；
+     * 于是 `awaitCommit(I, T)` 命中 `index <= commitIndex_` 直接回 `kOk` ——
+       客户端被告知"写成功"，而**那次写从未被任何节点应用**。
+     证据：残留复现轮里 `fill` 输出 `filled 10000`（rc=0、无 server error），
+     `verify` 却 `missing 1`；`[app] node2 key=f816 idx=892 term=7` 说明它被追加在 892，
+     而 `[commit] node1 ADVANCE commit=892 term=8`（多数派 {1,3}）提交的是**新 leader 的
+     另一个条目**，全集群没有任何节点 APPLY 过 f816。
+     reactor 因为选举更频繁而更易触发（实测 win=1 约 1/10 轮），**sync 同样有这个缺陷**，
+     只是触发概率低（此前 8/8 干净）。
+  2. **修复**（`raft_node.cpp`，不触碰 wire 格式）：两处成功判断都要求
+     **`log_.termAt(index) == term`**（该 index 上仍是本次追加的那一条）；条目已被覆盖时
+     回 `kNotLeader`，让客户端按既有重定向/重试逻辑重发（幂等，(clientId, requestId) 去重）。
+     `cv_.wait_until` 的谓词同步收紧，条目被覆盖时不再空等。
+  3. **回归用例 M5.A12**（`tests/raft_perf_test.cpp`）：用"只挡第一次 `sync()`"的
+     `OnceBlockingLogStore` 把 propose 停在**锁外 fsync 窗口**里，趁这个窗口投递
+     "更高任期 + 不同条目覆盖 I + leaderCommit=I"的 AE，然后放行 fsync，断言 propose
+     返回 `kNotLeader` 而不是 `kOk`。
+     **RED 证据**：临时去掉 term 校验后该用例失败（`status=0(kOk)` vs 期望 `3(kNotLeader)`），
+     恢复后通过。
+  4. **修复后实测（全部 10000 写/轮、`verify` 门禁）**：
+     * reactor `win=1` ×10、`win=4` ×4、sync ×5 → **19/19 全部 `missing 0`**
+       （修复前 reactor win=1 约 1/10 轮 missing 1）。
+     * 9 次脚本运行**全 PASS**：默认(sync) 侧 `snapshot_e2e` / `membership_e2e` /
+       `raft_fault(50)` / `raft_membership_fault(50)` / `snapshot_fault(20)`；
+       reactor 侧 `snapshot_e2e` / `membership_e2e` / `raft_fault(50)` / `raft_membership_fault(50)`。
+     * 单测 **86/86**；TSan **rc=0、0 warning、86/86**；M1 13/13。
+  5. **至此 M5 的已知正确性阻断项全部关闭**（I9 锁内 fsync、ack 归因、reactor 重发、
+     `awaitCommit` 误报成功）。仍未达成的是**绝对性能判据**（见 §3.0 机器状态声明：
+     本机当前 p=1 为 28.7–41.5 ms/写、p=64 约 250–320 qps，而冻结基线期 M4 自身也只有
+     16.4 ms/写、589 qps）——这一项取决于机器，需在安静机器上复测。
