@@ -79,6 +79,8 @@ class FrameServer {
   uint16_t port() const { return port_.load(); }
   std::string addr() const { return "127.0.0.1:" + std::to_string(port_.load()); }
   int accepted() const { return accepted_.load(); }
+  // M5.6（R6 用）：收到的**帧**数（无论是否回复），用于断言不重发。
+  int frames() const { return frames_.load(); }
 
  private:
   void loop() {
@@ -92,7 +94,7 @@ class FrameServer {
         std::lock_guard<std::mutex> lk(mu_);
         conns_.push_back(c);
       }
-      if (!echo_) continue;  // 收下连接但永不回复
+      // 即使不回复也要把帧读出来计数：R6 靠它断言"等待应答期间不重发"。
       std::thread worker([this, c] {
         for (;;) {
           Byte hdr[4];
@@ -103,6 +105,8 @@ class FrameServer {
                                static_cast<uint32_t>(hdr[3]);
           std::vector<Byte> body(len);
           if (len > 0 && !readFull(c, body.data(), len)) return;
+          frames_.fetch_add(1);
+          if (!echo_) continue;  // 收下但不回复
           std::vector<Byte> whole;
           whole.insert(whole.end(), hdr, hdr + 4);
           whole.insert(whole.end(), body.begin(), body.end());
@@ -141,6 +145,7 @@ class FrameServer {
   std::atomic<uint16_t> port_{0};
   std::atomic<bool> run_{false};
   std::atomic<int> accepted_{0};
+  std::atomic<int> frames_{0};
   bool echo_ = true;
   std::thread th_;
   mutable std::mutex mu_;
@@ -192,6 +197,35 @@ TEST(RaftReactor, R1_SendReceivesReplyAsynchronously) {
 }
 
 // R2：对端不回复 -> 回调不触发（超时语义），in-flight 归零
+
+// R6 [M5.6 丢写根因回归]：队首帧在**等待应答期间不得被重发**。
+//   修复前 flushLocked() 只要看到 queue 非空就把队首重新装进 out 再发一遍，而 run() 的
+//   扫描循环每次迭代都会调用它 —— 实测同一帧被完整发送 2.0 次（高负载下 44% 的帧重复），
+//   对端回两次，第二次答复会弹掉下一批的 Pending，造成 ack 归因错位 -> matchIndex 虚高
+//   -> 已 ack 的写丢失。本用例把该行为钉死：对端不回复，等待远超一次事件循环的时间后
+//   必须仍然只收到 1 帧。
+TEST(RaftReactor, R6_FrameIsNotRetransmittedWhileAwaitingReply) {
+  FrameServer server(/*echo=*/false);  // 只收不回：队首会一直停在"等待应答"状态
+  ASSERT_TRUE(server.start());
+  Reactor reactor;
+  reactor.start();
+  reactor.addPeer(1, server.addr());
+
+  std::atomic<int> cbs{0};
+  const bool queued = reactor.send(1, tinyFrame(), /*timeoutMs=*/3000,
+                                   [&](const Bytes&, bool ok) {
+                                     if (ok) cbs.fetch_add(1);
+                                   });
+  EXPECT_TRUE(queued);
+  // 事件循环在这段时间里会反复扫描该 peer；修复前每轮都会重发一次。
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  EXPECT_EQ(server.frames(), 1)
+      << "同一帧在等待应答期间被重发了 " << server.frames() << " 次";
+  EXPECT_EQ(cbs.load(), 0) << "对端未回复，回调不应触发";
+  EXPECT_EQ(reactor.inflight(), 1u) << "该请求应仍在途（未被误当成已应答）";
+  reactor.stop();
+  server.stop();
+}
 TEST(RaftReactor, R2_TimeoutDropsCallback) {
   FrameServer server(/*echo=*/false);
   ASSERT_TRUE(server.start());

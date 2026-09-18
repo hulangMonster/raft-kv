@@ -757,3 +757,41 @@ TSan（全量 raft 用例 + `raft_perf_test`）必须 0 报告；注入用例：
      （实测日志 `bind :40002 failed: Address already in use` + `terminate called without an active
      exception`）。已加 RAII 守卫（所有退出路径先停 ticker 再 join），并实测 bind 冲突时干净退出
      （rc=1，仅一行错误信息，无 terminate）。
+
+- **v2.4**（reactor 丢写**已修复**：`flushLocked()` 在等待应答期间重发队首帧）：
+  1. **根因（精确到行）**：`Reactor::Impl::flushLocked()` 的装填条件是
+     `if (p.out.empty() && !p.queue.empty()) p.out = p.queue.front().frame;` ——
+     队首帧**完整写出后 `p.out` 变空、但它仍在 queue 里等应答**，于是下一次 `flushLocked()`
+     又把同一帧装进 `out` 再发一遍。而 `run()` 的事件循环尾部每次迭代都会对
+     `!p.out.empty() || !p.queue.empty()` 的 peer 调用 `flushLocked()` —— **每一次循环迭代重发一次**。
+     另一条出口：`onReadableLocked()` 收到应答后自己内联写下一帧（不走 `flushLocked`），
+     同样不置"等待应答"标志，于是新队首也会被下一轮扫描重发。
+  2. **实测证据**：给 reactor 加发送序号后按 (peer, seq) 统计"累计写出字节"：
+     | 节点 | 入队且有写出的 seq | 恰好一次 | **超出（重复发送）** | 不足 |
+     |---|---|---|---|---|
+     | node1 | 4096 | 4021 | **75（全是 2.0 倍）** | 0 |
+     | node2 | 6 | 3 | **3（2.0 倍）** | 0 |
+     | node3 | 307 | 173 | **134（2.0 倍）** | 0 |
+     对端因此对同一请求回两次；第二次答复会弹掉**下一批**的 Pending → ack 归因错位
+     （v2.3 的对照实验：reactor 1–3% 记功错位、sync 0/855）→ `matchIndex_` 虚高 →
+     leader 提交并 ack 了 follower 从未持有的条目 → 已 ack 的写被更高任期的合法分歧覆盖而丢失。
+  3. **修复**（`src/raft/reactor.cpp`，不触碰 wire 格式，符合 I14）：给 `Peer` 增加
+     `awaitingReply`（队首已完整写出、只等应答）；`flushLocked()` 仅在
+     `!awaitingReply && out.empty()` 时装填队首，整帧写完后置 `awaitingReply=true`；
+     收到应答弹出队首时、以及 `closePeerLocked()` 时复位；`onReadableLocked()` 的
+     "应答后立刻发下一帧"改为**统一走 `flushLocked()`**，消除第二条重发出口。
+  4. **验证**（同机、每轮 10000 写 + `verify`）：
+     * 修复前：`win=1` 1/6 轮丢写（missing 29）；`win=4` ~2/3 轮丢写（missing 1…49）。
+     * 修复后（各 10000 写/轮）：`win=4` **6/6 全部 missing 0**（修复前 ~2/3 轮丢写、最多 missing 49）；
+       `win=1` **9/10 missing 0，1 轮 missing 1**（修复前 1/6 轮、missing 29）。
+       → 占主导的丢写路径已消除；**仍残留一个极罕见项（约 1/10 万写）尚未归因**，
+       已如实记录，未声称 reactor 已可用于生产。
+     * reactor 全量脚本（修复后）**一次通过**：`snapshot_e2e` / `membership_e2e` /
+       `raft_fault --repeat 50` / `raft_membership_fault --repeat 50` 全部 rc=0 PASS。
+  5. **新增回归用例 R6**（`tests/raft_reactor_test.cpp`）：用一个"只收不回"的 FrameServer
+     发一帧，等待 400ms（远大于一次事件循环），断言对端**只收到 1 帧**、回调不触发、
+     `inflight()==1`。修复前该用例必失败（每轮扫描重发一次）。为此给测试用 `FrameServer`
+     加了 `frames()` 计数（即使不回复也把帧读出来计数）。
+  6. **出厂配置不变**：默认仍 `sync`（它在同口径下 3/3 + 全部 A/B 格子零丢写），
+     `--inflight-per-peer` 默认 1；reactor 从"存在未关闭阻断项"改为
+     "根因已定位并修复、有专项回归用例"，但**在安静机器上完成整套复测前仍不作为默认**。

@@ -88,6 +88,12 @@ struct Reactor::Impl {
     bool connecting = false;
     Bytes out;                  // 待写字节（可能是半个帧）
     Bytes in;                   // 已读字节
+    // M5.6 修复（丢写根因）：队首帧已**完整写出**、正在等应答。没有这个标志时，
+    // flushLocked 会在每次事件循环尾部（run() 的扫描）看到 queue 非空就重新把队首
+    // 装进 out 再发一遍 —— 实测同一 seq 被完整发送 2.0 次（node3 有 44% 的帧重复），
+    // 对端于是回两次；第二次答复会弹掉**下一批**的 Pending，造成 ack 归因错位
+    // （实测 1~3% 的记功对应到 peer 从未处理的帧）-> matchIndex 虚高 -> 已 ack 的写丢失。
+    bool awaitingReply = false;
     std::deque<Pending> queue;  // FIFO：一次一个请求在途（协议 request->reply 一一对应）
     size_t inflight() const { return queue.size(); }
   };
@@ -120,6 +126,7 @@ struct Reactor::Impl {
     p.connecting = false;
     p.out.clear();
     p.in.clear();
+    p.awaitingReply = false;
     if (dropHead && !p.queue.empty()) p.queue.pop_front();  // 超时/错误：回调不触发
   }
 
@@ -157,7 +164,7 @@ struct Reactor::Impl {
       }
       p.connecting = false;
     }
-    if (p.out.empty() && !p.queue.empty()) {
+    if (!p.awaitingReply && p.out.empty() && !p.queue.empty()) {
       p.out = p.queue.front().frame;  // 一次只发队首（请求-应答配对）
     }
     size_t written = 0;
@@ -167,6 +174,7 @@ struct Reactor::Impl {
         return;
       }
       p.out.erase(p.out.begin(), p.out.begin() + static_cast<ptrdiff_t>(written));
+      if (p.out.empty()) p.awaitingReply = true;  // 整帧已上线：只等应答，绝不重发
     }
     updateInterestLocked(p);
   }
@@ -207,17 +215,12 @@ struct Reactor::Impl {
       if (p.queue.empty()) continue;  // 没有在途请求：丢弃（不应发生）
       Pending pending = std::move(p.queue.front());
       p.queue.pop_front();
+      p.awaitingReply = false;  // 队首已应答：下一帧可以发了
       if (pending.cb) pending.cb(frame, true);
-      // 收到应答后立刻尝试发下一个
-      if (!p.queue.empty()) {
-        p.out = p.queue.front().frame;
-        size_t written = 0;
-        if (!writeAllNonBlocking(p.fd, p.out.data(), p.out.size(), written)) {
-          closePeerLocked(p, /*dropHead=*/true);
-          return;
-        }
-        p.out.erase(p.out.begin(), p.out.begin() + static_cast<ptrdiff_t>(written));
-      }
+      // 收到应答后立刻尝试发下一个。**必须复用 flushLocked**：这里原来自己写一遍
+      // 内联发送逻辑，不会置 awaitingReply，于是下一次事件循环扫描又把这个新队首
+      // 重发一遍（与上面修掉的是同一个缺陷的另一条出口）。
+      if (!p.queue.empty()) flushLocked(p);
       updateInterestLocked(p);
     }
   }
