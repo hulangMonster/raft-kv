@@ -386,6 +386,168 @@ TEST(RaftSnapshotDisk, TornSnapshotDiscarded) {
   std::filesystem::remove_all(dir);
 }
 
+
+// ===== M5.4（§8.3 流式序列化 / §8.4 断点续传）=====
+
+namespace {
+
+// 造一个有大 payload 的 state machine（每条 value 8KiB，便于验证分块路径）
+std::unique_ptr<KvStateMachine> bigStateMachine(size_t entries) {
+  auto sm = std::make_unique<KvStateMachine>();
+  const std::string value(8 * 1024, 'v');
+  for (size_t i = 0; i < entries; ++i) {
+    LogEntry e = entry(static_cast<Index>(i + 1), 1,
+                       "k" + std::to_string(i), value);
+    sm->apply(e);
+  }
+  return sm;
+}
+
+}  // namespace
+
+// §8.3 保真：分块流的字节序列必须与 serialize() 逐字节一致（否则磁盘格式就变了）
+TEST(RaftSnapshotStream, ChunkedStreamMatchesSerializeByteForByte) {
+  auto sm = bigStateMachine(64);  // ~512 KiB payload，跨越多个 64KiB 块
+  auto view = sm->snapshotView();
+  ASSERT_NE(view, nullptr);
+  const Bytes oneShot = view->serialize();
+  Bytes streamed;
+  std::unique_ptr<SnapshotStream> st = view->stream();
+  Bytes chunk;
+  size_t maxSeen = 0;
+  while (st->next(chunk, 64 * 1024)) {
+    maxSeen = std::max(maxSeen, chunk.size());
+    streamed.insert(streamed.end(), chunk.begin(), chunk.end());
+  }
+  EXPECT_EQ(streamed, oneShot) << "分块流与整块序列化必须逐字节相同";
+  EXPECT_LE(maxSeen, 64 * 1024 + 8 * 1024 + 16)
+      << "每块不得超过 maxChunk + 单条记录开销（实测 " << maxSeen << "）";
+}
+
+// §8.3 落盘保真：saveStreaming 写出的文件必须与 encodeSnapshotFile 完全一致（I14）
+TEST(RaftSnapshotStream, SaveStreamingWritesIdenticalFile) {
+  const std::string dir = tempDir();
+  auto sm = bigStateMachine(32);
+  auto view = sm->snapshotView();
+  const Bytes cfg = Bytes{'c', 'f', 'g'};
+  FileSnapshotStore snap(dir);
+  ASSERT_TRUE(snap.saveStreaming(*view, /*lastIncludedIndex=*/99,
+                                 /*lastIncludedTerm=*/7, cfg));
+  EXPECT_EQ(snap.installedBytes(), std::filesystem::file_size(dir + "/raft/snapshot.dat"));
+
+  // 期望文件：用同一份数据走老的整块编码
+  SnapshotData expect;
+  expect.lastIncludedIndex = 99;
+  expect.lastIncludedTerm = 7;
+  expect.config = cfg;
+  expect.payload = view->serialize();
+  const Bytes want = encodeSnapshotFile(expect);
+  Bytes got;
+  {
+    std::ifstream in(dir + "/raft/snapshot.dat", std::ios::binary);
+    got.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+  }
+  EXPECT_EQ(got, want) << "流式落盘的文件必须与整块编码逐字节一致";
+
+  // 再读回来验一遍语义
+  SnapshotData loaded;
+  ASSERT_TRUE(snap.load(loaded));
+  EXPECT_EQ(loaded.lastIncludedIndex, 99u);
+  EXPECT_EQ(loaded.lastIncludedTerm, 7u);
+  EXPECT_EQ(loaded.payload, expect.payload);
+  EXPECT_EQ(loaded.config, cfg);
+  std::filesystem::remove_all(dir);
+}
+
+// §8.3 惰性供片：readInstalled 必须按偏移返回文件里的对应切片（InstallSnapshot 用）
+TEST(RaftSnapshotStream, ReadInstalledSlicesMatchFileContent) {
+  const std::string dir = tempDir();
+  auto sm = bigStateMachine(16);
+  auto view = sm->snapshotView();
+  FileSnapshotStore snap(dir);
+  ASSERT_TRUE(snap.saveStreaming(*view, 42, 3, Bytes{}));
+  const uint64_t total = snap.installedBytes();
+  ASSERT_GT(total, 200u);
+
+  Bytes head;
+  ASSERT_TRUE(snap.readInstalled(0, 64, head));
+  EXPECT_EQ(head.size(), 64u);
+  EXPECT_EQ(std::string(head.begin(), head.begin() + 4), "RKS1");
+
+  Bytes mid;
+  ASSERT_TRUE(snap.readInstalled(100, 200, mid));
+  Bytes all;
+  ASSERT_TRUE(snap.readInstalled(0, total, all));
+  EXPECT_EQ(std::string(mid.begin(), mid.end()),
+            std::string(all.begin() + 100, all.begin() + 300));
+
+  Bytes over;
+  EXPECT_FALSE(snap.readInstalled(total - 1, 8, over)) << "越界必须拒绝";
+  std::filesystem::remove_all(dir);
+}
+
+// §8.4 跨进程重启续传：新 store 实例（= 新进程）必须能从 .recv 尾部恢复进度并接着收
+TEST(RaftSnapshotResume, ContinuesAfterStoreRestart) {
+  const std::string dir = tempDir();
+  auto sm = bigStateMachine(8);
+  auto view = sm->snapshotView();
+  SnapshotData full;
+  full.lastIncludedIndex = 21;
+  full.lastIncludedTerm = 2;
+  full.payload = view->serialize();
+  const Bytes file = encodeSnapshotFile(full);  // 线上传的就是这个文件内容
+  ASSERT_GT(file.size(), 64u);
+
+  const size_t firstLen = file.size() / 2;
+  {
+    FileSnapshotStore a(dir);
+    Bytes first(file.begin(), file.begin() + static_cast<ptrdiff_t>(firstLen));
+    ASSERT_TRUE(a.receiveChunk(21, 2, /*offset=*/0, first, /*done=*/false));
+    EXPECT_EQ(a.recvProgress(), firstLen);
+    // 让 a 析构：等价于接收方进程重启（.recv 与尾部元数据留在磁盘上）
+  }
+  {
+    FileSnapshotStore b(dir);  // 新实例 = 重启后的进程
+    EXPECT_EQ(b.recvProgress(), firstLen)
+        << "新实例必须从 .recv 尾部恢复已收字节数";
+    Bytes second(file.begin() + static_cast<ptrdiff_t>(firstLen), file.end());
+    ASSERT_TRUE(b.receiveChunk(21, 2, firstLen, second, /*done=*/true))
+        << "必须能从断点继续接收";
+    SnapshotData loaded;
+    ASSERT_TRUE(b.load(loaded));
+    EXPECT_EQ(loaded.lastIncludedIndex, 21u);
+    EXPECT_EQ(loaded.payload, full.payload) << "续传后安装的载荷必须完整";
+  }
+
+  // 对照：换一份更**新**的快照，重启后从头传（offset=0）仍然要能安装
+  {
+    SnapshotData newer = full;
+    newer.lastIncludedIndex = 30;
+    newer.lastIncludedTerm = 4;
+    const Bytes file30 = encodeSnapshotFile(newer);
+    FileSnapshotStore c(dir);
+    ASSERT_TRUE(c.receiveChunk(30, 4, 0, file30, /*done=*/true));
+    SnapshotData loaded;
+    ASSERT_TRUE(c.load(loaded));
+    EXPECT_EQ(loaded.lastIncludedIndex, 30u);
+  }
+
+  // 对照：从**错误的**偏移续传必须被拒（并要求 leader 从头来）
+  {
+    SnapshotData newer = full;
+    newer.lastIncludedIndex = 40;
+    newer.lastIncludedTerm = 5;
+    const Bytes file40 = encodeSnapshotFile(newer);
+    const size_t half = file40.size() / 2;
+    FileSnapshotStore d(dir);
+    Bytes first(file40.begin(), file40.begin() + static_cast<ptrdiff_t>(half));
+    ASSERT_TRUE(d.receiveChunk(40, 5, 0, first, false));
+    Bytes tail(file40.begin() + static_cast<ptrdiff_t>(half), file40.end());
+    EXPECT_FALSE(d.receiveChunk(40, 5, half + 7, tail, true))
+        << "偏移对不上必须拒绝，而不是拼出错文件";
+  }
+  std::filesystem::remove_all(dir);
+}
 TEST(RaftSnapshotDisk, TornTailAfterCompact) {
   const std::string dir = tempDir();
   {

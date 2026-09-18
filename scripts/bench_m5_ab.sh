@@ -4,7 +4,13 @@
 #   * 每档先跑 200 写预热（丢弃），每档重复 N 次取中位数
 #   * 每次 fill 后必须 verify，missing != 0 则整轮作废
 # 用法: scripts/bench_m5_ab.sh [--quick] [--repeats N] [--base-ref REF] [--only m4|m5]
-# 判据(docs/m5-design.md §10): 同档中位数 延迟 <= M4*0.9 或吞吐 >= M4*1.5 记为改善
+# 判据(M5.5 修订, docs/m5-design.md §10 + docs/m5-bench.md §3.7): **同机比值口径**
+#   * pipeline=1  : M5 延迟 <= M4 延迟 x 1.2   (小并发下延迟不劣化)
+#   * pipeline=8/64: M5 吞吐 >= M4 吞吐 x 0.8   (高并发下吞吐不明显退化)
+#   * 硬门禁     : 每个格子 verify 必须 missing 0（probe 里已强校验）
+# 为什么不用绝对判据(<=8ms/写、>=1200qps)：见 docs/m5-bench.md §3.6 —— 本机单次持久化
+# 提交下限 ~8ms(fsync/fdatasync/预分配/O_DIRECT 实测)，Raft 必须 durable 后才 ack，
+# 绝对目标隐含 "flush ≈ 1ms" 的硬件；比值口径才是同机可复现、可回归的判据。
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -120,8 +126,8 @@ for p in "${PIPELINES[@]}"; do
 done
 
 echo
-echo "| pipeline | n | M4 median ms/write | M5 median ms/write | M4 median qps | M5 median qps | 判定 |"
-echo "|---|---|---|---|---|---|---|"
+echo "| pipeline | n | M4 median ms/write | M5 median ms/write | M4 median qps | M5 median qps | M5/M4 延迟 | M5/M4 吞吐 | 判定(§10 比值口径) |"
+echo "|---|---|---|---|---|---|---|---|---|"
 for p in "${PIPELINES[@]}"; do
   if [[ $QUICK == 1 ]]; then
     case $p in 1) N=500;; 8) N=2000;; 64) N=2000;; esac
@@ -130,13 +136,18 @@ for p in "${PIPELINES[@]}"; do
   fi
   m4l=$(medians m4 "$p" ms_per_write); m5l=$(medians m5 "$p" ms_per_write)
   m4q=$(medians m4 "$p" qps);          m5q=$(medians m5 "$p" qps)
-  verdict="n/a"
+  verdict="n/a"; lratio="n/a"; qratio="n/a"
   if [[ "$m4l" != "n/a" && "$m5l" != "n/a" ]]; then
-    verdict=$(awk -v a="$m4l" -v b="$m5l" -v qa="$m4q" -v qb="$m5q" \
-      'BEGIN{ if (b <= a*0.9) print "latency改善"; else if (qb >= qa*1.5) print "throughput改善"; else print "未达标" }')
+    lratio=$(awk -v a="$m4l" -v b="$m5l" 'BEGIN{ if (a>0) printf "%.2fx", b/a; else print "n/a" }')
+    qratio=$(awk -v qa="$m4q" -v qb="$m5q" 'BEGIN{ if (qa>0) printf "%.2fx", qb/qa; else print "n/a" }')
+    verdict=$(awk -v p="$p" -v a="$m4l" -v b="$m5l" -v qa="$m4q" -v qb="$m5q" 'BEGIN{
+      if (p==1) { if (b <= a*1.2) print "达标(延迟<=1.2x)"; else print "未达标(延迟>1.2x)" }
+      else      { if (qb >= qa*0.8) print "达标(吞吐>=0.8x)"; else print "未达标(吞吐<0.8x)" }
+    }')
   fi
-  echo "| $p | $N | $m4l | $m5l | $m4q | $m5q | $verdict |"
+  echo "| $p | $N | $m4l | $m5l | $m4q | $m5q | $lratio | $qratio | $verdict |"
 done
 echo
 echo "raw log: $RAW"
+echo "（硬门禁：每次 fill 之后都跑 verify，出现 missing != 0 时 probe 会打印 VERIFY_FAILED 并整轮作废）"
 rm -rf "$WORK"

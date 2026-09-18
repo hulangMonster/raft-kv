@@ -85,7 +85,7 @@ RaftNode::RaftNode(RaftConfig cfg, LogStore& log, StateMachine& sm,
       }
       // D3: the boundary must be known before load() validates firstIndex().
       log_.setBoundary(snap.lastIncludedIndex, snap.lastIncludedTerm);
-      snapshotBytes_ = encodeSnapshotFile(snap);
+      // M5.4（§8.3）：不再常驻整块编码——分块发送时按需从 store 读取切片。
     }
     // Absent/corrupt (magic/version/CRC) snapshot falls through to a full log
     // replay (D2 guarantee: compaction only runs after a durable snapshot).
@@ -957,12 +957,11 @@ void RaftNode::maybeSnapshot() {
 
   // Serialize + persist OUTSIDE the lock (lock discipline L8).
   SnapshotData data;
-  data.lastIncludedIndex = snapIndex;
-  data.lastIncludedTerm = snapTerm;
-  data.payload = view->serialize();
-  data.config = encodeClusterConfig(snapConfig);  // 锁外序列化（L8）
-  if (!snapshots_->save(data)) return;
-  Bytes encoded = encodeSnapshotFile(data);  // outside the lock (L8)
+  // M5.4（§8.3）：**流式**落盘——两趟走 view->stream()（先算 payloadLen/crc32，再分块写），
+  // 不再 materialize 整块 payload，也不再多存一份 encodeSnapshotFile 的副本。
+  const Bytes snapCfg = encodeClusterConfig(snapConfig);  // 锁外序列化（L8）
+  if (!snapshots_->saveStreaming(*view, snapIndex, snapTerm, snapCfg)) return;
+  const uint64_t snapBytes = snapshots_->installedBytes();
 
   {
     std::lock_guard<ProbedMutex> lock(mu_);
@@ -984,8 +983,7 @@ void RaftNode::maybeSnapshot() {
     if (epoch != installEpoch_) return;
     lastIncluded_ = snapIndex;
     lastIncludedTerm_ = snapTerm;
-    if (metrics_ != nullptr) metrics_->onSnapshot(encoded.size());
-    snapshotBytes_ = std::move(encoded);
+    if (metrics_ != nullptr) metrics_->onSnapshot(snapBytes);
     for (auto& kv : snapshotSendOffset_) kv.second = 0;  // restart peer sends
     if (snapIndex > syncedIndex_) syncedIndex_ = snapIndex;
   }
@@ -1090,7 +1088,7 @@ InstallSnapshotReply RaftNode::onInstallSnapshot(const InstallSnapshotArgs& args
     }
     lastIncluded_ = installed.lastIncludedIndex;
     lastIncludedTerm_ = installed.lastIncludedTerm;
-    snapshotBytes_ = std::move(encoded);
+    // M5.4（§8.3）：快照字节由 store 持有（文件），这里不再常驻整块编码。
     for (auto& kv : snapshotSendOffset_) kv.second = 0;  // restart peer sends
     // B9 (I4): commit/applied never move backwards. restore() rewound the state
     // machine to the boundary, so replay whatever is still committed above it.
@@ -1466,13 +1464,22 @@ bool RaftNode::approveSnapshotSend(int peer, const InstallSnapshotArgs& a) {
 RaftNode::PeerJob RaftNode::buildPeerJobLocked(int peer) {
   // 只构建作业；"能否发送/登记应答上下文"由 approve*Send() 在真正发送前完成（M5.3）。
   PeerJob job;
-  if (lastIncluded_ != kNoIndex && !snapshotBytes_.empty() &&
-      nextIndex_[peer] <= lastIncluded_) {
-    const uint64_t total = snapshotBytes_.size();
+  const uint64_t snapTotal =
+      (lastIncluded_ != kNoIndex && snapshots_ != nullptr)
+          ? snapshots_->installedBytes()
+          : 0;
+  if (snapTotal > 0 && nextIndex_[peer] <= lastIncluded_) {
+    const uint64_t total = snapTotal;
     uint64_t start = snapshotSendOffset_[peer];
     if (start >= total) start = 0;
     const uint64_t remaining = total - start;
     const uint64_t take = std::min<uint64_t>(cfg_.snapshotChunkBytes, remaining);
+    Bytes chunk;
+    // M5.4（§8.3）：只把这一块读进来（O(块)），不再常驻整块快照
+    if (!snapshots_->readInstalled(start, take, chunk)) {
+      job.skip = true;
+      return job;
+    }
     job.isSnapshot = true;
     job.snapshot.term = currentTerm_;
     job.snapshot.leaderId = cfg_.selfId;
@@ -1480,8 +1487,7 @@ RaftNode::PeerJob RaftNode::buildPeerJobLocked(int peer) {
     job.snapshot.lastIncludedTerm = lastIncludedTerm_;
     job.snapshot.offset = start;
     job.snapshot.done = (start + take >= total);
-    job.snapshot.data.assign(snapshotBytes_.begin() + start,
-                             snapshotBytes_.begin() + start + take);
+    job.snapshot.data = std::move(chunk);
   } else {
     job.append = buildAppendEntries(peer);
   }
@@ -1884,8 +1890,9 @@ void RaftNode::onInstallSnapshotReplyWithContext(
   }
 
   snapshotSendOffset_[peerId] = chunkEnd;  // M5.3：上下文来自闭包
-  if (!snapshotBytes_.empty() &&
-      snapshotSendOffset_[peerId] >= snapshotBytes_.size()) {
+  const uint64_t snapTotal =
+      snapshots_ != nullptr ? snapshots_->installedBytes() : 0;
+  if (snapTotal > 0 && snapshotSendOffset_[peerId] >= snapTotal) {
     // Transfer complete: the peer now has the snapshot.
     nextIndex_[peerId] = lastIncluded_ + 1;
     matchIndex_[peerId] = lastIncluded_;

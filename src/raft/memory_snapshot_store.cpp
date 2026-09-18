@@ -20,6 +20,7 @@ bool MemorySnapshotStore::save(const SnapshotData& data) {
   if (has_ && data.lastIncludedIndex <= data_.lastIncludedIndex) return false;
   data_ = data;
   has_ = true;
+  encoded_ = encodeSnapshotFile(data_);  // M5.4：供分块发送/切片读取
   recv_.clear();
   recvIndex_ = kNoIndex;
   recvTerm_ = kNoTerm;
@@ -70,7 +71,44 @@ bool MemorySnapshotStore::receiveChunk(Index lastIncludedIndex,
   }
   data_ = std::move(parsed);
   has_ = true;
+  encoded_ = encodeSnapshotFile(data_);
   return true;
+}
+
+// ---- M5.4（§8.3/§8.4）：内存适配器的流式/切片接口（语义与 File 版一致，便于对拍） ----
+bool MemorySnapshotStore::saveStreaming(const SnapshotView& view,
+                                        Index lastIncludedIndex,
+                                        Term lastIncludedTerm,
+                                        const Bytes& config) {
+  SnapshotData data;
+  data.lastIncludedIndex = lastIncludedIndex;
+  data.lastIncludedTerm = lastIncludedTerm;
+  data.config = config;
+  std::unique_ptr<SnapshotStream> st = view.stream();
+  Bytes buf;
+  while (st->next(buf, 1u << 20)) {
+    data.payload.insert(data.payload.end(), buf.begin(), buf.end());
+  }
+  return save(data);
+}
+
+uint64_t MemorySnapshotStore::installedBytes() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return encoded_.size();
+}
+
+bool MemorySnapshotStore::readInstalled(uint64_t offset, uint64_t len,
+                                        Bytes& out) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (len == 0 || offset + len > encoded_.size()) return false;
+  out.assign(encoded_.begin() + static_cast<ptrdiff_t>(offset),
+             encoded_.begin() + static_cast<ptrdiff_t>(offset + len));
+  return true;
+}
+
+uint64_t MemorySnapshotStore::recvProgress() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return recvEnd_;
 }
 
 }  // namespace raftkv::raft

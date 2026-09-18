@@ -27,7 +27,12 @@
 4. **可观测性与压测故事**：进程内指标（qps、p50/p99 写延迟、fsync 次数/耗时、组提交批大小、
    复制 lag、选举/快照次数、锁等待、Reactor 在途请求）+ perf/火焰图流程 + **同机 A/B 对比表**。
 
-### 1.2 验收口径（冻结）
+### 1.2 验收口径（冻结；**M5.5 收尾已修订为同机比值口径**，见 §15 v2.7 与 `docs/m5-bench.md` §3.7）
+
+> 下表是**冻结时的期望值**（绝对判据）。收尾时经用户决定改为**同机比值口径**：
+> p=1 要求 `M5 延迟 ≤ M4 延迟 × 1.2`、p=8/64 要求 `M5 吞吐 ≥ M4 吞吐 × 0.8`，
+> 且每次 `verify missing 0` 为硬门禁。原因见 `docs/m5-bench.md` §3.6：本机单次持久化
+> 提交下限 ≈ 8 ms，绝对目标隐含 "flush ≈ 1 ms" 的硬件。
 
 | 项 | 基线（`dc6c56a` 实测，见 §3） | M5 目标 | 判定方式 |
 |---|---|---|---|
@@ -341,7 +346,7 @@ TSan（全量 raft 用例 + `raft_perf_test`）必须 0 报告；注入用例：
 | **M5.1** | `metrics.{h,cpp}` + `status` 扩展（+ 可选 `/metrics`）+ bench 脚本参数化 + perf 权限处理 + **冻结 M4 基线** | 指标可脚本断言；`docs/m5-bench.md` 基线段落档；M1/raft 全绿 |
 | **M5.2** | 两段式持久化（§6 全部：follower ACK、no-op、I5 三处、compact 两处） | M5.A1–A4/A8 + M5.B1 通过；**锁内 fsync == 0**；`raft_fault`/`raft_snapshot_fault` `--repeat 50` 绿 |
 | **M5.3** | Reactor（§7）+ 同步引擎保留对照 | M5.A5/A6 + 挂起 peer/重连注入；**TSan 全绿**；pipeline=1 延迟显著下降 |
-| **M5.4** | §8 全部（批处理/no-op/流式快照/断点续传；滑动窗口条件触发） | M5.A8/B2/B3/B4；**pipeline=1 ≤8 ms/写** 且 **pipeline=64 ≥1200 qps** |
+| **M5.4** | §8 全部（批处理/no-op/流式快照/断点续传；滑动窗口条件触发） | M5.A8/B2/B3/B4；**同机比值口径**：p=1 延迟 ≤1.2×M4、p=8/64 吞吐 ≥0.8×M4，且每次 `missing 0` |
 | **M5.5** | A/B 对比表 + 火焰图 + README/roadmap + #4 独立评审 | `bench_m5_ab.sh` 判定全过 + 全部脚本 PASS + 对比表与方法学落档 |
 
 ## 13. 风险与对策
@@ -855,3 +860,38 @@ TSan（全量 raft 用例 + `raft_perf_test`）必须 0 报告；注入用例：
     不声称"性能目标达成"；它标记的是"M5 工程量完成、全部正确性门禁转绿、性能判据待安静机器复测"。
   * **默认引擎**：`sync`（reactor 已可用、故障注入与端到端全绿、丢写根因已修并有专项回归用例，
     但性能上并不优于 sync，且需在安静机器上再复测一轮）。
+
+- **v2.7**（补 §8.3 流式快照与 §8.4 跨进程断点续传；并把绝对判据修订为**同机比值口径**）：
+  1. **§8.3 快照流式序列化（已实现）**：
+     * `state_machine.h` 新增 `SnapshotStream`，`SnapshotView::stream()` 有默认实现
+       （把 `serialize()` 当单块吐出，旧实现零改动即可编译）。
+     * `KvSnapshotStream`（`kv_state_machine.cpp`）按 `[lastApplied][kvCount][条目…][dedupCount][去重…]`
+       逐条产出，**超大单条记录用 carry-over 拆到多次 next()**，因此 `next()` 的返回块严格
+       ≤ `maxChunk`；有 B 组用例断言"分块流 == `serialize()` 逐字节相同"。
+     * `FileSnapshotStore::saveStreaming()` **两趟走流**：第一趟只累计 `payloadLen` 与增量 CRC32
+       （新增 `crc32Update`），第二趟逐块写盘 + `fsync` + `rename` + `fsyncDir`。落盘文件与
+       `encodeSnapshotFile()` **逐字节一致**（用例实测），I14 不破。
+     * 新增 `installedBytes()` / `readInstalled(offset,len)`：leader 发送 InstallSnapshot 分块时
+       **按需读取文件切片**（O(块)），`RaftNode` 因此**删除了常驻的 `snapshotBytes_`**
+       （启动加载、maybeSnapshot、onInstallSnapshot 三处都不再 materialize 整块编码）。
+     * 仍为 O(状态) 的两处（已在此记录，不再算"未实现偏差"）：`snapshotView()` 在 `mu_` 下做的
+       状态**拷贝**（L8 要求序列化在锁外，无法省），以及接收端安装时 `decodeSnapshotFile` 需要
+       整块 payload 交给 `sm_.restore()`。即快照路径峰值从 ~3× 状态降到 ~1× 状态 + 1 块。
+  2. **§8.4 跨进程断点续传（已实现）**：
+     * `.recv` 的续传元数据放在**尾部**：`[payload: receivedLen] | "RKR1" | idx(8) | term(8) |
+       receivedLen(8) | crcSoFar(4)`。每收一块就更新尾部（长度 + 增量 CRC），
+       **载荷因此保持从偏移 0 连续**——安装时只需 `ftruncate` 掉尾部再 `rename`，
+       不需要为"去掉头部"再复制一份整块 payload。
+     * `FileSnapshotStore` 构造时即尝试从尾部恢复 `(idx, term, receivedLen, crc)`，
+       `receiveChunk()` 因此能在**新进程**里从断点继续（`recvProgress()` 可读进度）；
+       重传块仍是幂等成功；偏移对不上则拒绝并要求 leader 从 0 重来。
+     * 用例 `RaftSnapshotResume.ContinuesAfterStoreRestart`：半个文件 → 析构（=进程重启）→
+       新实例 `recvProgress()==半个文件` → 从断点续完 → `load()` 载荷完整；另有两条对照
+       （重启后换更新的快照从头传仍可安装；错误偏移必须被拒）。
+  3. **验收口径修订（用户决定）**：绝对判据 `p=1 ≤8 ms/写`、`p=64 ≥1200 qps` 改为**同机比值口径**：
+     `p=1: M5 延迟 ≤ 1.2×M4`；`p=8/64: M5 吞吐 ≥ 0.8×M4`；每次 `verify missing 0` 为硬门禁。
+     `scripts/bench_m5_ab.sh` 的判定逻辑已改（并输出 M5/M4 两个比值列），`docs/m5-bench.md` §3.7
+     记录理由与对照（§3.6 的微基准：本机单次持久化提交 ≈8 ms，绝对目标隐含 flush≈1 ms 的硬件）。
+  4. **本轮验证**：单测 **90/90**（原 86 + 4 条新增：流式保真 2、切片读取 1、跨重启续传 1）；
+     `raft_snapshot_e2e` / `raft_snapshot_fault --repeat 20` / `raft_e2e` 全部 PASS（这三条脚本
+     正好覆盖快照生成、分块传输、安装与重启路径）。
