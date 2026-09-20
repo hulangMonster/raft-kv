@@ -10,9 +10,14 @@
 #
 # 用法：
 #   scripts/bench_m5_cell.sh --eng m5 --pipeline 8 --n 2000
-#   scripts/bench_m5_cell.sh --eng m5 --pipeline 64 --n 2000 -- --transport=reactor
+#   scripts/bench_m5_cell.sh --eng m5 --nodes 10 --pipeline 8 --n 500      # 节点规模（§3.12）
+#   scripts/bench_m5_cell.sh --eng m5 --nodes 10 --pipeline 1 --n 200 -- --transport=reactor
 #   scripts/bench_m5_cell.sh --eng m4 --pipeline 8 --n 2000 --strace-leader
 #   scripts/bench_m5_cell.sh --eng m5 --pipeline 1 --n 500 --threshold 5000
+#
+# --nodes N：起 N 个节点回环集群（默认 3）。**所有节点都写进 seed 的 `--peers`**，即全部是
+#   投票成员 —— 这正是 §3.12"节点规模"那一节的口径（不做成员变更，只比不同 N 的稳态）。
+#   注意：单机跑 N 个节点会共享 CPU 与磁盘，N 大时绝对值只作趋势参考。
 #
 # 退出码：0 = 该格 verify missing 0；1 = 无 leader / 缺写；2 = 参数或环境错（可进 CI 门禁）。
 set -uo pipefail
@@ -20,6 +25,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASE_REF=dc6c56a                 # M4 基线（与 bench_m5_ab.sh 一致）
 ENG=m5
+NODES=3
 PIPELINE=8
 N=2000
 THRESHOLD=5000
@@ -34,6 +40,7 @@ usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --eng)        ENG="$2"; shift 2 ;;
+    --nodes)      NODES="$2"; shift 2 ;;
     --pipeline)   PIPELINE="$2"; shift 2 ;;
     --n)          N="$2"; shift 2 ;;
     --threshold)  THRESHOLD="$2"; shift 2 ;;
@@ -57,12 +64,19 @@ if [[ ! -x "$BIN/raftkv_raft_node" ]]; then
   [[ "$ENG" == m4 ]] && echo "  m4 基线 worktree 由 scripts/bench_m5_ab.sh 自动创建（/tmp/m5base-$BASE_REF），"                             "或用 --m4-bin 指向别处的构建" >&2
   exit 2
 fi
+if [[ "$NODES" -lt 1 || "$NODES" -gt 50 ]] 2>/dev/null; then
+  echo "--nodes 需要 1..50 的整数（收到 $NODES）" >&2; exit 2
+fi
 [[ -z "$DATAROOT" ]] && DATAROOT="/tmp/raftkv-cell-$$"
 command -v strace >/dev/null 2>&1 || { [[ $STRACE == 1 ]] && { echo "--strace-leader 需要 strace" >&2; exit 2; }; }
 
-BASE=$(( 45000 + RANDOM % 2000 ))
-PEERS="1=127.0.0.1:$BASE,2=127.0.0.1:$((BASE+1)),3=127.0.0.1:$((BASE+2))"
-DIR="$DATAROOT/$ENG-p$PIPELINE"
+BASE=$(( 45000 + RANDOM % 500 ))   # N ≤ 50 时端口不越界（45000..45499 + N）
+PEERS=""
+for id in $(seq 1 "$NODES"); do
+  PEERS="$PEERS$id=127.0.0.1:$((BASE+id-1))"
+  [[ $id -lt $NODES ]] && PEERS="$PEERS,"
+done
+DIR="$DATAROOT/$ENG-n$NODES-p$PIPELINE"
 rm -rf "$DIR"; mkdir -p "$DIR"
 PIDS=()
 
@@ -87,12 +101,12 @@ start_node() {  # <id>
   PIDS+=("$!")
 }
 
-for id in 1 2 3; do start_node "$id"; done
+for id in $(seq 1 "$NODES"); do start_node "$id"; done
 
 CLI="$BIN/raftkv_raft_cli --peers $PEERS --host 127.0.0.1"
 LPORT=0
-for _ in $(seq 1 200); do
-  for id in 1 2 3; do
+for _ in $(seq 1 400); do
+  for id in $(seq 1 "$NODES"); do
     if $CLI --port $((BASE+id-1)) status 2>/dev/null | grep -q 'role=leader'; then
       LPORT=$((BASE+id-1)); break
     fi
@@ -136,13 +150,13 @@ BUSY=$(awk -v x="$stat_before" -v y="$stat_after" 'BEGIN{
   if (dt>0) printf "%.0f", 100*(dt-di)/dt; else print -1 }')
 FIELDS='(role|term|commit_index|last_applied|snapshot_index|fsync_calls|fsync_ms|batch_avg|batch_max|repl_lag_max|elections_total|snapshots_total|lat_p50_us|lat_p99_us|lock_wait_us_total|lock_wait_max|inflight_rpc)=[0-9a-z]+'
 
-echo "CELL eng=$ENG pipeline=$PIPELINE n=$N ms=$MS ms_per_write=$(awk -v m="$MS" -v n="$N" 'BEGIN{printf "%.3f", m/n}') qps=$QPS verify=[$VERIFY]"
-for id in 1 2 3; do
+echo "CELL eng=$ENG nodes=$NODES pipeline=$PIPELINE n=$N ms=$MS ms_per_write=$(awk -v m="$MS" -v n="$N" 'BEGIN{printf "%.3f", m/n}') qps=$QPS verify=[$VERIFY]"
+for id in $(seq 1 "$NODES"); do
   tag=FOLLOWER; [[ $id -eq $LEADER_ID ]] && tag=LEADER
   echo "$tag id=$id $($CLI --port $((BASE+id-1)) status 2>/dev/null | tr '\n' ' ' | grep -oE "$FIELDS" | tr '\n' ' ')"
 done
 LCPU_S=$(awk -v a="$lcpu_before" -v b="$lcpu_after" 'BEGIN{printf "%.2f", (b-a)/100}')
-echo "RESOURCE leader_cpu_s=$LCPU_S all_nodes_cpu_s=$CPU_S us_per_write_3nodes=$USPW machine_busy_pct=$BUSY"
+echo "RESOURCE leader_cpu_s=$LCPU_S all_nodes_cpu_s=$CPU_S us_per_write_allnodes=$USPW machine_busy_pct=$BUSY"
 
 if [[ $STRACE == 1 ]]; then
   ALL=$(wc -l < "$DIR/strace-leader.txt" 2>/dev/null || echo 0)

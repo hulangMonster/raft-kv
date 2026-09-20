@@ -350,6 +350,7 @@ flusher 的副产品，一并消失。
 四类行；`verify missing != 0` 时退出码 1，可直接进 CI。M4 基线 worktree 由 `bench_m5_ab.sh` 生成）：
 
 ```bash
+# （默认 --nodes 3；节点规模对照见 §3.12）
 ./scripts/bench_m5_cell.sh --eng m5 --pipeline 8  --n 20000   # 表里 p=8 的两行
 ./scripts/bench_m5_cell.sh --eng m4 --pipeline 8  --n 20000
 ./scripts/bench_m5_cell.sh --eng m5 --pipeline 64 --n 2000    # 表里 p=64 的两行
@@ -368,7 +369,8 @@ flusher 的副产品，一并消失。
 
 **方法**：单台 VM（8 核、loopback、同一块盘）；**所有节点都是 seed 里的投票成员**；
 `--snapshot-threshold 5000`；预热 200 写；每格跑 `verify`，**全部 `missing 0`**。
-（多节点 runner 是本轮的临时脚本、未入库；仓库里的 `scripts/bench_m5_cell.sh` 是固定 3 节点版本。）
+（多节点 runner 见 `scripts/bench_m5_cell.sh --nodes N`：**所有节点都写进 seed 的 `--peers`**，即全部是
+投票成员 —— 正是本节的稳态口径；复现命令见本节末。）
 
 **① `sync` 随 N 退化**
 
@@ -402,6 +404,17 @@ p=64 在 3 节点时 sync 反超 1.10×，到 10 节点时 reactor 反超 1.36×
 
 **边界**：全部节点共享 8 核与同一块盘、n 偏小（200/500）、单机 loopback ⇒ 本文只支持
 "实现内部扇出成本随 N 近似线性、reactor 把它解耦"这个结论，**不等于多机 10 节点集群的性能**。
+
+**复现命令**（`scripts/bench_m5_cell.sh --nodes N`，默认 3、范围 1..50；每格 `verify missing 0` 才退 0）：
+
+```bash
+for N in 3 5 10; do ./scripts/bench_m5_cell.sh --nodes $N --pipeline 8  --n 500 | grep '^CELL'; done
+for N in 3 5 10; do ./scripts/bench_m5_cell.sh --nodes $N --pipeline 1  --n 200 | grep '^CELL'; done
+for N in 3 5 10; do ./scripts/bench_m5_cell.sh --nodes $N --pipeline 8  --n 500 -- --transport=reactor | grep '^CELL'; done
+```
+
+（本地复跑对账：N=3/5/10 的 p=8 分别 466 / 336 / 137 qps，N=10 p=1 reactor 11.2 ms/写、89 qps ——
+与表内数值同量级。）
 
 **引擎复测（P2a 之后；同一轮交替，n=500/2000/2000，每格 `missing 0`）**：
 
