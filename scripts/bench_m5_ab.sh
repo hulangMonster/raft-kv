@@ -38,10 +38,17 @@ RAW="$LOGDIR/raw-$(date +%s).txt"
 echo "# m5 A/B raw log  $(date)" > "$RAW"
 echo "# machine: $(nproc) cores, load=$(cut -d' ' -f1 /proc/loadavg), ref=$BASE_REF, threshold=$THRESHOLD, reps=$REPS, quick=$QUICK" >> "$RAW"
 
+# 基线 worktree：对"残留注册 / 半删除目录"要健壮——否则读者重跑会撞
+# "worktree add failed"（git 仍注册着已被 /tmp 清理掉的路径）。
 M4SRC="/tmp/m5base-$BASE_REF"
-if [[ ! -d "$M4SRC" ]]; then
+if [[ -d "$M4SRC" && -f "$M4SRC/CMakeLists.txt" ]]; then
+  : # 已有可用基线 worktree，直接用
+else
+  git -C "$ROOT" worktree prune >/dev/null 2>&1 || true
+  rm -rf "$M4SRC"
   git -C "$ROOT" worktree add --detach "$M4SRC" "$BASE_REF" >/dev/null 2>&1 || {
-    echo "worktree add failed for $BASE_REF" >&2; exit 1; }
+    echo "worktree add failed for $BASE_REF（确认该 commit 在本地存在，或用 --base-ref 指定）" >&2
+    exit 1; }
 fi
 echo "== building baseline $BASE_REF =="
 cmake -S "$M4SRC" -B "$M4SRC/build" -DCMAKE_BUILD_TYPE=Release >/dev/null
