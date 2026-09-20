@@ -194,13 +194,24 @@ M5 的墙钟代价换来的是"零丢写 + 锁内零 fsync + Reactor + 可观测
 顺带 `batch_avg` 由 1 升到 4~8（组提交一并变好）。§3.9 的"并行扇出更差"与 §3.10 的"唤醒机制"结论
 据此作废。
 
-**(4) 默认引擎仍是 `sync`（P2a 后重测过口径）。** Reactor（epoll）引擎端到端与故障注入全绿、
-丢写根因已修并有回归用例。同轮交替重测（发布内容、n=500/2000/2000、每格 `missing 0`）：
-p=1 **reactor 快 1.17×**（4.87 vs 5.69 ms/写）、p=8 **打平**（514 vs 511 qps）、
-p=64 **sync 快 1.38×**（2317 vs 1676 qps）。⇒ 低并发 reactor 略优、**高并发 sync 明显更优**，
-默认保持 `sync`；只要低并发延迟时显式 `--transport=reactor` 即可。
-（P2a 之前"reactor 在 p=8 领先 2.06×"的对照已作废——那时 sync 还处在多个 flusher 抢传输锁的状态，
-见 `docs/m5-bench.md` §3.11。）
+**(4) 引擎选择：3 节点默认 `sync`，节点数 ≥5 请改用 `reactor`（2026-09-20 实测）。**
+Reactor（epoll）引擎端到端与故障注入全绿、丢写根因已修并有回归用例。同轮交替实测
+（每格 `verify missing 0`）：
+
+| 场景 | `sync` | `reactor` | 结论 |
+|---|---|---|---|
+| 3 节点 p=1 | 5.69 ms/写 | 4.87 ms/写 | reactor 1.17× |
+| 3 节点 p=8 | 511 qps | 514 qps | 打平 |
+| 3 节点 p=64 | **2317 qps** | 1676 qps | sync 1.38× |
+| 10 节点 p=1 | 44.6 ms/写 | **11.1 ms/写** | reactor **4.1×** |
+| 10 节点 p=8 | 136 qps | **413 qps** | reactor **3.0×** |
+| 10 节点 p=64 | 836 qps | **1139 qps** | reactor 1.36× |
+
+⇒ **sync 的每写延迟随节点数线性增长**（p=1 时 3/5/10 节点 = 11.3 / 18.5 / 44.6 ms，因为它逐个 peer
+阻塞等回复、一把锁包住整趟往返），**reactor 的非阻塞发送把这条延迟压成常数**（≈11 ms 不随 N 变）
+—— 所以节点越多 reactor 越占优；N=10 时 sync 还出现了 leader 变更（`elections_total=2`），
+reactor 稳定。默认仍是 `sync`（3 节点下高并发更省 CPU），**计划跑 ≥5 节点就显式 `--transport=reactor`**。
+（数据、方法与边界见 `docs/m5-bench.md` §3.12；P2a 之前"reactor 在 p=8 领先 2.06×"那类对照已作废。）
 
 **(5) 未做的（非本阶段目标）**：分片锁/并发哈希、perf 火焰图（本机 `perf_event_paranoid=4`）、gRPC 接口层。
 
@@ -247,6 +258,9 @@ p=64 **sync 快 1.38×**（2317 vs 1676 qps）。⇒ 低并发 reactor 略优、
 - **可观测性**：`status` 全量指标 + `metrics` 端点（只读，不参与任何正确性判定）
 - **P2a 复制流水线修正（p=8/64 达标）**：flusher 等本批两次 `sendAppendEntries` 都发出后再放开
   `syncInFlight_`，消除"多个 flusher 并发在 `TcpTransport` 全局锁上排队"（M5.A16 守门）。
+- **节点规模与引擎选择（3/5/10 节点实测）**：复制扇出是随 N 的主要成本——`sync` 逐 peer 阻塞发送
+  ⇒ p=1 每写延迟 11.3→18.5→44.6 ms；`reactor` 非阻塞 ⇒ ≈11 ms 不随 N 变（N=10 时 p=1 快 4.1×、p=8 快 3.0×）。
+  **N ≥ 5 建议 `--transport=reactor`**；N=10 单机上 sync 出现过 leader 变更而 reactor 稳定（§3.12）
   同机比值：p=8 **0.47×→1.34×**、p=64 **~1.06×→2.20×**、p=1 延迟 **1.08×→1.03×**（详见 [docs/m5-bench.md](docs/m5-bench.md) §3.11）
 - 测试：`raftkv_raft_tests` **94/94**（含 A13/A14/A15/A16 四个 P2a 阶段新增的 RED→GREEN 用例）、
   TSan **94/94 且 0 报告**、干净重建 0 warning、`raft_e2e.sh` + `raft_fault/snapshot_fault/membership_fault`

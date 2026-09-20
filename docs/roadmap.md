@@ -110,6 +110,9 @@
   （`syncInFlight_` 在 fsync 返回即放开 → 多个 flusher 并发发送）：peer=2 的发送"拿到锁之前"中位等
   **11.5 ms**，而一次真正往返 **<1 ms**。修法：flusher 等本批两次 `sendAppendEntries` 都发出后再放开该窗口
   （M5.A16 守门）。见 `m5-bench.md` §3.11 与提交 `ab7bd57`
+- ✅ **节点规模与引擎选择（3/5/10 节点实测，2026-09-20）**：扇出随 N 线性增长（sync p=1 每写
+  11.3→18.5→44.6 ms），reactor 非阻塞把它压成常数（≈11 ms）⇒ **N ≥ 5 建议 `--transport=reactor`**；
+  N=10 单机上 sync 出现过 leader 变更而 reactor 稳定。数据见 `m5-bench.md` §3.12
 - ⬜ 未做（非本里程碑目标）：分片锁 / 并发哈希、Node Exporter 风格指标端点、gRPC 接口层
 
 ## 贯穿性工程要求
