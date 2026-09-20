@@ -344,7 +344,20 @@ M5 为了 I9（锁内 fsync==0）把 fsync 移出锁，代价就是 34+ 线程�
 | 64 | 2000 | 2129 qps | 967 qps | **2.20×** | ~1.06× |
 
 副产物：leader `batch_avg` 由 p=8 的 1 升到 4~6、p=64 升到 8（max 63）——"批成形差"原本是并发
-flusher 的副产品，一并消失。门禁：单测 **94/94**、TSan **94/94 且 0 报告**（`tests/tsan.supp`
+flusher 的副产品，一并消失。
+
+**复现命令**（`scripts/bench_m5_cell.sh` —— 一次一格，输出 `CELL / LEADER / FOLLOWER / RESOURCE`
+四类行；`verify missing != 0` 时退出码 1，可直接进 CI。M4 基线 worktree 由 `bench_m5_ab.sh` 生成）：
+
+```bash
+./scripts/bench_m5_cell.sh --eng m5 --pipeline 8  --n 20000   # 表里 p=8 的两行
+./scripts/bench_m5_cell.sh --eng m4 --pipeline 8  --n 20000
+./scripts/bench_m5_cell.sh --eng m5 --pipeline 64 --n 2000    # 表里 p=64 的两行
+./scripts/bench_m5_cell.sh --eng m4 --pipeline 64 --n 2000
+./scripts/bench_m5_cell.sh --eng m5 --pipeline 1  --n 500     # p=1 延迟档
+./scripts/bench_m5_cell.sh --eng m5 --pipeline 64 --n 2000 -- --transport=reactor   # 引擎对照（§3.11 引擎表）
+./scripts/bench_m5_cell.sh --eng m5 --pipeline 8  --n 2000 --strace-leader          # leader fsync 计数（§3.11 归因证据）
+```门禁：单测 **94/94**、TSan **94/94 且 0 报告**（`tests/tsan.supp`
 按同一 libstdc++ 论证补了 `condition_variable_any::wait_until` 变体）、`raft_e2e.sh` 与
 `raft_fault / raft_snapshot_fault / raft_membership_fault` 各 10 轮全部 PASS。
 

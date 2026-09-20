@@ -116,6 +116,7 @@ TSAN_OPTIONS=suppressions=tests/tsan.supp setarch "$(uname -m)" -R ./build-tsan/
 ```bash
 ./scripts/bench_m5_ab.sh --repeats 3     # M4 基线(dc6c56a) vs 当前工作区，同轮交替、3 次取中位数
 ./scripts/bench_m5_ab.sh --quick         # 快速冒烟（1 次）
+./scripts/bench_m5_cell.sh --eng m5 --pipeline 8 --n 2000   # 单格诊断：per-node fsync/批量/锁等待/CPU（§3.11 的复现口）
 ./scripts/bench_group_commit.sh          # 组提交 / 批量的观察脚本
 # 单次持久化提交延迟微基准（与 raftkv 无关，用于判断硬件下限）
 g++ -O2 -std=c++17 -o /tmp/fsbench scripts/fsbench_commit_latency.cpp && /tmp/fsbench
