@@ -1,1 +1,0 @@
-/usr/bin/c++ -O2 -g -DNDEBUG CMakeFiles/raftkv_raft_node.dir/src/main_raft_node.cpp.o -o bin/raftkv_raft_node  libraftkv_raft.a 

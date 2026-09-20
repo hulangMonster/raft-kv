@@ -1,11 +1,13 @@
-build/
+# 所有构建目录：每个配置一个（build / build-tsan / build-asan / build-final ...）。
+# 必须用通配而不是逐个枚举——枚举漏一个，git add -A 就会把构建产物提交进去
+# （本项目真实发生过两次：build-tsan/ 与 build-final+build-q）。
+build*/
 cmake-build-*/
 *.o
 *.a
 core.*
 *.log
 .cache/
-build-tsan/
-build-asan/
-# M1 单机版默认数据目录（README 快速开始用的 ./data）；运行期产物不入库
+
+# M1 单机版默认数据目录（README 快速启动用的 ./data）；运行期产物不入库
 data/

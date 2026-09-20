@@ -1,1 +1,0 @@
-/usr/bin/c++ -O2 -g -DNDEBUG CMakeFiles/raftkv_server.dir/src/main_server.cpp.o -o bin/raftkv_server  libraftkv_core.a 

@@ -1,1 +1,0 @@
-/usr/bin/c++ -O2 -g -DNDEBUG CMakeFiles/raftkv_raft_cli.dir/src/main_raft_client.cpp.o -o bin/raftkv_raft_cli  libraftkv_raft.a 
