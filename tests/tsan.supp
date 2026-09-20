@@ -19,5 +19,11 @@
 # 抑制范围刻意收窄到"栈里出现 condition_variable_any::notify_all"的这两类告警，
 # 其余任何 race / mutex / deadlock 依旧会报出来（例如 A11 早先真正抓到的
 # allocation-size-too-big，就是测试桩的数据竞争，已修）。
+# M5.7（P2a 收尾）：同一族误报的**等待侧**变体。新增的并发用例（A15/A16）让 TSan 在
+# `condition_variable_any::wait_until`（libstdc++ condition_variable:307-331 的 `__mutex`/`_Unlock`
+# 组合，析构顺序与上面完全一致）上画出同一条不存在的边；论证不变，抑制同样收窄到"栈里出现
+# condition_variable_any::wait_until"的这两类告警。
 mutex:condition_variable_any::notify_all
 deadlock:condition_variable_any::notify_all
+mutex:condition_variable_any::wait_until
+deadlock:condition_variable_any::wait_until
