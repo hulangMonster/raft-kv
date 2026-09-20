@@ -193,8 +193,13 @@ M5 的墙钟代价换来的是"零丢写 + 锁内零 fsync + Reactor + 可观测
 顺带 `batch_avg` 由 1 升到 4~8（组提交一并变好）。§3.9 的"并行扇出更差"与 §3.10 的"唤醒机制"结论
 据此作废。
 
-**(4) 默认引擎仍是 `sync`。** Reactor（epoll）引擎端到端与故障注入全绿、丢写根因已修并有回归用例，
-但性能不优于 sync，故只作为 `--transport=reactor` 可选。
+**(4) 默认引擎仍是 `sync`（P2a 后重测过口径）。** Reactor（epoll）引擎端到端与故障注入全绿、
+丢写根因已修并有回归用例。同轮交替重测（发布内容、n=500/2000/2000、每格 `missing 0`）：
+p=1 **reactor 快 1.17×**（4.87 vs 5.69 ms/写）、p=8 **打平**（514 vs 511 qps）、
+p=64 **sync 快 1.38×**（2317 vs 1676 qps）。⇒ 低并发 reactor 略优、**高并发 sync 明显更优**，
+默认保持 `sync`；只要低并发延迟时显式 `--transport=reactor` 即可。
+（P2a 之前"reactor 在 p=8 领先 2.06×"的对照已作废——那时 sync 还处在多个 flusher 抢传输锁的状态，
+见 `docs/m5-bench.md` §3.11。）
 
 **(5) 未做的（非本阶段目标）**：分片锁/并发哈希、perf 火焰图（本机 `perf_event_paranoid=4`）、gRPC 接口层。
 

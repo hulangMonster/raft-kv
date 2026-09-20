@@ -344,3 +344,16 @@ flusher 的副产品，一并消失。门禁：单测 **94/94**、TSan **94/94 �
 按同一 libstdc++ 论证补了 `condition_variable_any::wait_until` 变体）、`raft_e2e.sh` 与
 `raft_fault / raft_snapshot_fault / raft_membership_fault` 各 10 轮全部 PASS。
 
+**引擎复测（P2a 之后；同一轮交替，n=500/2000/2000，每格 `missing 0`）**：
+
+| pipeline | reactor | sync | 结论 |
+|---|---|---|---|
+| 1 | 4.87 ms/写（103 qps） | 5.69 ms/写（88 qps） | reactor 快 **1.17×** |
+| 8 | 514 qps（batch_avg 2 / max 7） | 511 qps（batch_avg 4 / max 8） | **打平** |
+| 64 | 1676 qps（batch_avg 6 / max 57） | **2317 qps**（batch_avg 8 / max 64） | sync 快 **1.38×** |
+
+⇒ §3.3 的"reactor 在 p=1/p=8 明显更快（8: 2.06×）、p=64 反而慢"是 **P2a 之前**的对照（当时 sync
+还在"多个 flusher 抢 `TcpTransport` 全局锁"的状态），其 p=8 结论**已作废**；现在的口径是
+**低并发 reactor 略优、高并发 sync 更优**，默认引擎保持 `sync`（低并发要 1.17× 就显式
+`--transport=reactor`）。
+
