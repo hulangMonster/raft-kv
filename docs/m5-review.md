@@ -37,22 +37,25 @@
   → **下限 ≈8 ms**。Raft 必须 durable 后才 ack，所以 `p=1 ≤8 ms/写` 等价于要求
   "提交 + 复制往返"不花时间 —— 物理不可达（冻结基线期 M4 自身也只有 16.4 ms/写）。
 * **口径改为同机比值**（用户决定，`m5-bench.md` §3.7）：p=1 延迟 ≤1.2×M4；p=8/64 吞吐 ≥0.8×M4；
-  每次 `verify missing 0` 为硬门禁。实测：**p=1 达标（1.11×）**；p=8/64 **未达标（0.60×/0.57×）**。
+  每次 `verify missing 0` 为硬门禁。实测（当轮）：**p=1 达标（1.11×）**；p=8/64 **未达标（0.60×/0.57×）**。
+  > **后续（P2a，2026-09-20）**：根因改判为**复制发送段排队**（不是本节下文说的"唤醒 + `mu_` 争用"）；
+  > 修复后 p=8 **1.34×**、p=64 **2.20×**、p=1 延迟 **1.03×**。见 `m5-bench.md` §3.11 与提交 `ab7bd57`。
 * **同一轮 A/B 里 M4 基线丢了 `missing 5`/`missing 9`，而 M5 全绿** —— M5 的墙钟代价换来的是
   零丢写 + 锁内零 fsync + reactor 引擎 + 可观测性。
 * **p=8/64 差距的定量定位**（§3.9/§3.10）：单批内部 fsync 8ms + 等 ack 13ms + 发送 14ms + 间隙 3ms
   ≈38 ms；整轮里 **fsync 只占 ~10%**；剩余约 40% 墙钟在"批与批之间"的**唤醒 + 单把全局锁争用**
   （34+ proposer 抢 `mu_`）。M4 之所以快，是因为它把 fsync 关在锁内 —— 那是个**全局串行点**，
   没有 thundering herd。这是"I9（锁内不做 IO）"与"高并发吞吐"的结构性张力，不是调参能解决的。
-* **下一步（已写明，未做）**：改唤醒机制（按批的条件变量/事件计数，把"批成形"从抢锁里拆出来），
-  而不是继续动复制路径（并行扇出实测更差：p=64 252→138 qps，已回退）。
+* ~~**下一步**：改唤醒机制（按批的条件变量/事件计数，把"批成形"从抢锁里拆出来）~~ —— **已由 P2a 取代**：
+  实测证明瓶颈在"复制发送段的排队"（`syncInFlight_` 放开过早 → 并发 flusher 抢 `TcpTransport` 全局锁），
+  与唤醒机制无关；§3.9 的"并行扇出更差"也不构成反证（那次缺背压、会重复构建 AE）。
 
 ## 4. 交付物与验收（当前 HEAD）
 
 | 项 | 状态 |
 |---|---|
 | 文档 | `m5-design.md`（v1.0→v2.8 修订记录）、`m5-prerequisites.md`（I9–I17/L12–L18）、`m5-bench.md`（§1 冻结基线 → §3.10）、本复盘 |
-| 测试 | 单测 **90/90**（M5.A1–A12、R1–R6 等）；TSan **0 报告**（`tests/tsan.supp` 窄抑制 libstdc++ `condition_variable_any` 误报，含出处论证） |
-| 脚本 | 9 次 e2e/fault 运行 PASS（sync 侧 5 + reactor 侧 4）；`missing 0` 19/19 轮 |
+| 测试 | 单测 **94/94**（M5.A1–A16、R1–R6 等）；TSan **94/94 且 0 报告**（`tests/tsan.supp` 窄抑制 libstdc++ `condition_variable_any` 的 `notify_all`/`wait_until` 两族误报，含出处论证） |
+| 脚本 | e2e/fault 运行全 PASS（sync 侧 5 + reactor 侧 4）；P2a 后复跑 `raft_e2e` + `raft_fault/snapshot_fault/membership_fault` 各 10 轮 PASS，A/B 每格 `missing 0` |
 | 构建 | 干净重建 0 warning |
 | 交付 | tag `m5-performance`（注释写明未达标项与偏差）、已 push、本地 clone 已同步 |

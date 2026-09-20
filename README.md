@@ -92,7 +92,7 @@ $CLI                                       # 不带命令 = 交互 REPL（put/ge
 
 ```bash
 ./build/bin/raftkv_tests          # M1：13/13（零依赖自测）
-./build/bin/raftkv_raft_tests     # M2–M5：90/90（gtest；含 A 组契约与 R 组 Reactor 用例）
+./build/bin/raftkv_raft_tests     # M2–M5：94/94（gtest；含 A 组契约与 R 组 Reactor 用例）
 
 # 端到端 + 故障注入（脚本会自己起/停节点、随机端口、每轮 verify missing 0）
 ./scripts/raft_e2e.sh                              # 3 节点基本路径
@@ -239,7 +239,12 @@ M5 的墙钟代价换来的是"零丢写 + 锁内零 fsync + Reactor + 可观测
 - **流式快照（§8.3）**：`SnapshotView::stream()` 分块产出（超大单条 carry-over，块严格 ≤ maxChunk）；`saveStreaming()` 两趟走流（先算 payloadLen/增量 CRC32，再分块写 + fsync + rename + fsyncDir），落盘与整块编码**逐字节一致**；leader 发 InstallSnapshot 时 `readInstalled()` 按需读文件切片（O(块)，不再常驻整块）
 - **跨进程断点续传（§8.4）**：`.recv` 尾部携带 `RKR1|idx|term|receivedLen|crcSoFar`（每块更新）；**新进程**从尾部恢复进度续传；安装时 `ftruncate` 掉尾部再 `rename`
 - **可观测性**：`status` 全量指标 + `metrics` 端点（只读，不参与任何正确性判定）
-- 测试：`raftkv_raft_tests` **90/90**、TSan 0 报告、干净重建 0 warning、9 次 e2e/fault 脚本运行全 PASS、`missing 0` 19/19 轮
+- **P2a 复制流水线修正（p=8/64 达标）**：flusher 等本批两次 `sendAppendEntries` 都发出后再放开
+  `syncInFlight_`，消除"多个 flusher 并发在 `TcpTransport` 全局锁上排队"（M5.A16 守门）。
+  同机比值：p=8 **0.47×→1.34×**、p=64 **~1.06×→2.20×**、p=1 延迟 **1.08×→1.03×**（详见 [docs/m5-bench.md](docs/m5-bench.md) §3.11）
+- 测试：`raftkv_raft_tests` **94/94**（含 A13/A14/A15/A16 四个 P2a 阶段新增的 RED→GREEN 用例）、
+  TSan **94/94 且 0 报告**、干净重建 0 warning、`raft_e2e.sh` + `raft_fault/snapshot_fault/membership_fault`
+  各 10 轮全 PASS、A/B 每格 `missing 0`
 - 复盘（面试口径：六个真 bug 的定位/根因/回归 + 两次负结果 + 方法论）见 **[docs/m5-review.md](docs/m5-review.md)**
 
 ---
