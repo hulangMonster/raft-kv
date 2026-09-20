@@ -46,7 +46,7 @@ cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_TSAN=ON && c
 ### 2. 跑单机版（M1：KV + WAL 崩溃恢复）
 
 ```bash
-# 终端 1：起服务（每次写都 fsync；--no-sync 可关掉做纯内存压测）
+# 终端 1：起服务（每次写都 fsync；--no-sync 可关掉做纯内存压测；./data 已在 .gitignore 中）
 ./build/bin/raftkv_server --port 9527 --workers 4 --data-dir ./data
 
 # 终端 2：
