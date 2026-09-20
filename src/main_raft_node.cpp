@@ -282,18 +282,16 @@ int main(int argc, char** argv) {
   std::string peersArg;
   std::string dataDir;
   bool lockWaitMetrics = false;  // M5.1: 打开锁等待计时（默认关，零开销）
-  // M5.3：默认仍为 **sync**。reactor 引擎的数据层已修好（`fill 20000 --pipeline 64` 连续 3 轮
-  // `verify missing 0`），但把它设为默认后 e2e/故障注入出现失败（`raft_snapshot_e2e`、
-  // `raft_membership_e2e` 的 verify、`raft_fault --repeat 50` 的 iter 32 NOT_LEADER），
-  // 日志显示节点进程消失（cannot reach）—— 与压测中观察到的间歇性 SIGSEGV 相关。
-  // 在崩溃定位并修复之前，默认保持 M4 已验证的 sync；reactor 用 --transport=reactor 显式开启。
-  // M5.6 收尾：默认**保持 sync**。reactor 的性能更好（p=1 快 1.68×、p=8 快 2.06×，
-  // 见 docs/m5-bench.md §3.3），故障注入/端到端脚本也全绿，但 M5.6 的压力复测发现它在
-  // p=64 下**偶发丢写**（`verify` 报 missing 1~49/10000，且关闭快照压缩后依然复现 ->
-  // 属 append/复制路径）并偶发 abort；同一批复测中 sync 3/3 干净。
-  // 正确性优先于性能，因此默认仍是 sync；reactor 作为**可选引擎**保留：
-  //   --transport=reactor / RAFTKV_TRANSPORT=reactor
-  // 该阻断项记录在 docs/m5-design.md §15 v2.0，未修好之前不得作为默认。
+  // 引擎默认 = **sync**。理由随版本演过三轮，**当前的真实理由是性能**（P2a 后同轮交替实测，
+  // 见 docs/m5-bench.md §3.11）：
+  //   * p=64：sync 2317 qps vs reactor 1676（sync 快 1.38×）
+  //   * p=8 ：打平（514 vs 511 qps）
+  //   * p=1 ：reactor 更快（1.17×）——只要低并发延迟时显式选它
+  // 历史上两条"阻断项"都已关闭，不再构成理由：
+  //   * M5.3：reactor 下节点静默消失/SIGSEGV（`snapshotOpMu_` 串行化 compact + 回调异常重抛，已修）
+  //   * M5.6：reactor `win=1` 偶发丢写（应答归因错配 + awaitCommit 把"已提交"误判为"本次已提交"，
+  //           已修，并有 R6 / M5.A12 守门）
+  // reactor 作为可选引擎保留：--transport=reactor / RAFTKV_TRANSPORT=reactor
   bool useReactor = false;
 
   for (int i = 1; i < argc; ++i) {

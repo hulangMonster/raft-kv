@@ -112,6 +112,10 @@ M2（Raft 选主 + 日志复制）**核心正确、可上简历**：选举、日
   对外（`mu_` 保护）观察不到回退，状态机与索引也保持一致。
 - **保留意见**：O2（cv 谓词缺 `syncedIndex_`）。现有谓词是"已提交/已降级"，所有 `notify` 都伴随状态变化
   （写入 `syncedIndex_`、推进 `commitIndex_`、降级），未发现丢唤醒路径；本轮不改为条件谓词。
+  > **后续（M5 P2a 阶段，已被证伪）**：O2 指出的正是真问题。`awaitCommit` 的"开头能否接手当 flusher"
+  判定与 `cv_.wait_until` 之间有一段放锁窗口，flush 完成的通知会丢，最后一个待写者睡满 propose 超时
+  —— 用例 **M5.A15** 修前约 8/10 轮命中（`commit=64/lastIndex=65`）。修法：谓词补上
+  `(!syncInFlight_ && syncedIndex_ < index)`（见 `raft_node.cpp` awaitCommit 的谓词注释）。
 - **推迟到 M5**：O3、O4、O8、O11、O13、O15、O17（见 m3-design.md §12 末段）。
 
 ## 修复过程中的额外发现（评审未提及）
