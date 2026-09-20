@@ -826,9 +826,12 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
             syncedIndex_ = durable;
           }
         }
-        // A failed fsync must never be reported as durable (I5); leave
-        // syncInFlight_ clear so another proposer retries.
-        syncInFlight_ = false;
+        // fsync 失败：绝不记 durable（I5），并立刻放开 syncInFlight_ 让别的 proposer 重试。
+        // 成功时**不**在这里放开（P2a）：一直持有到本批的 AppendEntries 都发出去为止。
+        // 否则会出现"上一批还在发、下一批已经开始 fsync"的并发 flusher，它们会在
+        // TcpTransport 唯一那把 mu_ 上互相排队 —— 实测 p=8 时 peer=2 的发送在拿到锁
+        // 之前中位要等 11.5ms，而一次真正的往返 <1ms；每个 flush 平均 4.4 次往返。
+        if (!syncOk) syncInFlight_ = false;
         if (syncOk && role_ == Role::kLeader && currentTerm_ == term) {
           // Single-node clusters commit here (no peer jobs below).
           advanceCommitAndApply();
@@ -873,6 +876,16 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
             [this, peer = job.first, chunkEnd](const InstallSnapshotReply& reply) {
               onInstallSnapshotReplyWithContext(peer, chunkEnd, reply);
             });
+      }
+      // P2a：本批的 AppendEntries 已发出，这时才放开 flush 窗口；若仍有未 durable 的
+      // 条目，唤醒一个等待者接手当 flusher（谓词里也镜像了这个条件，见 cv_ 谓词）。
+      {
+        std::lock_guard<ProbedMutex> lock(mu_);
+        syncInFlight_ = false;
+        if (role_ == Role::kLeader && currentTerm_ == term &&
+            syncedIndex_ < log_.lastIndex()) {
+          cv_.notify_one();
+        }
       }
       continue;
     }

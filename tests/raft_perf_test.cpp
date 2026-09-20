@@ -1093,3 +1093,139 @@ TEST(RaftPerf, A15_WaitPathFlusherHandoffIsNotLost) {
   }
   EXPECT_LE(totalFlushes, kRounds * 32) << "总 flush 次数 " << totalFlushes;
 }
+
+// M5.A16 [RED->GREEN] 一批的复制还没发完之前，不许开始下一批 flush（P2a）。
+//
+// 实测（见交接文档"附 3"）：p=8 时 leader 上会同时有多个 flusher 在发 AppendEntries，
+// 而 TcpTransport 只有一把 mu_ 包住整段往返 —— peer=2 的发送"拿到锁之前"中位要等
+// 11.5ms，而一次真正的往返只要 <1ms；每个 flush 平均触发 4.4 次往返。修法是让 flusher
+// 在自己两次 send 都发出之前不放开 syncInFlight_，从而不产生并发 flusher。
+// 本用例用一个"对 peer 2 阻塞"的 transport 把该窗口撑开，断言窗口之内不会出现新的
+// store sync（= 不会有第二个 flusher 开始 flush）。
+class BlockingAppendTransport : public MemoryTransport {
+ public:
+  void armPeer(int peer, uint64_t blockMs) {
+    blockPeer_.store(peer);
+    blockMs_.store(blockMs);
+    armed_.store(true);
+  }
+  void setWindowFlag(std::atomic<bool>* w) { window_ = w; }
+  bool waitWindow(uint64_t timeoutMs) {
+    for (uint64_t w = 0; w < timeoutMs; w += 2) {
+      if (window_ != nullptr && window_->load()) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return window_ != nullptr && window_->load();
+  }
+  void sendAppendEntries(int peerId, const AppendEntriesArgs& a,
+                         AppendCb cb) override {
+    if (armed_.load() && peerId == blockPeer_.load()) {
+      if (window_ != nullptr) window_->store(true);
+      std::this_thread::sleep_for(std::chrono::milliseconds(blockMs_.load()));
+      if (window_ != nullptr) window_->store(false);
+    }
+    MemoryTransport::sendAppendEntries(peerId, a, std::move(cb));
+  }
+
+ private:
+  std::atomic<int> blockPeer_{-1};
+  std::atomic<uint64_t> blockMs_{0};
+  std::atomic<bool> armed_{false};
+  std::atomic<bool>* window_ = nullptr;
+};
+
+// 统计"在一次阻塞发送窗口之内"发生的 sync 次数（= 并发 flush 的次数）。
+class WindowSyncCounter : public MemoryLogStore {
+ public:
+  void setWindowFlag(const std::atomic<bool>* w) { window_ = w; }
+  bool sync() override {
+    if (window_ != nullptr && window_->load()) ++syncsInWindow;
+    ++syncs;
+    return MemoryLogStore::sync();
+  }
+  std::atomic<int> syncsInWindow{0};
+  std::atomic<int> syncs{0};
+
+ private:
+  const std::atomic<bool>* window_ = nullptr;
+};
+
+TEST(RaftPerf, A16_NextFlushWaitsForInFlightSends) {
+  auto c = std::make_shared<FakeClock>();
+  auto tr = std::make_shared<BlockingAppendTransport>();
+  auto window = std::make_shared<std::atomic<bool>>(false);
+  auto llog = std::make_unique<WindowSyncCounter>();
+  WindowSyncCounter* sl = llog.get();
+  sl->setWindowFlag(window.get());
+  tr->setWindowFlag(window.get());
+  auto lsm = std::make_unique<KvStateMachine>();
+  auto f2log = std::make_unique<MemoryLogStore>();
+  auto f2sm = std::make_unique<KvStateMachine>();
+  auto f3log = std::make_unique<MemoryLogStore>();
+  auto f3sm = std::make_unique<KvStateMachine>();
+  const ClusterConfig seed = makeSeedConfig(3);
+  RaftConfig c1;
+  c1.selfId = 1;
+  c1.peerIds = {2, 3};
+  RaftNode leader(c1, *llog, *lsm, *tr, *c, nullptr, seed);
+  RaftConfig c2;
+  c2.selfId = 2;
+  c2.peerIds = {1, 3};
+  RaftNode f2(c2, *f2log, *f2sm, *tr, *c, nullptr, seed);
+  RaftConfig c3;
+  c3.selfId = 3;
+  c3.peerIds = {1, 2};
+  RaftNode f3(c3, *f3log, *f3sm, *tr, *c, nullptr, seed);
+  tr->addNode(1, &leader);
+  tr->addNode(2, &f2);
+  tr->addNode(3, &f3);
+
+  // 只 tick 节点 1：它的选举计时器到点后发起投票，f2/f3 通过 MemoryTransport 同步应答。
+  // （三个都 tick 时，可能由 2 或 3 先到点当选；本用例只关心 leader 侧的 flush 行为。）
+  for (int i = 0; i < 200 && leader.role() != Role::kLeader; ++i) {
+    c->advance(10);
+    leader.tick();
+  }
+  ASSERT_EQ(leader.role(), Role::kLeader);
+  c->advance(10);
+  leader.tick();  // 本任期 no-op
+
+  tr->armPeer(2, 200);  // 对 peer 2 的 AppendEntries 阻塞 200ms
+
+  constexpr int kWriters = 8;
+  std::atomic<int> done{0};
+  std::atomic<int> notOk{0};
+  std::vector<std::thread> ws;
+  auto spawn = [&](int w) {
+    ws.emplace_back([&, w] {
+      ClientRequest req;
+      req.op = OpCode::kPut;
+      req.key = "b" + std::to_string(w);
+      req.value = "v";
+      req.clientId = 300 + static_cast<uint64_t>(w);
+      req.requestId = 1;
+      if (leader.propose(req, 8000).status != ClientStatus::kOk) {
+        notOk.fetch_add(1);
+      }
+      done.fetch_add(1, std::memory_order_release);
+    });
+  };
+  // 先让 1 号写者成为 flusher 并进入"正在发 AppendEntries"的窗口；窗口打开后再放进其余写者：
+  // 修复前它们会各自成为 flusher（窗口内出现新的 sync），修复后必须等这一批发完。
+  spawn(0);
+  ASSERT_TRUE(tr->waitWindow(3000)) << "1 号写者的 AppendEntries 应已进入阻塞窗口";
+  for (int w = 1; w < kWriters; ++w) spawn(w);
+  // 不推进 FakeClock、也不 tick follower：回复由 MemoryTransport 同步投递，
+  // 且不能让选举超时在等待期间触发（那会制造无关的 kNotLeader）。
+  for (int i = 0; i < 8000 && done.load() < kWriters; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  for (auto& t : ws) t.join();
+  EXPECT_EQ(notOk.load(), 0);
+  EXPECT_EQ(sl->syncsInWindow.load(), 0)
+      << "在 peer 2 的阻塞发送窗口内又开始了 " << sl->syncsInWindow.load()
+      << " 次新 flush：说明多个 flusher 并发在发，会在 transport 锁上互相排队";
+  EXPECT_LE(sl->syncs.load(), 4)
+      << kWriters << " 条并发写触发了 " << sl->syncs.load()
+      << " 次 flush（应能等到上一批发完再合并成一批）";
+}
