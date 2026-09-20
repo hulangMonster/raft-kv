@@ -226,6 +226,7 @@ AppendEntriesArgs RaftNode::buildAppendEntries(int peer) {
 }
 
 void RaftNode::advanceCommitAndApply() {
+  const Index commitBefore = commitIndex_;
   if (role_ == Role::kLeader) {
     for (Index n = log_.lastIndex(); n > commitIndex_; --n) {
       if (log_.termAt(n) != currentTerm_) continue;  // §5.4.2: only current term
@@ -285,7 +286,10 @@ void RaftNode::advanceCommitAndApply() {
       becomeFollower(currentTerm_);
     }
   }
-  cv_.notify_all();
+  // F2：只有 commitIndex_ 真的推进才唤醒等待者（本函数在每次 peer 应答/每批 flush
+  // 末尾都会被调用；无条件 notify_all 会把"每批 2 次、每次 N 个 waiter"的唤醒风暴
+  // 变成常态）。becomeFollower/becomeLeader 有自己的 notify。
+  if (commitIndex_ != commitBefore) cv_.notify_all();
 }
 
 // ---- public API -------------------------------------------------------------
@@ -838,7 +842,16 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
             }
           }
         }
-        cv_.notify_all();
+        // F2：只在确有推进/失败时唤醒。
+        //   * commit 推进 -> advanceCommitAndApply() 已 notify_all（可能满足多个等待者）
+        //   * fsync 失败 -> notify_all（错误要尽快让等待者看到）
+        //   * 仍有未 durable 条目 -> notify_one（只需一个等待者接手当 flusher）
+        // 原来的无条件 notify_all 让 p=64 下 64 个 waiter 每批白醒一轮。
+        if (!syncOk) {
+          cv_.notify_all();
+        } else if (syncedIndex_ < log_.lastIndex()) {
+          cv_.notify_one();
+        }
       }
       if (!syncOk) {
         return {ClientStatus::kErr, "log sync failed", -1};
@@ -867,12 +880,26 @@ ClientReply RaftNode::awaitCommit(Index index, Term term, uint64_t timeoutMs) {
     std::unique_lock<ProbedMutex> lock(mu_);
     ++syncWaiters_;  // M5.4：仅用于蓄批的自适应判定（近似计数即可）
     cv_.wait_until(lock, deadline, [&] {
-      return (index <= commitIndex_ && log_.termAt(index) == term) ||
-             role_ != Role::kLeader || currentTerm_ != term;
+      // M5.6（G1 丢唤醒修复）：谓词必须覆盖"我能接手当 flusher"这一条件 —— 它是循环
+      // 开头那段判定（!syncInFlight_ && syncedIndex_ < index）的镜像。否则存在丢失唤醒：
+      // 等待者在"开头判定"与 cv_.wait_until 之间会短暂放锁，若在飞的 flush 恰好在这个
+      // 窗口里完成并 notify，通知就丢了；而它可能已是最后一个待写者、不会再有 flush，
+      // 于是睡到 propose 超时。实测（单节点 8 写者 x 8 写 + 注入 10ms flush）：
+      // 不修时约 8/10 轮出现 commit=64/lastIndex=65、某个 propose 等满超时。
+      //
+      // F2：谓词里**不再**查 log_.termAt()。M5 起该访问器要抢 FileLogStore 内部锁，
+      // 而每个 peer 应答都会 notify，唤醒风暴下每次求值都是一次锁竞争。term 复核放在
+      // 唤醒后的成功分支（条目被覆盖 -> kNotLeader -> 客户端按幂等键重试）。
+      return index <= commitIndex_ || role_ != Role::kLeader ||
+             currentTerm_ != term || (!syncInFlight_ && syncedIndex_ < index);
     });
     --syncWaiters_;
     if (index <= commitIndex_) {
-      if (true) {  // RED 验证：临时去掉 term 校验
+      // M5.6（F3）：与循环开头同款的校验 —— "已提交"必须确认 index 上仍是本次追加的
+      // 那一条。9fbfd16 把这里写成 `if (true) { // RED 验证：临时去掉 term 校验 }`，
+      // 于是入口处的校验在**等待返回路径**上不可达：条目被新 leader 覆盖后仍回 kOk
+      // （A13 复现）。谓词里不再查 termAt（见下），复核必须在这里做。
+      if (log_.termAt(index) == term) {
         if (metrics_ != nullptr) {
           metrics_->onWriteCompleted(lockprobe::nowUs() - metricT0Us);
         }

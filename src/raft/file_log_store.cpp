@@ -143,7 +143,8 @@ bool decodeEntry(const Byte* p, size_t n, LogEntry& e) {
 
 }  // namespace
 
-FileLogStore::FileLogStore(std::string dir) : dir_(std::move(dir)) {
+FileLogStore::FileLogStore(std::string dir, FlushFn flush)
+    : dir_(std::move(dir)), flush_(std::move(flush)) {
   std::error_code ec;
   std::filesystem::create_directories(dir_ + "/raft", ec);
   if (ec) {
@@ -272,18 +273,40 @@ bool FileLogStore::persistMeta(Term term, int votedFor) {
 }
 
 bool FileLogStore::append(const std::vector<LogEntry>& entries) {
-  std::lock_guard<std::recursive_mutex> lock(mu_);
-  return appendNoSyncLocked(entries) && syncLocked();
+  {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
+    if (!appendNoSyncLocked(entries)) return false;
+  }
+  // 语义不变（返回前必须 durable），但 flush 走 sync()：不再持 mu_。
+  return sync();
 }
 
+// M5.6（D-2 修复）：fsync 期间**不持 mu_**。
+//
+// M5.2 把 fsync 移出 RaftNode::mu_ 之后，FileLogStore 里 sync() 与 appendNoSync()
+// 仍然共用同一把 mu_，而 sync() 是"持锁 fsync"。于是 leader 的锁外 fsync（本机 ~3-8ms）
+// 会把所有 append 挡在门外：fsync 窗口内日志**不再增长**，组提交的 batch 只能是
+// fsync 开始前已经 append 的那几条 —— 实测 p=8/3 节点：leader 1650 次 fsync / 2200 条写
+// （1.33 条/次）、batch_avg=1，吞吐掉到 M4 基线的 0.47×。
+//
+// 现在 fsync 只与"会换 logFd_ / 改文件结构"的操作互斥（flushMu_，叶子锁；锁序
+// flushMu_ -> mu_），append 可以继续写 page cache，批才能成形。
+// durability 语义不变：调用方只声称 flushTarget（fsync 开始前就已写下的范围）已 durable。
 bool FileLogStore::sync() {
-  std::lock_guard<std::recursive_mutex> lock(mu_);
-  return syncLocked();
+  std::lock_guard<std::mutex> flushLock(flushMu_);
+  int fd = -1;
+  {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
+    fd = logFd_;
+  }
+  if (fd < 0) return false;
+  return flushFd(fd);
 }
 
-bool FileLogStore::syncLocked() {
-  if (logFd_ < 0) return false;
-  return ::fsync(logFd_) == 0;
+// flush 原语：默认 ::fsync；测试可注入"慢 fsync"来验证 append 不被它阻塞。
+bool FileLogStore::flushFd(int fd) {
+  if (flush_) return flush_(fd) == 0;
+  return ::fsync(fd) == 0;
 }
 
 bool FileLogStore::appendNoSync(const std::vector<LogEntry>& entries) {
@@ -296,7 +319,10 @@ bool FileLogStore::appendNoSyncLocked(const std::vector<LogEntry>& entries) {
   for (const LogEntry& e : entries) {
     if (e.index <= lastIndex()) {
       if (termAt(e.index) == e.term) continue;  // already present
-      if (!truncateSuffixLocked(e.index, /*sync=*/true)) return false;
+      // M5.6（D-2）：这里不能 fsync —— 本函数在 mu_ 下被调用，而 fsync 要拿 flushMu_。
+      // 契约上 appendNoSync() 之后调用方必须 sync()（组提交），那次 fsync 会一并
+      // 持久化 ftruncate 造成的长度变化；append()（durable 变体）末尾也调 sync()。
+      if (!truncateSuffixLocked(e.index, /*flush=*/false)) return false;
     }
     if (e.index != lastIndex() + 1) return false;  // must be contiguous (D3)
     const int64_t off = static_cast<int64_t>(::lseek(logFd_, 0, SEEK_END));
@@ -317,18 +343,20 @@ bool FileLogStore::appendNoSyncLocked(const std::vector<LogEntry>& entries) {
 }
 
 bool FileLogStore::truncateSuffix(Index fromIndex) {
+  std::lock_guard<std::mutex> flushLock(flushMu_);  // 锁序 flushMu_ -> mu_
   std::lock_guard<std::recursive_mutex> lock(mu_);
-  return truncateSuffixLocked(fromIndex, /*sync=*/true);
+  return truncateSuffixLocked(fromIndex, /*flush=*/true);
 }
 
 // M5.2（I9）：不做 fsync 的截断（供持 RaftNode::mu_ 的冲突回滚路径使用）。
 // 调用方必须在同一批里随后 log_.sync()，否则变短的日志在崩溃后可能复活。
 bool FileLogStore::truncateSuffixNoSync(Index fromIndex) {
   std::lock_guard<std::recursive_mutex> lock(mu_);
-  return truncateSuffixLocked(fromIndex, /*sync=*/false);
+  return truncateSuffixLocked(fromIndex, /*flush=*/false);
 }
 
-bool FileLogStore::truncateSuffixLocked(Index fromIndex, bool sync) {
+// flush=true 时要求调用方已持有 flushMu_（与在飞的 fsync 互斥）。
+bool FileLogStore::truncateSuffixLocked(Index fromIndex, bool flush) {
   if (fromIndex == kNoIndex) return true;
   if (fromIndex <= lastIncluded_) return false;  // cannot cut below boundary
   if (fromIndex > lastIndex() + 1) return false;
@@ -349,7 +377,7 @@ bool FileLogStore::truncateSuffixLocked(Index fromIndex, bool sync) {
   // Make the shorter log durable: otherwise a crash could resurrect the entries
   // we just dropped. M5.2（I9）：持 mu_ 的路径传 sync=false，由同批的锁外
   // log_.sync() 负责持久化（fsync 会一并覆盖 size 变更）。
-  if (sync && ::fsync(logFd_) != 0) return false;
+  if (flush && !flushFd(logFd_)) return false;
 
   entries_.resize(static_cast<size_t>(fromIndex - firstIndex()));
   for (auto it = offsetOf_.begin(); it != offsetOf_.end();) {
@@ -421,6 +449,9 @@ void FileLogStore::setBoundary(Index lastIncludedIndex,
 }
 
 bool FileLogStore::compact(Index upTo, Term termAtUpTo) {
+  // M5.6（D-2）：本函数会 rename + 重开 logFd_，必须与在飞的 fsync 互斥（否则 fsync
+  // 可能落在已经被换掉的 fd 上）。锁序 flushMu_ -> mu_。
+  std::lock_guard<std::mutex> flushLock(flushMu_);
   std::lock_guard<std::recursive_mutex> lock(mu_);
   if (upTo == kNoIndex) return true;
   if (upTo <= lastIncluded_) return true;  // already compacted: no-op

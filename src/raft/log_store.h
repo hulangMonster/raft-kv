@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -106,7 +107,11 @@ class MemoryLogStore : public LogStore {
 // the log (rebuilt at load) for fast slice()/termAt().
 class FileLogStore : public LogStore {
  public:
-  explicit FileLogStore(std::string dir);
+  // 可注入的 flush 原语（默认 ::fsync(fd)）。两个理由：
+  //   * 单测要能构造"慢 fsync"，据此断言 append 不被 fsync 阻塞（M5.A14/A15 的回归缝）；
+  //   * 将来换 fdatasync / O_DIRECT / io_uring 时有缝可插。
+  using FlushFn = std::function<int(int fd)>;
+  explicit FileLogStore(std::string dir, FlushFn flush = nullptr);
   ~FileLogStore() override;
 
   bool load(Term& term, int& votedFor, Index& lastIndex) override;
@@ -142,10 +147,17 @@ class FileLogStore : public LogStore {
   // mu_ 下读它们 → 数据竞争 → UB/SIGSEGV（ASan 实测栈顶 termAt/slice）。
   // 用 recursive_mutex：内部实现之间互相调用（compact→lastIndex 等）不会自死锁。
   mutable std::recursive_mutex mu_;
-  // 以下三个是公共入口的内部实现：调用方必须已持有 mu_。
+  // 以下两个是公共入口的内部实现：调用方必须已持有 mu_。
   bool appendNoSyncLocked(const std::vector<LogEntry>& entries);
-  bool syncLocked();
-  bool truncateSuffixLocked(Index fromIndex, bool sync);
+  // flush=true 时要求调用方已持有 flushMu_（与在飞的 fsync 互斥）。
+  bool truncateSuffixLocked(Index fromIndex, bool flush);
+  // flush 原语（注入或 ::fsync）。
+  bool flushFd(int fd);
+
+  // M5.6（D-2）叶子锁：只串行化"会换 logFd_ / 改文件结构"的操作
+  // （fsync / compact / truncate），**不**与 append 互斥。锁序固定 flushMu_ → mu_。
+  std::mutex flushMu_;
+  FlushFn flush_;
 
   Term term_ = kNoTerm;
   int votedFor_ = -1;

@@ -11,9 +11,11 @@
 // 按子阶段 RED-first 在 M5.4 补写（见 docs/m5-design.md §15 修订记录 v1.1）。
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <thread>
@@ -801,4 +803,293 @@ TEST(RaftPerf, A7_ConfigChangeStillCommits) {
   driveSpy(c, 60, 10);
   EXPECT_GT(leader->configVersion(), v0);
   EXPECT_FALSE(leader->clusterConfig().contains(victim));
+}
+
+namespace {
+
+std::string perfTempDir() {
+  auto p = std::filesystem::temp_directory_path() /
+           ("raftkv-perf-" + std::to_string(::getpid()) + "-" +
+            std::to_string(static_cast<long long>(
+                std::chrono::steady_clock::now().time_since_epoch().count())));
+  std::filesystem::create_directories(p);
+  return p.string();
+}
+
+}  // namespace
+
+// M5.A13 [RED->GREEN] 等待路径上的同款校验（A12 的另一半）。
+//
+// A12 覆盖"propose 停在**锁外 fsync**窗口里"的序列；本用例覆盖：
+// propose 已经进入 `cv_.wait_until`（syncInFlight_ 被别的 flusher 占住，自己不是 flusher），
+// "更高任期覆盖 + leaderCommit 推进"恰好发生在它睡着的时候。此时唤醒谓词只由
+// `role_ != kLeader` 满足，而修复前等待返回后的分支是裸的 `if (index <= commitIndex_)`
+// —— 9fbfd16 留下的 RED 脚手架 `if (true) { // RED 验证：临时去掉 term 校验 }` 至今在
+// 生产代码里，于是"入口处的 term 校验"在这条路径上不可达：被覆盖的条目仍然回 kOk。
+//
+// 确定性构造：writer B 先追加并把 fsync 卡住（占住 syncInFlight_），writer A 随后追加，
+// 此时 A 不可能成为 flusher，只能进 cv_ 等待。
+class WaitPathBlockingLogStore : public MemoryLogStore {
+ public:
+  void arm() {
+    released_.store(false);
+    blocked_.store(false);
+  }
+  bool sync() override {
+    if (!blocked_.exchange(true)) {
+      inSync_.store(true);
+      while (!released_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      inSync_.store(false);
+    }
+    return MemoryLogStore::sync();
+  }
+  bool waitInsideSync(uint64_t timeoutMs) {
+    for (uint64_t w = 0; w < timeoutMs; w += 2) {
+      if (inSync_.load()) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return inSync_.load();
+  }
+  void release() { released_.store(true); }
+  bool appendNoSync(const std::vector<LogEntry>& entries) override {
+    const bool ok = MemoryLogStore::appendNoSync(entries);
+    appends_.fetch_add(1);
+    return ok;
+  }
+  int appends() const { return appends_.load(); }
+
+ private:
+  std::atomic<bool> blocked_{true};  // 未武装：不挡
+  std::atomic<bool> inSync_{false};
+  std::atomic<bool> released_{false};
+  std::atomic<int> appends_{0};
+};
+
+TEST(RaftPerf, A13_OverwriteDuringWaitIsNotReportedAsCommitted) {
+  auto c = std::make_shared<FakeClock>();
+  auto async = std::make_shared<AsyncQueueTransport>();
+  auto log = std::make_unique<WaitPathBlockingLogStore>();
+  WaitPathBlockingLogStore* slog = log.get();
+  auto lsm = std::make_unique<KvStateMachine>();
+  RaftConfig c1;
+  c1.selfId = 1;
+  c1.peerIds = {2, 3};  // 有投票者但 transport 里没有节点：复制不到多数派
+  RaftNode node1(c1, *log, *lsm, *async, *c);
+
+  for (int i = 0; i < 200 && node1.role() != Role::kLeader; ++i) {
+    c->advance(10);
+    node1.tick();
+    for (auto& v : async->takeVoteJobs()) {
+      RequestVoteReply r;
+      r.term = v.args.term;
+      r.voteGranted = true;
+      v.cb(r);
+    }
+  }
+  ASSERT_EQ(node1.role(), Role::kLeader);
+  const Term termT = node1.currentTerm();
+  c->advance(10);
+  node1.tick();  // 本任期 no-op
+
+  slog->arm();  // 只挡接下来这一次 sync = writer B 的锁外 fsync
+  std::atomic<int> statusB{-1};
+  std::atomic<int> statusA{-1};
+  std::thread writerB([&] {
+    ClientRequest req;
+    req.op = OpCode::kPut;
+    req.key = "b";
+    req.value = "v";
+    req.clientId = 71;
+    req.requestId = 1;
+    statusB.store(static_cast<int>(node1.propose(req, 8000).status));
+  });
+  ASSERT_TRUE(slog->waitInsideSync(3000)) << "writer B 应已进入锁外 fsync";
+
+  const int appendsBeforeA = slog->appends();
+  std::thread writerA([&] {
+    ClientRequest req;
+    req.op = OpCode::kPut;
+    req.key = "victim";
+    req.value = "v";
+    req.clientId = 72;
+    req.requestId = 1;
+    statusA.store(static_cast<int>(node1.propose(req, 8000).status));
+  });
+  for (int i = 0; i < 3000 && slog->appends() < appendsBeforeA + 1; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_GE(slog->appends(), appendsBeforeA + 1) << "writer A 的条目应已追加";
+  // A 的追加已完成；syncInFlight_ 仍被 B 占住 -> A 只能落到 cv_.wait_until。
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const Index idx = log->lastIndex();
+  ASSERT_NE(idx, kNoIndex);
+  ASSERT_EQ(log->termAt(idx), termT);
+  ASSERT_EQ(statusA.load(), -1) << "writer A 必须仍在等待（尚未被唤醒/返回）";
+
+  // 更高任期的新 leader：用**不同条目**覆盖 idx，并把 leaderCommit 推到 idx
+  AppendEntriesArgs ae;
+  ae.term = termT + 1;
+  ae.leaderId = 2;
+  ae.prevLogIndex = idx - 1;
+  ae.prevLogTerm = log->termAt(idx - 1);
+  LogEntry other;
+  other.index = idx;
+  other.term = termT + 1;
+  other.op = OpCode::kPut;
+  other.key = "OTHER";
+  other.value = "x";
+  ae.entries.push_back(other);
+  ae.leaderCommit = idx;
+  const AppendEntriesReply rep = node1.onAppendEntries(ae);
+  ASSERT_TRUE(rep.success);
+  ASSERT_EQ(node1.commitIndex(), idx) << "该 index 已被提交（提交的是新条目）";
+  ASSERT_EQ(log->termAt(idx), termT + 1) << "A 原来那条已被覆盖";
+
+  for (int i = 0; i < 3000 && statusA.load() < 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  EXPECT_EQ(statusA.load(), static_cast<int>(ClientStatus::kNotLeader))
+      << "等待路径同样必须确认 index 上仍是本次条目，绝不能报 kOk"
+      << "（ClientStatus: kOk=0, kNotLeader=3；修复前这里会是 0=kOk）";
+
+  slog->release();
+  writerA.join();
+  writerB.join();
+}
+
+// M5.A14 [RED->GREEN] D-2：sync() **不得**阻塞 appendNoSync()。
+//
+// M5.2 把 fsync 移出 RaftNode::mu_ 的同时，给 FileLogStore 加了一把覆盖"全部访问器"的
+// 内部锁，于是 appendNoSync() 与 sync() 又共用同一把锁，而 sync() 是**持锁 fsync**：
+// leader 的锁外 fsync（~8ms）期间没有任何 append 能落地 -> 日志不再增长 ->
+// flusher 取到的 flushTarget 常常只有它自己那一条 -> 组提交退化成"一写一 fsync"。
+// 这里用可注入的慢 fsync 把这条不变量钉死：fsync 在飞的时候 append 必须立刻返回。
+TEST(RaftPerf, A14_SyncDoesNotBlockAppends) {
+  const std::string dir = perfTempDir();
+  std::atomic<bool> inFlush{false};
+  std::atomic<int> flushCalls{0};
+  auto log = std::make_unique<FileLogStore>(dir, [&](int) {
+    flushCalls.fetch_add(1);
+    inFlush.store(true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    inFlush.store(false);
+    return 0;
+  });
+  FileLogStore& store = *log;
+
+  Term t = kNoTerm;
+  int vf = -1;
+  Index li = kNoIndex;
+  ASSERT_TRUE(store.load(t, vf, li));
+
+  LogEntry e1;
+  e1.index = 1;
+  e1.term = 1;
+  e1.op = OpCode::kPut;
+  e1.key = "k1";
+  e1.value = "v";
+  ASSERT_TRUE(store.appendNoSync({e1}));
+
+  std::thread flusher([&] { store.sync(); });
+  for (int i = 0; i < 1000 && !inFlush.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(inFlush.load()) << "fsync 应已在飞行中";
+
+  LogEntry e2;
+  e2.index = 2;
+  e2.term = 1;
+  e2.op = OpCode::kPut;
+  e2.key = "k2";
+  e2.value = "v";
+  const auto t0 = std::chrono::steady_clock::now();
+  const bool appended = store.appendNoSync({e2});
+  const auto dtMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+  EXPECT_TRUE(appended);
+  EXPECT_LT(dtMs, 75) << "appendNoSync() 被在飞的 fsync 阻塞了 " << dtMs
+                      << " ms：日志在 fsync 窗口内无法增长，组提交会退化成写一条 fsync 一次";
+
+  flusher.join();
+  EXPECT_EQ(flushCalls.load(), 1);
+  std::filesystem::remove_all(dir);
+}
+
+// M5.A15 [RED->GREEN] 等待路径的"接手 flusher"事件不能被丢掉（G1 丢唤醒）。
+//
+// 循环开头判定（!syncInFlight_ && syncedIndex_ < index）与 cv_.wait_until 之间有一
+// 段放锁窗口：若在飞的 flush 恰在此窗口里完成并 notify，通知会丢；最后一个待写者于是
+// 没人接手 flush，一直睡到 propose 超时（实测约 8/10 轮命中，日志 commit=64/lastIndex=65）。
+// 本用例把它变成可回归信号：单节点 leader（durable 即提交，无复制干扰）+ 注入 10ms flush
+// + 8 写者 x 8 写，重复 5 轮，任何一轮有写非 kOk 即失败。
+// 修复点：raft_node.cpp 的 cv_ 谓词补上"我能接手当 flusher"这一项。
+TEST(RaftPerf, A15_WaitPathFlusherHandoffIsNotLost) {
+  constexpr int kWriters = 8;
+  constexpr int kPerWriter = 8;
+  constexpr int kRounds = 5;
+  int totalFlushes = 0;
+  for (int round = 0; round < kRounds; ++round) {
+    const std::string dir = perfTempDir();
+    std::atomic<int> flushCalls{0};
+    auto log = std::make_unique<FileLogStore>(dir, [&](int) {
+      flushCalls.fetch_add(1);
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      return 0;
+    });
+    auto c = std::make_shared<FakeClock>();
+    auto async = std::make_shared<AsyncQueueTransport>();
+    auto lsm = std::make_unique<KvStateMachine>();
+    RaftConfig c1;
+    c1.selfId = 1;  // 单节点：durable 即提交，隔离掉复制路径
+    RaftNode leader(c1, *log, *lsm, *async, *c);
+    for (int i = 0; i < 200 && leader.role() != Role::kLeader; ++i) {
+      c->advance(10);
+      leader.tick();
+    }
+    ASSERT_EQ(leader.role(), Role::kLeader) << "round " << round;
+    c->advance(10);
+    leader.tick();  // 本任期 no-op（自身占一次 flush）
+
+    std::atomic<int> ready{0};
+    std::atomic<int> done{0};
+    std::atomic<int> notOk{0};
+    std::vector<std::thread> ws;
+    for (int w = 0; w < kWriters; ++w) {
+      ws.emplace_back([&, w] {
+        ready.fetch_add(1);
+        while (ready.load() < kWriters) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        for (int k = 0; k < kPerWriter; ++k) {
+          ClientRequest req;
+          req.op = OpCode::kPut;
+          req.key = "g" + std::to_string(w) + "_" + std::to_string(k);
+          req.value = "v";
+          req.clientId = 200 + static_cast<uint64_t>(w);
+          req.requestId = static_cast<uint64_t>(k + 1);  // (clientId, requestId) 幂等键
+          if (leader.propose(req, 4000).status != ClientStatus::kOk) {
+            notOk.fetch_add(1);
+          }
+          done.fetch_add(1, std::memory_order_release);
+        }
+      });
+    }
+    for (int i = 0; i < 4000 && done.load() < kWriters * kPerWriter; ++i) {
+      c->advance(5);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    for (auto& t : ws) t.join();
+    totalFlushes += flushCalls.load();
+    EXPECT_EQ(notOk.load(), 0)
+        << "round " << round << "：有写等满 propose 超时（丢唤醒）；commit="
+        << leader.commitIndex() << " lastIndex=" << log->lastIndex()
+        << " flushes=" << flushCalls.load();
+    if (notOk.load() != 0) break;
+    std::filesystem::remove_all(dir);
+  }
+  EXPECT_LE(totalFlushes, kRounds * 32) << "总 flush 次数 " << totalFlushes;
 }
