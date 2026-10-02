@@ -22,8 +22,8 @@
 
 - 成员变更、客户端任意节点路由（**M4**）
 - 增量快照、并发/后台快照线程、压缩算法（ZSTD）、多个快照副本（**M5**）
-- gRPC、异步 transport（**M5**）
-- 断点续传式 InstallSnapshot（M5 可选，字段已预留）
+- gRPC（**至今未做**）；~~异步 transport~~ —— **已在 M5 落地**（epoll Reactor，`--transport=reactor`）
+- ~~断点续传式 InstallSnapshot~~ —— **已在 M5.4 落地**（`.recv` 尾部元数据 + `recvProgress()`）
 
 ---
 
@@ -211,7 +211,7 @@ struct InstallSnapshotArgs {
 struct InstallSnapshotReply {
   Term term = kNoTerm;
   bool success = false;
-  uint64_t nextOffset = 0;             // M5 断点续传预留；M3 恒为 0
+  uint64_t nextOffset = 0;             // 断点续传（M5.4 已实现）：回报已收到的载荷字节数
 };
 ```
 
@@ -298,6 +298,7 @@ CRC32 与 M2 同多项式。`payloadLen == 0` 合法（空状态机），此时 
   因此 fd 生命周期必须由 **LogStore 内部锁**保护：`FileLogStore` 新增 `mu_`，`sync/load/persistMeta/truncateSuffix/compact`
   （即所有触碰 `logFd_` 或重建/改名日志文件的操作）都在其内；`appendNoSync` 不加该锁，因为它只由 `mu_` 串行调用
   （与所有 fd 变更互斥）。锁序固定为 **`RaftNode::mu_` → `LogStore::mu_`**，反向获取不存在，故无死锁。
+  \* **编号说明**：该契约在 M5 代码注释里的编号是 **I9 / L12（含评审项 B4）**；"L9 / D5" 只存在于本文档。
 - **SnapshotStore 内部锁（v1.3）**：`save/receiveChunk/load` 由 store 自己的互斥量串行（多连接并发 InstallSnapshot
   与 `maybeSnapshot` 的锁外 `save` 可能并发），且**任何写路径都不得把已落盘边界往回退**。
 
@@ -323,27 +324,29 @@ CRC32 与 M2 同多项式。`payloadLen == 0` 合法（空状态机），此时 
 
 **A 组（FakeClock + MemoryTransport + MemoryLogStore + MemorySnapshotStore，无 IO/无 flaky）**
 
-| # | 用例 | 断言要点 |
+> 下表"用例"列已换成 `tests/raft_snapshot_test.cpp` 里**实际存在**的 gtest 用例名。
+
+| # | 用例（实际名） | 断言要点 |
 |---|---|---|
-| 1 | `test_snapshot_created_at_threshold` | 超过阈值后生成快照；`lastIncludedIndex ≤ lastApplied` |
-| 2 | `test_snapshot_only_covers_applied_prefix` | 快照边界恒 `≤ lastApplied`（构造未 apply 条目不得被覆盖） |
-| 3 | `test_compact_truncates_log_and_first_index` | compact 后 `firstIndex == lastIncluded + 1`，日志条数下降 |
-| 4 | `test_term_at_compacted_boundary_semantics` | `termAt(lastIncluded) == lastIncludedTerm`；`termAt(<lastIncluded) == kNoTerm`；`slice` clamp |
-| 5 | `test_install_snapshot_catches_up_lagging_follower` | 落后 follower 收快照后 `lastApplied/commitIndex` 追平；`nextIndex` 复位 |
-| 6 | `test_follower_keeps_suffix_beyond_snapshot` | 安装快照后保留 `> lastIncludedIndex` 的后缀日志 |
-| 7 | `test_stale_snapshot_ignored` | `lastIncludedIndex ≤ 自己边界` 的旧快照被忽略，状态不回退 |
-| 8 | `test_sync_542_still_holds_across_compaction` | 压缩边界前后的旧 term 条目仍不得"仅凭多数派"提交 |
-| 9 | `test_propose_not_leader_unaffected_by_snapshot` | 快照路径不影响降级后 `propose → kNotLeader` |
-| 10 | `test_dedup_table_survives_snapshot` | restore 后同一 `(clientId,requestId)` 仍被去重 |
+| 1 | `RaftSnapshot.SnapshotCreatedAtThreshold` | 超过阈值后生成快照；`lastIncludedIndex ≤ lastApplied` |
+| 2 | `RaftSnapshot.SnapshotOnlyCoversAppliedPrefix` | 快照边界恒 `≤ lastApplied`（构造未 apply 条目不得被覆盖） |
+| 3 | `RaftSnapshot.CompactTruncatesLogAndFirstIndex` | compact 后 `firstIndex == lastIncluded + 1`，日志条数下降 |
+| 4 | `RaftSnapshot.TermAtCompactedBoundarySemantics` | `termAt(lastIncluded) == lastIncludedTerm`；`termAt(<lastIncluded) == kNoTerm`；`slice` clamp |
+| 5 | `RaftSnapshot.InstallSnapshotCatchesUpLaggingFollower` | 落后 follower 收快照后 `lastApplied/commitIndex` 追平；`nextIndex` 复位 |
+| 6 | `RaftSnapshot.FollowerKeepsSuffixBeyondSnapshot` | 安装快照后保留 `> lastIncludedIndex` 的后缀日志 |
+| 7 | `RaftSnapshot.StaleSnapshotIgnored` | `lastIncludedIndex ≤ 自己边界` 的旧快照被忽略，状态不回退 |
+| 8 | `RaftSnapshot.Sync542StillHoldsAcrossCompaction` | 压缩边界前后的旧 term 条目仍不得"仅凭多数派"提交 |
+| 9 | `RaftSnapshot.ProposeNotLeaderUnaffectedBySnapshot` | 快照路径不影响降级后 `propose → kNotLeader` |
+| 10 | `RaftSnapshot.DedupTableSurvivesSnapshot` | restore 后同一 `(clientId,requestId)` 仍被去重 |
 
 **B 组（FileLogStore + FileSnapshotStore + 真实临时目录）**
 
 | # | 用例 | 断言要点 |
 |---|---|---|
-| 11 | `test_restart_loads_snapshot_then_replays_tail` | 重启后状态 = 快照 + 日志尾部重放 |
-| 12 | `test_torn_snapshot_discarded` | 损坏 `snapshot.dat` 被丢弃并回落全量日志重放 |
-| 13 | `test_torn_tail_after_compact` | compact 后日志 torn-tail 正确截断 |
-| 14 | `test_snapshot_and_log_combined_recovery` | 快照 + 日志组合恢复出完整 KV |
+| 11 | `RaftSnapshotDisk.RestartLoadsSnapshotThenReplaysTail` | 重启后状态 = 快照 + 日志尾部重放 |
+| 12 | `RaftSnapshotDisk.TornSnapshotDiscarded` | 损坏 `snapshot.dat` 被丢弃并回落全量日志重放 |
+| 13 | `RaftSnapshotDisk.TornTailAfterCompact` | compact 后日志 torn-tail 正确截断 |
+| 14 | `RaftSnapshotDisk.SnapshotAndLogCombinedRecovery` | 快照 + 日志组合恢复出完整 KV |
 
 **既有用例保持不变**：`raftkv_tests`（M1 13 例）、`tests/raft_*_test.cpp`（M2 14 例）、`scripts/e2e.sh`、`scripts/raft_e2e.sh`、`scripts/raft_fault.sh` 断言全部保持。
 
@@ -426,6 +429,6 @@ CRC32 与 M2 同多项式。`payloadLen == 0` 合法（空状态机），此时 
 O6（`compact(upTo <= lastIncluded_)` 为 no-op）、O7（`setBoundary` 单次范围 erase）、O9（`persistMeta` 补 `fsyncDir`）、
 O10（`truncateSuffix` 缺 offset 不再退化成 `ftruncate(0)`，并 fsync）。
 **明确推迟到 M5**：O2（cv 谓词加固；当前谓词为提交/降级条件，通知均伴随状态变化，未发现丢唤醒路径）、
-O3（tick 的 noop 仍走 `log_.append()`：每任期一次 fsync，与 M2 行为一致）、O4（快照内存峰值流式化）、
-O8（边界以下损坏记录跳过）、O11（per-peer 异步 transport）、O13（`.recv` 落盘带 (index,term) 头）、
+O3（tick 的 noop 仍走 `log_.append()`：每任期一次 fsync，与 M2 行为一致）、~~O4~~（快照内存峰值流式化 —— **M5 已落地**：`saveStreaming()`）、
+O8（边界以下损坏记录跳过）、~~O11~~（per-peer 异步 transport —— **M5 已落地**：`TransportReactor`）、~~O13~~（`.recv` 元数据 —— **M5 已落地**，落在**尾部** trailer）、
 O15（GTest 缺失改为 fatal）、O17（`main_raft_node` 线程池化）。

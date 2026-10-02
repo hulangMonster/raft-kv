@@ -33,7 +33,7 @@
 
 ## M3 ✅ 快照与日志压缩（已完成）
 
-> 详细设计见 [m3-design.md](m3-design.md)（**v1.2**，含 D3/D4 修订），前置校验见
+> 详细设计见 [m3-design.md](m3-design.md)（**v1.3**，含 D3/D4 修订与 #4 评审修订），前置校验见
 > [m3-prerequisites.md](m3-prerequisites.md)。
 
 - `SnapshotStore` seam：`MemorySnapshotStore` / `FileSnapshotStore`（`RKS1` 文件格式、tmp+fsync+rename+fsync(dir)、CRC、torn-snapshot 丢弃、只留最新）
@@ -105,6 +105,8 @@
 - ✅ 批处理与滑动窗口（`--inflight-per-peer`、乐观 `nextIndex_` + TTL 回退）、蓄批旋钮（实测无增益，默认关）
 - ✅ 流式快照序列化（§8.3）与跨进程断点续传（§8.4）
 - ✅ 输出：同机交替 A/B（3 次中位数）+ 微基准 + 分段实测，见 `docs/m5-bench.md` §3 与 `docs/m5-review.md`
+- ✅ 测试门禁：`raftkv_raft_tests` **94/94**（gtest）+ `raftkv_tests` **13/13**（零依赖自测）；
+  M2/M3/M4 的历史基线分别为 14/35/68，见各里程碑段
 - ✅ **p=8/64 同机比值（P2a 修复后达标）**：0.60×/0.57× → **1.34× / 2.20×**，p=1 延迟 1.03×（门槛 ≤1.2×）。
   真实根因**不是** §3.10 说的"批间唤醒 + 全局锁争用"，而是**复制发送段在 `TcpTransport` 全局锁上排队**
   （`syncInFlight_` 在 fsync 返回即放开 → 多个 flusher 并发发送）：peer=2 的发送"拿到锁之前"中位等
@@ -113,7 +115,8 @@
 - ✅ **节点规模与引擎选择（3/5/10 节点实测，2026-09-20）**：扇出随 N 线性增长（sync p=1 每写
   11.3→18.5→44.6 ms），reactor 非阻塞把它压成常数（≈11 ms）⇒ **N ≥ 5 建议 `--transport=reactor`**；
   N=10 单机上 sync 出现过 leader 变更而 reactor 稳定。数据见 `m5-bench.md` §3.12
-- ⬜ 未做（非本里程碑目标）：分片锁 / 并发哈希、Node Exporter 风格指标端点、gRPC 接口层
+- ⬜ 未做（非本里程碑目标）：分片锁 / 并发哈希、Node Exporter 风格的 **HTTP** 指标端点（已有走私有协议
+  msgType 15 的 Prometheus 文本指标通道 `metrics`）、gRPC 接口层
 
 ## 贯穿性工程要求
 

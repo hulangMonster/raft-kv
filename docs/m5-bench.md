@@ -164,7 +164,7 @@ reactor 在 p=1/p=8 **明显更快**（非阻塞发送让 propose/tick 不被 fo
 ### 3.6 为什么绝对判据在本机**物理上**不可达（独立微基准，重启后静载复测）
 
 主机重启、`load average ≈ 0` 之后复测，p=1 仍是 **38.3 ms/写**（p=8 15.9、p=64 4.36 ms/写、230 qps），
-且节点自报 `fsync_ms / fsync_calls = 38403 / 4886 ≈ **7.9 ms/次**`、`batch_avg=1`、`lat_p50` 顶在 50 ms 桶。
+且节点自报 `fsync_ms / fsync_calls = 38403 / 4886 ≈ **7.9 ms/次**`、`batch_avg=1`、`lat_p50_us` 顶在 50 ms 桶。
 为了判定这是"实现问题"还是"机器下限"，写了一个**独立于 raftkv 的**微基准
 （4 KiB 追加 + flush × 200 次，ext4 on `/dev/mapper/vgubuntu-root`）：
 

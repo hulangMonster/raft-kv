@@ -72,15 +72,15 @@ M2 集群完全不引用 M1 `Store`；M1 standalone 继续用 `Store+Wal` 原样
 
 | 风险 | 后果 | 缓解 | 对应测试 |
 |---|---|---|---|
-| 同 term 双主 | 数据分叉 | 回复投票前持久化 term/votedFor | `test_term_and_vote_persisted_before_reply` + kill -9 e2e |
+| 同 term 双主 | 数据分叉 | 回复投票前持久化 term/votedFor | `RaftElection.TermAndVotePersistedBeforeReply` + kill -9 e2e |
 | 持久化顺序错误 | 已确认日志丢失 | I5 两段式 + spy LogStore 断言顺序 | 同上 |
-| §5.4.2 提交规则遗漏 | 提交将被覆盖的旧 term 条目 | 提交条件显式含 `log[N].term==currentTerm` | `test_old_term_entry_not_committed_by_count` |
-| propose 阻塞挂死 | 客户端卡死 | cv 谓词三条件（提交/降级/超时）；降级立即返回 | `test_propose_returns_not_leader_after_step_down` |
-| 幂等失效 | 重试重复 apply | `clientId+requestId` 去重表 | `test_kv_apply_idempotent_on_retry` |
+| §5.4.2 提交规则遗漏 | 提交将被覆盖的旧 term 条目 | 提交条件显式含 `log[N].term==currentTerm` | `RaftCommit.OldTermEntryNotCommittedByCount` |
+| propose 阻塞挂死 | 客户端卡死 | cv 谓词三条件（提交/降级/超时）；降级立即返回 | `ProposeStepDown.ReturnsNotLeaderAfterStepDown` |
+| 幂等失效 | 重试重复 apply | `clientId+requestId` 去重表 | `KvIdempotent.ApplyIsIdempotentOnRetry` |
 | 持锁 IO/fsync 死锁 | 心跳卡顿、假超时 | L2/L4 纪律 + 评审专查 | ——（review gate） |
-| torn tail 损坏 | 启动崩 | CRC 校验 + 截断（沿用 M1 已验证思路） | `test_raft_restart` + B 组 |
-| truncateSuffix 偏移错误 | 截错日志 | 启动重建 `index→offset` 映射 | `test_conflicting_suffix_truncated_on_leader_change` |
-| leaderHint 循环/过期 | 客户端打转 | 重试上限 3 次、总预算 1s | e2e |
+| torn tail 损坏 | 启动崩 | CRC 校验 + 截断（沿用 M1 已验证思路） | `FileLogStore.RestartRestoresMetaAndLog` / `FileLogStore.TruncatesTornTail` |
+| truncateSuffix 偏移错误 | 截错日志 | 启动重建 `index→offset` 映射 | `RaftLog.ConflictingSuffixTruncatedOnLeaderChange` |
+| leaderHint 循环/过期 | 客户端打转 | 重试上限 4 次（`attempt <= 3`）、无统一总预算 | e2e |
 | 时钟 flaky | 测试不可信 | 单测 FakeClock；e2e 才用真实时钟；超时下限 150ms | —— |
 | SIGSTOP ≠ 真分区 | 覆盖不足 | 文档标注局限，M5 用 iptables/tc | —— |
 

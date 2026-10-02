@@ -54,7 +54,7 @@
 
 | 项 | 状态 |
 |---|---|
-| 文档 | `m5-design.md`（v1.0→v2.8 修订记录）、`m5-prerequisites.md`（I9–I17/L12–L18）、`m5-bench.md`（§1 冻结基线 → §3.10）、本复盘 |
+| 文档 | `m5-design.md`（v1.0→v2.10 修订记录）、`m5-prerequisites.md`（I9–I17/L12–L18）、`m5-bench.md`（§1 冻结基线 → §3.12）、本复盘 |
 | 测试 | 单测 **94/94**（M5.A1–A16、R1–R6 等）；TSan **94/94 且 0 报告**（`tests/tsan.supp` 窄抑制 libstdc++ `condition_variable_any` 的 `notify_all`/`wait_until` 两族误报，含出处论证） |
 | 脚本 | e2e/fault 运行全 PASS（sync 侧 5 + reactor 侧 4）；P2a 后复跑 `raft_e2e` + `raft_fault/snapshot_fault/membership_fault` 各 10 轮 PASS，A/B 每格 `missing 0` |
 | 构建 | 干净重建 0 warning |

@@ -131,8 +131,8 @@ g++ -O2 -std=c++17 -o /tmp/fsbench scripts/fsbench_commit_latency.cpp && /tmp/fs
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--id N` | 必填 | 节点 id |
-| `--port P` | 必填 | 监听端口 |
+| `--id N` | 1 | 节点 id |
+| `--port P` | 19601 | 监听端口 |
 | `--peers "1=h:p,2=h:p,…"` | 必填 | 启动种子配置（可含自己；不在其中 = 动态加入的非投票节点） |
 | `--data-dir DIR` | `./raft-data-<id>` | 数据目录（`raft/raft.log`、`meta.dat`、`snapshot.dat`） |
 | `--snapshot-threshold N` | 10000 | 距上次快照多少条已应用条目触发一次快照 + 日志压缩 |
@@ -222,7 +222,7 @@ reactor 稳定。默认仍是 `sync`（3 节点下高并发更省 CPU），**计
 
 ### M1：单机 KV + WAL
 
-- 二进制 TCP 协议（长度前缀 + 版本校验 + CRC 防护），`put/get/del`
+- 二进制 TCP 协议（版本校验 + op 白名单），`put/get/del`
 - WAL 追加写 + 每次写 fsync（`--no-sync` 可关）；启动重放；`kill -9` 后半条记录被 CRC 检测并截断
 - 线程池服务端（accept + N worker），SIGINT/SIGTERM 优雅退出；命令行客户端 + 顺序压测
 - 测试：`raftkv_tests` 13/13 + `scripts/e2e.sh`（含崩溃恢复）
@@ -263,7 +263,7 @@ reactor 稳定。默认仍是 `sync`（3 节点下高并发更省 CPU），**计
   ⇒ p=1 每写延迟 11.3→18.5→44.6 ms；`reactor` 非阻塞 ⇒ ≈11 ms 不随 N 变（N=10 时 p=1 快 4.1×、p=8 快 3.0×）。
   **N ≥ 5 建议 `--transport=reactor`**；N=10 单机上 sync 出现过 leader 变更而 reactor 稳定（§3.12）
   同机比值：p=8 **0.47×→1.34×**、p=64 **~1.06×→2.20×**、p=1 延迟 **1.08×→1.03×**（详见 [docs/m5-bench.md](docs/m5-bench.md) §3.11）
-- 测试：`raftkv_raft_tests` **94/94**（含 A13/A14/A15/A16 四个 P2a 阶段新增的 RED→GREEN 用例）、
+- 测试：`raftkv_raft_tests` **94/94**（含 M5.A13/M5.A14/M5.A15/M5.A16 四个 P2a 阶段新增的 RED→GREEN 用例）、
   TSan **94/94 且 0 报告**、干净重建 0 warning、`raft_e2e.sh` + `raft_fault/snapshot_fault/membership_fault`
   各 10 轮全 PASS、A/B 每格 `missing 0`
 - 复盘（面试口径：六个真 bug 的定位/根因/回归 + 两次负结果 + 方法论）见 **[docs/m5-review.md](docs/m5-review.md)**
@@ -288,18 +288,20 @@ raft-kv/
 │       ├── reactor.*                                             # epoll 事件循环
 │       ├── metrics.*  lock_probe.h                               # 指标 / 锁探针
 │       └── state_machine.h  clock.h
-├── tests/        raftkv_tests（13）+ raft_*_test.cpp（gtest，90）+ tsan.supp
-├── scripts/      e2e/raft_e2e/fault/snapshot/membership 系列 + bench_m5_ab.sh + fsbench_commit_latency.cpp
-└── docs/         protocol.md roadmap.md m2/m3/m4/m5-design.md m5-prerequisites.md m5-bench.md m5-review.md
+├── tests/        raftkv_tests（13）+ raft_*_test.cpp（gtest，94）+ tsan.supp
+├── scripts/      e2e/raft_e2e/fault/snapshot/membership 系列 + bench_m5_ab/cell/group_commit.sh + fsbench_commit_latency.cpp
+└── docs/         protocol.md roadmap.md m2/m3/m4/m5-design.md m2/m3/m4/m5-prerequisites.md m5-bench.md m5-review.md code-review.md
 ```
 
 ---
 
 ## 协议速览
 
-见 [docs/protocol.md](docs/protocol.md)。要点：长度前缀帧（4 字节大端长度 + 负载）、版本与 op 白名单、
-CRC32 校验；客户端 `ClientRequest/ClientReply`（含 `kNotLeader` + `leaderHint`）、节点间
-`RequestVote/AppendEntries/InstallSnapshot/ReadProbe`（msgType 9/14）、配置查询与 `metrics`（msgType 15）。
+见 [docs/protocol.md](docs/protocol.md)（**M1 单机 KV 协议**：请求 `[ver:1][op:1][keyLen:2][valLen:4][key][value]`，
+版本校验 + op 白名单；CRC32 只用于落盘记录，不在线协议里）。Raft 一侧的帧与消息类型见
+`src/raft/message.h`：帧为 `[len:4 大端][type:1][payload]`，`RequestVote(1/2)`、`AppendEntries(3/4)`、
+`InstallSnapshot(5/6)`、`ReadProbe(9/14)`、客户端 `ClientRequest/ClientReply(10/11)`（含 `kNotLeader` +
+`leaderHint`）、配置查询 `ConfigRequest/Reply(7/8)`、`metrics`（15）。
 **kConfig 不在客户端白名单内**——客户端无法伪造配置条目。
 
 ## 为什么这样做（面试可讲的三句话）

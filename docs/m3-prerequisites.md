@@ -87,16 +87,16 @@ M3 起点基线**已在本轮重新执行、全部通过**：
 
 | # | 风险 | 后果 | 缓解 | 覆盖测试 |
 |---|---|---|---|---|
-| R1 | 快照覆盖未 apply 前缀 | 提交语义破坏 | D2 + `snapIndex = lastApplied_` | A2 |
-| R2 | compact 后 `termAt/slice/lastIndex` 边界语义破坏 | 复制/选主误判 | §4.3 不变量 + 以 `firstIndex_` 为基址 | A3/A4 |
-| R3 | **compact 失败/部分成功后重启，`load` 误判损坏截断整份日志**（D3） | 丢数据 | `load` 按 `firstIndex_` 校验、跳过 `index < firstIndex_` 的旧记录 | B13/B14 |
-| R4 | 旧快照覆盖新状态 | 状态回退 | `lastIncludedIndex ≤ 自己边界 → 忽略` | A7 |
-| R5 | 先删日志后落快照 | 崩溃丢数据 | §5.4 顺序 + 回锁校验 | B11/B12 |
-| R6 | torn-snapshot | 启动失败 | 魔数/版本/CRC 校验 → 丢弃回落全量日志 | B12 |
-| R7 | 去重表未随快照序列化 | 重启后二次 apply | 视图/恢复包含 `lastRequest_` | A10 |
-| R8 | 快照传输期间 propose 阻塞 | 可用性下降 | 每 tick 每 peer 1 chunk | A5、e2e |
-| R9 | InstallSnapshot 单包超 64 MiB | 传输失败 | 1 MiB 分块 + 帧上限校验 | A5 |
-| R10 | 分块 offset 不连续 | 快照损坏 | `offset != 当前大小 → 重置重传` | A5（可注入） |
+| R1 | 快照覆盖未 apply 前缀 | 提交语义破坏 | D2 + `snapIndex = lastApplied_` | `RaftSnapshot.SnapshotOnlyCoversAppliedPrefix` |
+| R2 | compact 后 `termAt/slice/lastIndex` 边界语义破坏 | 复制/选主误判 | §4.3 不变量 + 以 `firstIndex_` 为基址 | `RaftSnapshot.CompactTruncatesLogAndFirstIndex` / `RaftSnapshot.TermAtCompactedBoundarySemantics` |
+| R3 | **compact 失败/部分成功后重启，`load` 误判损坏截断整份日志**（D3） | 丢数据 | `load` 按 `firstIndex_` 校验、跳过 `index < firstIndex_` 的旧记录 | `RaftSnapshotDisk.TornTailAfterCompact` / `RaftSnapshotDisk.SnapshotAndLogCombinedRecovery` |
+| R4 | 旧快照覆盖新状态 | 状态回退 | `lastIncludedIndex ≤ 自己边界 → 忽略` | `RaftSnapshot.StaleSnapshotIgnored` |
+| R5 | 先删日志后落快照 | 崩溃丢数据 | §5.4 顺序 + 回锁校验 | `RaftSnapshotDisk.RestartLoadsSnapshotThenReplaysTail` / `RaftSnapshotDisk.TornSnapshotDiscarded` |
+| R6 | torn-snapshot | 启动失败 | 魔数/版本/CRC 校验 → 丢弃回落全量日志 | `RaftSnapshotDisk.TornSnapshotDiscarded` |
+| R7 | 去重表未随快照序列化 | 重启后二次 apply | 视图/恢复包含 `lastRequest_` | `RaftSnapshot.DedupTableSurvivesSnapshot` |
+| R8 | 快照传输期间 propose 阻塞 | 可用性下降 | 每 tick 每 peer 1 chunk | `RaftSnapshot.InstallSnapshotCatchesUpLaggingFollower`、e2e |
+| R9 | InstallSnapshot 单包超 64 MiB | 传输失败 | 1 MiB 分块 + 帧上限校验 | `RaftSnapshot.InstallSnapshotCatchesUpLaggingFollower` |
+| R10 | 分块 offset 不连续 | 快照损坏 | `offset != 当前大小 → 重置重传` | `RaftSnapshot.InstallSnapshotRetransmitAfterLostReplies` |
 | R11 | 锁内序列化大 KV / 锁内 IO | ticker/propose 卡死 | L8 | 评审 + A 组时序检查 |
 | R12 | `restore` 期间并发读 sm_ | 数据竞争 | `restore` 在 `mu_` 锁内执行 | 评审 |
 | R13 | 阈值默认值不合理（10000 条） | 测试过慢/过快 | 测试显式设小阈值（如 8）；默认值仅生产用 | 全部 A 组 |
@@ -203,4 +203,5 @@ M3 起点基线**已在本轮重新执行、全部通过**：
 
 1. ✅ **VM 通道**：已配置公钥免密，`本地 ↔ 虚拟机` 同步可用（tar/scp 同步 + md5 校验一致）。
 2. ✅ **基线复验**：§0 的 6 条命令已在本轮 VM 实测全部通过。
-3. ⏭️ **下一步 #2（TDD 测试先行）**：新增 `tests/raft_snapshot_test.cpp`（A 组 10 例 + B 组 4 例），编译并**跑出 RED**。
+3. ⏭️ **下一步 #2（TDD 测试先行）**：新增 `tests/raft_snapshot_test.cpp`（首轮 A 组 10 例 + B 组 4 例），编译并**跑出 RED**。
+   （**后补**：该文件最终共 **25** 个用例 —— `RaftSnapshot` 13 + `RaftSnapshotDisk` 6 + `RaftSnapshotStream` 3 + `RaftSnapshotStore` 2 + `RaftSnapshotResume` 1，含 M5 追加的流式/续传/并发用例。）

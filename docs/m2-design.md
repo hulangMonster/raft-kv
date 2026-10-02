@@ -26,10 +26,10 @@
 
 - 快照与日志压缩（**M3**）
 - 在线成员变更（**M4**）
-- ReadIndex / Lease Read 优化读（**M5**）
-- 批处理 / 组提交 / pipeline 复制（**M5**）
-- gRPC 迁移、TLS/鉴权、多分片、跨机部署（**M5 或不做**）
-- 异步/协程网络模型（M2 沿用 M1 的线程池模型，M5 再换 epoll）
+- ~~ReadIndex / Lease Read 优化读~~ —— **已在 M4 落地**（`RaftNode::linearizableGet`，msgType 9/14）
+- ~~批处理 / 组提交 / pipeline 复制~~ —— **已在 M5 落地**（`LogStore::appendNoSync/sync`、`--inflight-per-peer`）
+- gRPC 迁移、TLS/鉴权、多分片、跨机部署（**至今未做**）
+- ~~异步/协程网络模型~~ —— **已在 M5 落地**（epoll Reactor，`--transport=reactor`；默认仍是同步 `TcpTransport`）
 
 ---
 
@@ -38,12 +38,12 @@
 | M1 组件 | M2 中的角色 | 动作 |
 |---|---|---|
 | `common.h` 大端编解码、日志 | RPC 消息编解码 | 复用 |
-| `codec.{h,cpp}` 长度前缀帧 | peer RPC 与客户端协议统一帧格式 | 扩展（加消息类型字段） |
-| `thread_pool.h` | RPC 服务端 worker + 出站 RPC 执行池 | 复用 |
+| `codec.{h,cpp}`（版本 + op，**无长度前缀**） | 仅 M1 单机协议 | **未复用**：peer RPC 另起 `raft/message.{h,cpp}`，帧为 `[len:4][type:1][payload]` |
+| `thread_pool.h` | 仅 M1 服务端使用 | **未用于 Raft 节点**（节点为 1 ticker + accept + 每连接 1 线程，上限 256） |
 | `server.cpp` accept/连接处理模式 | RPC 监听与连接分发 | 复用模式，新增消息分发 |
 | `wal.{h,cpp}` CRC 记录格式与 torn-tail 处理 | **LogStore 的持久化格式基础** | 复用思路 + 扩展字段 |
-| `store.{h,cpp}` | **降级为纯内存 StateMachine** | **重构：去掉它自带的 WAL** |
-| `main_client.cpp` | 加 Leader 重定向 + 重试 + `status` 命令 | 扩展 |
+| `store.{h,cpp}` | **原样保留**（M1 单机版，仍自带 WAL） | 不动；另新增 `src/kv/kv_state_machine.{h,cpp}` 作为 Raft 状态机 |
+| `main_client.cpp` | M1 单机 CLI，**未改动** | 不动；重定向/重试/拓扑缓存在新增的 `main_raft_client.cpp` |
 | `main_server.cpp` | 变为"单节点 M1 模式"的保留入口 | 保留，新增 `main_raft_node.cpp` |
 
 ### 2.1 关键决策 D1：KV 不再自带 WAL
@@ -113,21 +113,24 @@ src/
 ├── raft/
 │   ├── types.h            类型别名(Role/Term/Index)、LogEntry、RPC 消息结构体
 │   ├── message.{h,cpp}    消息 ↔ 字节 的编解码（复用 common.h 工具与 M1 帧格式）
-│   ├── log_store.{h,cpp}  LogStore 接口 + FileLogStore / MemoryLogStore
-│   ├── state_machine.{h,cpp} KV 状态机 + 幂等去重表
+│   ├── log_store.h        LogStore 接口 + MemoryLogStore
+│   ├── file_log_store.cpp FileLogStore（文件实现）
+│   ├── memory_adapters.cpp MemoryLogStore 等内存适配器
+│   ├── state_machine.h    StateMachine 接口
 │   ├── transport.h        Transport 接口 + MemoryTransport
 │   ├── transport_tcp.{h,cpp} 长连接 + 重连的 TCP 适配器
 │   ├── clock.h            Clock 接口 + SteadyClock + FakeClock
 │   └── raft_node.{h,cpp}  共识核心（选主/复制/提交/角色转换）
+├── kv/kv_state_machine.{h,cpp}  KV 状态机 + 幂等去重表
 ├── main_raft_node.cpp     节点进程入口（Raft + KV + 客户端协议服务）
 ├── main_server.cpp        M1 单机入口（保留）
-└── main_client.cpp        扩展：Leader 重定向、重试、status
+└── main_raft_client.cpp   集群客户端：Leader 重定向、重试、拓扑缓存、status
 tests/
-├── test_raft_election.cpp  选主与任期（fake clock + memory transport）
-├── test_raft_log.cpp       复制、冲突截断、追赶
-├── test_raft_commit.cpp    提交规则（含 §5.4.2 反例）
-├── test_raft_restart.cpp   持久化与重启恢复（FileLogStore）
-└── test_kv_idempotent.cpp  幂等重试
+├── raft_election_test.cpp  选主与任期（fake clock + memory transport）
+├── raft_log_test.cpp       复制、冲突截断、追赶
+├── raft_commit_test.cpp    提交规则（含 §5.4.2 反例）
+├── raft_restart_test.cpp   持久化与重启恢复（FileLogStore）
+└── raft_idempotent_test.cpp 幂等重试
 scripts/
 ├── raft_e2e.sh            3 进程生命周期 + kill -9 Leader
 └── raft_fault.sh          分区/宕机注入 + 重复稳定性
@@ -190,6 +193,11 @@ struct RaftConfig {
 };
 }  // namespace raftkv::raft
 ```
+
+> **接口现状（后补）**：下面这些代码块是 M2 当时设计的**原始签名**。实际头文件在 M3–M5 又做了向后兼容的扩展，
+> 一律以 `src/raft/*.h` 为准：`log_store.h` 增加 `appendNoSync/sync/truncateSuffixNoSync/compact/setBoundary` 等；
+> `transport.h` 增加 `sendInstallSnapshot/sendReadProbe/isAsync/addPeer/removePeer`；
+> `state_machine.h` 增加 `snapshotView/restore`；`RaftNode` 构造函数为 7 参（多出 `SnapshotStore*` / `ClusterConfig seed` / `Metrics*`）。
 
 ```cpp
 // src/raft/log_store.h —— 持久化日志与元数据（term / votedFor）
@@ -283,13 +291,13 @@ class RaftNode {
 
 | 线程 | 职责 |
 |---|---|
-| ticker（1 个） | 每 10ms 调 `RaftNode::tick()`：选举超时检查、Leader 心跳与补日志 |
-| RPC worker 池（N=4） | 处理入站 RPC：`onRequestVote` / `onAppendEntries`；以及客户端 `propose` |
-| 出站 RPC 池（N=4） | 执行 `Transport::send*`（阻塞的网络调用），回调再回到 `RaftNode` |
-| accept（1 个） | 复用 M1 模式，收连接后投递给 worker 池 |
+| ticker（1 个） | 周期性调 `RaftNode::tick()`：选举超时检查、Leader 心跳与补日志 |
+| accept 主线程（1 个） | 复用 M1 的 accept 模式；**每个连接 1 个 detached 线程**（`kMaxConns = 256`），没有固定 worker 池 |
+| 出站 RPC | **无独立线程池**：同步引擎在调用线程（ticker / flusher）内联执行 `Transport::send*` |
 
 **锁纪律（必须遵守，否则必出死锁）**：
-1. `RaftNode` 内单一 `std::mutex mu_`，**所有状态读写都在锁内**。
+1. `RaftNode` 内**单一主锁** `mu_`（M5 起为 `ProbedMutex`），**所有共识状态读写都在锁内**；M5 另加三个叶子锁
+   （`membershipMu_` / `metaPersistMu_` / `snapshotOpMu_`），`FileLogStore` 自持 `mu_` / `flushMu_`。
 2. **绝不在持锁期间做网络 IO 或 fsync**：需要发送时，先在锁内构造消息放入"出站队列"，解锁后由出站池发送。
 3. `propose()` 用 `condition_variable` 等待提交结果；等待时**不持锁**。
 
@@ -389,7 +397,7 @@ Leader 只在满足**两个条件**时推进 `commitIndex`：
 ### 6.6 领导权变更时挂起的请求
 
 `propose()` 在等待期间若检测到本节点不再是 Leader（或 term 变化）→ 立即返回 `kNotLeader + leaderHint`，不等超时。
-CLI 收到 `kNotLeader` → 连接 hint 节点重试（最多 3 次，总预算 1s）。
+CLI 收到 `kNotLeader` → 连接 hint 节点重试（`attempt <= 3`，即最多 4 次；**无统一总预算**，单次请求超时 500ms）。
 
 ---
 
@@ -397,24 +405,26 @@ CLI 收到 `kNotLeader` → 连接 hint 节点重试（最多 3 次，总预算 
 
 ### 7.1 确定性单测（FakeClock + MemoryTransport，毫秒级、不 flaky）
 
-| 测试 | 断言 |
+> 下表"测试"列已换成 `tests/` 里**实际存在**的 gtest 用例名（`<Suite>.<Case>`）。
+
+| 测试（实际名） | 断言 |
 |---|---|
-| `test_single_node_becomes_leader` | 单节点集群，advance 超时后 role==kLeader |
-| `test_only_one_leader_per_term` | 3 节点跑 100 个随机 tick 序列，同 term 内 leader 数 ≤ 1 |
-| `test_split_vote_resolved_by_next_timeout` | 两候选同时竞选（票分裂）→ 下一个超时窗口内选出唯一 Leader |
-| `test_vote_rejected_when_log_stale` | 日志落后的候选人拿不到票 |
-| `test_replication_all_logs_match` | propose 20 条后，3 节点日志逐条 (index,term) 相同 |
-| `test_commit_requires_majority` | 只有 1 个 Follower ack 时 commitIndex 不前进；第 2 个 ack 后前进 |
-| `test_old_term_entry_not_committed_by_count` | §5.4.2 反例场景：多数派复制了旧 term 条目，但不得提交 |
-| `test_conflicting_suffix_truncated_on_leader_change` | 少数派上的脏后缀在收到新 Leader 的 AppendEntries 后被截断 |
-| `test_lagging_follower_catches_up` | 停掉的 Follower 恢复后，日志追平 |
-| `test_term_and_vote_persisted_before_reply` | 用 spy LogStore 断言"持久化调用发生在 RPC 返回之前" |
-| `test_kv_apply_idempotent_on_retry` | 同 (clientId,requestId) apply 两次，值只变一次 |
-| `test_propose_returns_not_leader_after_step_down` | Leader 降级后挂起的 propose 立即返回 kNotLeader |
+| `RaftElection.SingleNodeBecomesLeader` | 单节点集群，advance 超时后 role==kLeader |
+| `RaftElection.OnlyOneLeaderPerTerm` | 3 节点跑随机 tick 序列，同 term 内 leader 数 ≤ 1 |
+| `RaftElection.SplitVoteResolvedByNextTimeout` | 两候选同时竞选（票分裂）→ 下一个超时窗口内选出唯一 Leader |
+| `RaftElection.VoteGrantedToUpToDateCandidate` | 投票的日志新旧限制（落后候选人拿不到票） |
+| `RaftLog.ReplicationAllLogsMatch` | propose 若干条后，3 节点日志逐条 (index,term) 相同 |
+| `RaftCommit.CommitRequiresMajority` | 只有 1 个 Follower ack 时 commitIndex 不前进；多数派 ack 后前进 |
+| `RaftCommit.OldTermEntryNotCommittedByCount` | §5.4.2 反例场景：多数派复制了旧 term 条目，但不得提交 |
+| `RaftLog.ConflictingSuffixTruncatedOnLeaderChange` | 少数派上的脏后缀在收到新 Leader 的 AppendEntries 后被截断 |
+| `RaftLog.LaggingFollowerCatchesUp` | 停掉的 Follower 恢复后，日志追平 |
+| `RaftElection.TermAndVotePersistedBeforeReply` | 用 spy LogStore 断言"持久化调用发生在 RPC 返回之前" |
+| `KvIdempotent.ApplyIsIdempotentOnRetry` | 同 (clientId,requestId) apply 两次，值只变一次 |
+| `ProposeStepDown.ReturnsNotLeaderAfterStepDown` | Leader 降级后挂起的 propose 立即返回 kNotLeader |
 
 ### 7.2 崩溃与持久化测试（真实文件）
 
-- `test_raft_restart.cpp`：写入 → 析构节点 → 用同一目录重建 → term/votedFor/lastIndex 与新状态机重放结果一致
+- `FileLogStore.RestartRestoresMetaAndLog`（`tests/raft_restart_test.cpp`）：写入 → 析构节点 → 用同一目录重建 → term/votedFor/lastIndex 与重放结果一致
 - 手工追加垃圾字节到 `raft.log` 尾部 → 重建后仍是有效前缀（沿用 M1 已验证的 torn-tail 行为）
 
 ### 7.3 端到端与故障注入（真实时钟、真实进程）
@@ -422,8 +432,8 @@ CLI 收到 `kNotLeader` → 连接 hint 节点重试（最多 3 次，总预算 
 ```bash
 # 3 节点生命周期 + kill -9 Leader
 scripts/raft_e2e.sh
-  1. 启动 3 节点（临时 data dir，端口 19601/19602/19603）
-  2. 轮询 `raftkv_cli status` 直到出现 Leader（超时 5s）
+  1. 启动 3 节点（临时 data dir；端口在 19000–19799 随机选取，避免与并发测试冲突）
+  2. 轮询 `raftkv_raft_cli status` 直到出现 Leader
   3. 写入 k=v，读回校验
   4. kill -9 Leader → 轮询新 Leader ≤ 2s → 写读继续成功
   5. kill 第 2 个节点（只剩 1 个）→ 写必须失败（NOT_LEADER 或 ERR），且不得返回 OK
@@ -446,11 +456,11 @@ scripts/raft_fault.sh --repeat 50
 
 | 阶段 | 交付物 | 验收命令 / 断言 | 预估 |
 |---|---|---|---|
-| **M2.1** | `types.h`、`message`、`clock.h`、`MemoryLogStore`、`MemoryTransport`、单节点自选主 | `raftkv_tests --filter raft_election` 中 `test_single_node_becomes_leader` PASS | 3–4h |
-| **M2.2** | 3 节点选主、心跳续任、任期规则、投票限制 | `test_only_one_leader_per_term`、`test_split_vote_resolved_by_next_timeout`、`test_vote_rejected_when_log_stale` PASS | 6–8h |
-| **M2.3** | 日志复制、提交规则、`KvStateMachine`、`propose`、客户端 NOT_LEADER + 重试 | `test_replication_all_logs_match`、`test_commit_requires_majority`、`test_old_term_entry_not_committed_by_count`、`raft_e2e.sh` 前 3 步 PASS | 8–10h |
-| **M2.4** | `FileLogStore`（meta + log + truncate）、重启恢复、kill -9 语义 | `test_raft_restart`、`test_term_and_vote_persisted_before_reply`、`raft_e2e.sh` 全部步骤 PASS | 6–8h |
-| **M2.5** | 冲突快速回退（conflictIndex/conflictTerm）、故障注入脚本、稳定性打磨 | `test_conflicting_suffix_truncated_on_leader_change` + `raft_fault.sh --repeat 50` 全绿 | 4–6h |
+| **M2.1** | `types.h`、`message`、`clock.h`、`MemoryLogStore`、`MemoryTransport`、单节点自选主 | `raftkv_raft_tests --gtest_filter='RaftElection.*'` 中 `SingleNodeBecomesLeader` PASS | 3–4h |
+| **M2.2** | 3 节点选主、心跳续任、任期规则、投票限制 | `OnlyOneLeaderPerTerm`、`SplitVoteResolvedByNextTimeout`、`VoteGrantedToUpToDateCandidate` PASS | 6–8h |
+| **M2.3** | 日志复制、提交规则、`KvStateMachine`、`propose`、客户端 NOT_LEADER + 重试 | `ReplicationAllLogsMatch`、`CommitRequiresMajority`、`OldTermEntryNotCommittedByCount`、`raft_e2e.sh` 前 3 步 PASS | 8–10h |
+| **M2.4** | `FileLogStore`（meta + log + truncate）、重启恢复、kill -9 语义 | `FileLogStore.RestartRestoresMetaAndLog`、`RaftElection.TermAndVotePersistedBeforeReply`、`raft_e2e.sh` 全部步骤 PASS | 6–8h |
+| **M2.5** | 冲突快速回退（conflictIndex/conflictTerm）、故障注入脚本、稳定性打磨 | `RaftLog.ConflictingSuffixTruncatedOnLeaderChange` + `raft_fault.sh --repeat 50` 全绿 | 4–6h |
 
 **顺序上的取舍**：M2.1–M2.3 用内存 LogStore + FakeClock 先把**算法**跑对（确定性、秒级反馈），M2.4 再引入真实持久化与崩溃语义。这样每个阶段都有清晰的成功判据，避免"算法没对就陷进文件 IO 调试"。
 

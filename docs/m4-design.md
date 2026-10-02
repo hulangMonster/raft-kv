@@ -20,7 +20,8 @@
 
 ### 1.2 非目标（明确推迟）
 
-- M5 性能项（异步/per-peer transport、快照流式序列化、火焰图、分段日志、tick no-op 绕组提交、`main_raft_node` 线程池化）。
+- M5 性能项：~~异步/per-peer transport~~（**已在 M5 落地**：`--transport=reactor`）、~~快照流式序列化~~（**已在 M5.4 落地**：`saveStreaming()`）、
+  火焰图（未做）、分段日志（**至今未做**）、~~tick no-op 绕组提交~~（**已在 M5 落地**）、`main_raft_node` 线程池化（**至今未做**，仍是每连接 1 线程）。
 - 自动扩缩容、跨机房/多区域部署、完整 Learner 日志追赶优化（CatchUp 只做"追平后才能投票"的最小实现）。
 - 完整 Joint Consensus 状态机（本次采用"一次一个 + 双重多数派"，见决策①）。
 - 动态地址自动发现（地址由 `add` 命令显式给出，见决策⑦）。
@@ -41,11 +42,11 @@ M2 决策 D1 规定"**Raft log 是唯一持久化真相源**"。M4 因此**不�
 
 沿用 m2-prerequisites.md 的 **I1~I8** 与 m3-design.md 的 **"快照 ≤ lastApplied"、"先 durable 快照、后 compact"**，M4 新增：
 
-- **J1**：同一时刻**至多一个成员变更在途**（`configChangeInFlight_` 非空即拒绝新的变更请求）。
+- **J1**：同一时刻**至多一个成员变更在途**（`inFlightConfigIndex_ != kNoIndex` 即拒绝新的变更请求）。
 - **J2**：配置条目自身的提交判定必须同时满足 **majority(C_old)** 与 **majority(C_new)**。
 - **J3**：`ClusterConfig::version` 严格单调，且只能由日志推进（配置条目的 `index`）；任何更小版本的配置**必须被拒绝**，不得回退拓扑。
 - **J4**：被移除的节点**不再参与投票、不计入任何多数派**，其 `RequestVote` 被忽略、其日志不一致不阻塞提交。
-- **J5**：`C_old ∩ C_new ≠ ∅`（由 J1 的"一次一个"保证），因此过渡期不存在两个不相交多数派各自选出 Leader。
+- **J5**（文档编号；代码注释只单列了 J1–J4）：`C_old ∩ C_new ≠ ∅`（由 J1 的"一次一个"保证），因此过渡期不存在两个不相交多数派各自选出 Leader。
 
 ### 2.3 复用 / 扩展 / 刻意不做
 
@@ -267,7 +268,7 @@ v2（M4）: 在 v1 之后追加
 
 | 阶段 | 规则 |
 |---|---|
-| **追加** | 仅 Leader；`configChangeInFlight_` 为空时才允许（J1）；`changeMembership()` 内部走既有 `propose` 路径（`op=kConfig`，`clientId=0/requestId=0`），复用组提交与 `syncedIndex_` 门控 |
+| **追加** | 仅 Leader；`configChangeInFlight_` 为空时才允许（J1）；`changeMembership()` **不再走 `propose()`**，而是持 `membershipMu_` 后直接用 `appendEntryLocked()` + `awaitCommit()`（`op=kConfig`，见 §12 第 8 条的 B6 重构），复用组提交与 `syncedIndex_` 门控 |
 | **复制** | 与普通条目一致；peer 集合 = `currConfig_.members ∪ pendingPeers_`（后者用于 CatchUp） |
 | **提交** | 普通条目：majority(`currConfig_`)；**在途配置条目**：majority(`prevConfig_`) 且 majority(`currConfig_`)（J2） |
 | **生效** | 节点在本地日志中首次看到 index 更大的配置条目即切换 `currConfig_`（旧配置存入 `prevConfig_`）；提交后清空 `prevConfig_` 并置 `inFlightConfigIndex_ = kNoIndex` |
@@ -277,9 +278,9 @@ v2（M4）: 在 v1 之后追加
 
 ```cpp
 // 所有需要“多数派”的地方都必须经过这两个函数，禁止散落计算
-size_t RaftNode::majorityOf(const ClusterConfig& c) const { return c.majority(); }
-bool RaftNode::hasMajority(const ClusterConfig& c,
-                           const std::function<bool(int)>& acked) const;
+// 实际实现（以 src/raft/*.h 为准）：
+size_t ClusterConfig::majority() const;                       // cluster_config.h
+bool RaftNode::hasMajorityLocked(const ClusterConfig& c, Index index) const;  // raft_node.h
 ```
 
 - **提交普通条目**：`hasMajority(currConfig_, matchIndex_ >= n)`；
@@ -348,7 +349,8 @@ linearizableGet(key, timeoutMs):
 沿用 M2 的 L1–L7 与 M3 的 L8/L9，新增：
 
 - **L10（地址簿与成员清理出锁执行）**：`Transport::addPeer/removePeer`、被移除节点的连接清理等一律**锁外作业**执行；锁内只收集/登记。
-- **L11（锁序）**：`RaftNode::mu_` → `Transport::mu_` → `LogStore::mu_`；由于 L10，Transport 锁只在锁外获取，**任何路径都不得在持有 Transport 锁时回调 RaftNode**（既有 `roundTrip` 已满足：回调在外层、锁内不做 cb）。
+- **L11（锁序）***：`RaftNode::mu_` → `Transport::mu_` → `LogStore::mu_`；由于 L10，Transport 锁只在锁外获取，**任何路径都不得在持有 Transport 锁时回调 RaftNode**（既有 `roundTrip` 已满足：回调在外层、锁内不做 cb）。
+  （\* 代码注释里单独标注的只有 L10 / L12 / L15，L11 未单独成注释；锁序本身由实现保证。）
 - **条件变量谓词**：`cv_` 的等待谓词必须包含 `retired_` 与配置代际（`configVersion` 或 `inFlightConfigIndex_`），避免节点退役/变更后请求永久阻塞。
 - **配置对象生命周期**：`clusterConfig()` 返回**值拷贝**；内部一律持锁读，禁止把 `currConfig_` 的引用/指针带出锁外。
 
@@ -375,23 +377,26 @@ linearizableGet(key, timeoutMs):
 
 ### 8.1 A 组（确定性：FakeClock + MemoryTransport + MemoryLogStore + MemorySnapshotStore，零 flaky）
 
-| # | 用例 | 断言要点 |
+> 下表"用例"列已换成 `tests/raft_membership_test.cpp` 里**实际存在**的 gtest 用例名。实际名统一带 `A<n>_` / `B<n>_` 前缀
+> （suite 为 `RaftMembership` / `RaftMembershipDisk`，如 `RaftMembership.A1_ConfigSerdeRoundTrip`）。
+
+| # | 用例（实际名） | 断言要点 |
 |---|---|---|
-| A1 | `ConfigSerdeRoundTrip` | 编解码往返一致；截断/CRC 错误被拒 |
-| A2 | `ConfigEntryReplicatedToAllPeers` | 3 节点追加配置条目后三者 `clusterConfig()` 相同 |
-| A3 | `BootstrapSeedBecomesInitialConfig` | `--peers` → version=0 配置；self 在配置内 |
-| A4 | `AddRequiresCatchUpBeforeVoting` | 未追平的新节点不计入多数派、不被计票 |
+| A1 | `A1_ConfigSerdeRoundTrip` | 编解码往返一致；截断/CRC 错误被拒 |
+| A2 | `A2_AddReplicatesConfigToAllNodes` | 3 节点追加配置条目后三者 `clusterConfig()` 相同 |
+| A3 | `A3_SeedBecomesInitialConfig` | `--peers` → version=0 配置；self 在配置内 |
+| A4 | `A4_UnreachableNewNodeIsNotAddedAndDoesNotCount` | 未追平的新节点不计入多数派、不被计票 |
 | A5 | `AddCommitsAndTakesEffect` | 追平后 add 成功；多数派按 C_new 计算 |
 | A6 | `RemoveTakesEffectAndStopsCounting` | 移除后旧节点不再被计票，且不阻塞提交 |
-| A7 | `SecondChangeRejectedWhileInFlight` | 在途变更期间第二个变更被拒（J1） |
+| A7 | `A7_SecondChangeRejectedWhileOneInFlight` | 在途变更期间第二个变更被拒（J1） |
 | A8 | `ConfigCommitNeedsBothMajorities` | 构造 C_old 多数派缺失 → 配置条目不提交 |
-| A9 | `ElectionRespectsNewConfig` | 变更后旧节点无法当选；退役节点不竞选 |
+| A9 | `A9_RemovedNodeCannotWinElection` | 变更后旧节点无法当选；退役节点不竞选 |
 | A10 | `RemovedNodeRetiresAndRedirects` | 被移除节点：不竞选、写请求回 `kNotLeader`、仍答 status |
-| A11 | `ConfigVersionMonotonicRejectsStale` | 更小版本的配置被拒（J3） |
+| A11 | `A11_StartupRejectsNonMonotonicConfigVersions` | 更小版本的配置被拒（J3） |
 | A12 | `SnapshotCarriesConfigAndRestartKeepsTopology` | 快照携带配置；重启后拓扑不丢 |
-| A13 | `ReadIndexLinearizableAcrossLeaderChange` | 旧 Leader 降级后读不返回陈旧值 |
+| A13 | `A13_ReadIsNotServedByStaleLeader` | 旧 Leader 降级后读不返回陈旧值 |
 | A14 | `ReadIndexRequiresQuorum` | 少数派 Leader 读超时失败 |
-| A15 | `SupraRulesHoldAcrossMembershipChange` | §5.4.2 反例在成员变更后仍成立 |
+| A15 | `A15_SupraRuleHoldsAfterMembershipChange` | §5.4.2 反例在成员变更后仍成立 |
 | A16 | `LeaderSelfRemovalStepsDownAfterCommit` | Leader 自我移除：提交生效后才下台（§5.7） |
 | A17 | `ConfigMessageCodec` | 7/8/9/14 消息编解码往返；截断被拒 |
 | A18 | `InstalledSnapshotCarriesConfig` | 靠 InstallSnapshot 追平的节点继承快照里的配置（M4.3） |
@@ -414,11 +419,11 @@ linearizableGet(key, timeoutMs):
 | B1 | `ConfigPersistsAcrossRestart` | 重启后配置与版本号一致 |
 | B2 | `ConfigCompactedThenRecoveredFromSnapshot` | 配置条目被 compact 后仍能从快照恢复拓扑 |
 | B3 | `CrashDuringConfigChangeKeepsConsistentTopology` | 变更中途 kill -9：重启后配置要么是 C_old 要么是 C_new，不存在第三种 |
-| B4 | `RKS1V1SnapshotStillLoads` | M3 的 v1 快照文件仍能解码（config 为空） |
+| B4 | `B4_Rks1V1SnapshotStillLoads` | M3 的 v1 快照文件仍能解码（config 为空） |
 
 ### 8.3 脚本验收
 
-- `scripts/raft_membership_e2e.sh`：3 节点启动 → 压测（`fill` + `verify`）→ `add` 第 4/5 节点 → 继续压测（**无长时间失败**）→ `remove` 1 个节点 → 校验拓扑（`config`/status）与线性一致读（`get` 必须命中已提交值）；
+- `scripts/raft_membership_e2e.sh`：3 节点启动 → 压测（`fill` + `verify`）→ `add` **第 4 个节点** → 继续压测（**无长时间失败**）→ `remove` 1 个节点 → 校验拓扑（`config`/status）与线性一致读（`get` 必须命中已提交值）；
 - `scripts/raft_membership_fault.sh --repeat 50`：变更窗口内注入 `kill -9` / `SIGSTOP`，每轮结束后校验：拓扑一致（所有存活节点 `config_version` 相同或单调推进）、压测可继续、无脑裂读。
 - `scripts/raft_membership_e2e.sh` 追加两步（**评审 O5 / 决策⑦ 的验收目标**）：**6)** `--peers` 只给一个非 Leader 种子 → 客户端仍能按最新拓扑路由到 Leader 完成线性一致读；**7)** `--host` 指向不可达端口 → 客户端自动换节点后仍能完成读。
 

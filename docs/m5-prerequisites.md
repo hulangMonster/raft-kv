@@ -22,13 +22,13 @@
 
 | # | 不变量 | 如何断言 |
 |---|---|---|
-| **I9** | 持 `mu_` 期间不发生 `fsync`、不发生任何网络 IO（锁内允许 page-cache `write`） | `SpyLogStore` + `MuHeldGuard` 线程局部标志：持锁窗口内 `sync/compact/persistMeta` 调用数 == 0（M5.A1） |
-| **I10** | 一次 fsync 摊一批；只有 durable 之后才对外声明持久（`syncedIndex_` 语义不变） | M5.A2：`fsync 次数 ≤ 批次数`，且 sync 失败时 `syncedIndex_` 不推进 |
-| **I11** | 回复 `AppendEntries success` / `RequestVote granted` 之前，该批 entries / `term+votedFor` 必须已 durable | M5.A3（卡住 sync → 不 ack）、M5.A4（卡住 persistMeta → 不 granted） |
-| **I12** | 异步发送不改变 §5.4.2 / J2 / §8 屏障的判定输入集合 | M5.A5：乱序/重复 ack 下 `matchIndex_` 单调、多数派判定与同步引擎一致 |
-| **I13** | 指标只读、无副作用、不得成为任何正确性判定的输入 | M5.A7：指标单调；关闭指标的全部用例行为不变；指标不在任何分支条件里 |
-| **I14** | 不改变 wire 格式、磁盘格式与对外错误码语义（`RKS1` v1 仍可解） | M5.B2 + 既有 B4（`Rks1V1SnapshotStillLoads`）保持绿 |
-| **I15** | （M5.3 实测新增）异步引擎下"该 peer 已有一批在途"的**静音窗口必须严格小于 follower 的最小选举超时**（取 `electionTimeoutMinMs/3`，且不超过 `2*rpcTimeoutMs`） | M5.A10 钉住不变量（含 tick 10ms 余量与极端配置）；reactor 引擎 `raft_fault.sh --repeat 50` 连续 3 轮通过 |
+| **I9** | 持 `mu_` 期间不发生 `fsync`、不发生任何网络 IO（锁内允许 page-cache `write`） | `SpyLogStore` + `lockprobe::consensusHeld()`（`ProbedMutex` 线程局部持锁深度）：持锁窗口内 `sync/compact/persistMeta` 调用数 == 0（`RaftPerf.A1_LockHeldDurableCallsAndSendsAreZero`） |
+| **I10** | 一次 fsync 摊一批；只有 durable 之后才对外声明持久（`syncedIndex_` 语义不变） | `RaftPerf.A4_FailedSyncDoesNotAckOrAdvance`（sync 失败不得 ack、不得推进 `syncedIndex_`）+ `RaftPerf.A16_NextFlushWaitsForInFlightSends`（批与批的边界） |
+| **I11** | 回复 `AppendEntries success` / `RequestVote granted` 之前，该批 entries / `term+votedFor` 必须已 durable | `RaftPerf.A4_FailedSyncDoesNotAckOrAdvance`（卡住/失败 sync → 不 ack）、`RaftPerf.A3_MetaPersistOutsideLockThenGrant`（persistMeta 期间锁空闲，durable 后才 granted） |
+| **I12** | 异步发送不改变 §5.4.2 / J2 / §8 屏障的判定输入集合 | `RaftPerf.A11_SlidingWindowOutOfOrderAcksAreIdempotent`：乱序/重复 ack 下 `matchIndex_` 单调、多数派判定与同步引擎一致 |
+| **I13** | 指标只读、无副作用、不得成为任何正确性判定的输入 | `RaftPerf.A6_MetricsCountersAndStatusFragment`：指标可渲染、只在请求时读取；指标不在任何分支条件里 |
+| **I14** | 不改变 wire 格式、磁盘格式与对外错误码语义（`RKS1` v1 仍可解） | `RaftSnapshotStream.SaveStreamingWritesIdenticalFile` + 既有 `RaftMembershipDisk.B4_Rks1V1SnapshotStillLoads` 保持绿 |
+| **I15** | （M5.3 实测新增）异步引擎下"该 peer 已有一批在途"的**静音窗口必须严格小于 follower 的最小选举超时**（取 `electionTimeoutMinMs/3`，且不超过 `2*rpcTimeoutMs`） | M5.A10 钉住不变量（含 tick 10ms 余量与极端配置）；`raft_fault.sh --repeat 50` 连续 3 轮通过（脚本走默认 sync 引擎） |
 | **I17** | （M5.6 新增）滑动窗口下 `nextIndex_` 允许**乐观推进**（发出即推进），但每一批的"未确认区间"必须始终存在回退/重发路径：① 槽位 TTL 过期 → `nextIndex_` 回退到该批起点；② 收到失败应答 → 清空该 peer 全部在途槽位并从冲突点重发。否则丢一帧（reactor 超时丢弃且不回调）= **丢写** | M5.A11（乱序/重复 ack 幂等 + `matchIndex_` 单调 + 窗口宽度不超限）；reactor 故障注入 3 脚本通过 |
 | **I16** | （M5.3 实测新增）**会改日志边界/快照文件的整段操作必须彼此串行**（`maybeSnapshot` 的 save+compact 与 `onInstallSnapshot` 的 receive+load+compact）；且 **transport 回调中逃逸的异常不得让节点无诊断地静默死亡** | 机制复现脚本（reactor + `--snapshot-threshold 200` + `fill 20000 --pipeline 64`）×5 全部无节点死亡；reactor 全量 e2e/fault 五个脚本全绿 |
 
@@ -47,29 +47,30 @@
 | **L12** | **锁内只允许 `LogStore::appendNoSync`（write）**；`sync/compact/persistMeta` 一律在锁外执行，回锁后必须重新校验（term/role/lastIndex/installEpoch） |
 | **L13** | `metaPersistMu_` 是叶子锁，锁序 **`metaPersistMu_ → mu_`**；持 `mu_` 时绝不获取它。"决定 term/votedFor → 落盘 → 回锁校验"整体在 `metaPersistMu_` 下串行，保证**磁盘 meta 版本单调** |
 | **L14** | `Reactor` 线程**从不持有 `mu_`**；它只触发回调，回调入口自己取 `mu_`（与今日同步回调一致）。`Transport` 内部锁序列保持在 `mu_` 之外，锁序不变 |
-| **L15** | 关闭顺序：`Reactor::stop()`（停 epoll → 关连接 → 丢弃在途回调）→ join reactor → join ticker → 再析构 `RaftNode`/store；**禁止再用 `std::_Exit(0)` 绕过析构** |
+| **L15** | 关闭顺序：`Reactor::stop()`（停 epoll → 关连接 → 丢弃在途回调）→ join reactor → join ticker → 再析构 `RaftNode`/store。**实际**：`src/main_raft_node.cpp` 末尾仍以 `std::_Exit(0)` 收尾（为 detached 连接线程兜底）—— 该项**未按原计划移除** |
 | **L16** | （M5.2 实测新增）任何"把 IO 移出 `mu_`"的改动，必须确认被移出方与**仍留在锁内**的调用方之间原有的互斥/顺序关系是否被打破；被移出方若曾借用 `mu_` 互斥，必须自己补锁（例：`FileLogStore::appendNoSync` 依赖 `mu_` 与 `compact()` 互斥，出锁后必须改为 store 自持锁） |
-| **L18** | （M5.6 新增）在途槽位表 `appendInflight_` 受 `mu_` 保护；`peerSendAllowedLocked()` 只**读**（统计未过期槽位），回收与 `nextIndex_` 回退只在非 const 的 `pruneInflightLocked()` 里做（`approveAppendSend` 开头调用）。槽位 TTL 复用 I15 的 `inflightMuteGapMs()`，因此"窗口满"的静音时长仍严格小于最小选举超时 | （M5.3 实测新增）`snapshotOpMu_` 是叶子锁，锁序 **`snapshotOpMu_ → RaftNode::mu_`**；只在 `mu_` 之外获取，持 `mu_` 时绝不获取它。持它期间做的是 save/load/compact/install（含 fsync），因此**不违反 I9**（共识锁仍未被长 IO 占住） |
+| **L17** | （M5.3 实测新增）`snapshotOpMu_` 是叶子锁，锁序 **`snapshotOpMu_ → RaftNode::mu_`**；只在 `mu_` 之外获取，持 `mu_` 时绝不获取它。持它期间做的是 save/load/compact/install（含 fsync），因此**不违反 I9**（共识锁仍未被长 IO 占住） |
+| **L18** | （M5.6 新增）在途槽位表 `appendInflight_` 受 `mu_` 保护；`peerSendAllowedLocked()` 只**读**（统计未过期槽位），回收与 `nextIndex_` 回退只在非 const 的 `pruneInflightLocked()` 里做（`approveAppendSend` 开头调用）。槽位 TTL 复用 I15 的 `inflightMuteGapMs()`，因此"窗口满"的静音时长仍严格小于最小选举超时 |
 
 ### 2.3 原子性与可见性
 
 - `Metrics` 计数器用 `std::atomic`（`fetch_add`/`load`）；直方图用 `atomic<uint64_t>` 分桶数组。
 - 允许在锁内做指标累加的**只有** O(1) 原子操作（目标开销 <1%）；任何需要分配/遍历的采集放锁外。
-- 新增的 `metaDirty_`/`pendingSyncIndex_` 等标志均受 `mu_` 保护，不引入独立原子状态。
+- 新增的 `metaDirty_`/`syncedIndex_` 等标志均受 `mu_` 保护，不引入独立原子状态。
 
 ## 3. 风险清单（含检测手段）
 
 | 风险 | 触发条件 | 后果 | 对策 / 检测 |
 |---|---|---|---|
-| R1 no-op 不 durable 卡住读路径 | no-op 走 appendNoSync 但 `syncedIndex_` 不推进 | §8 屏障永不满足 → **所有线性一致读失败** | §8.1 锁外 fsync；**先写 M5.A8 用例再看实现** |
+| R1 no-op 不 durable 卡住读路径 | no-op 走 appendNoSync 但 `syncedIndex_` 不推进 | §8 屏障永不满足 → **所有线性一致读失败** | §8.1 锁外 fsync；**先写 `RaftPerf.A5_NoopUnblocksReadBarrier` 用例再看实现** |
 | R2 follower 配置生效延后 | `applyAppendedConfigLocked` 移到 durable 之后 | 在途窗口内 `currConfig_` 落后于日志 | 全量回归 A20–A29（尤其 A24/A25/A29）；窗口内不对外回复 |
-| R3 回锁后状态已变 | 解锁窗口内发生 step-down / truncateSuffix / compact / InstallSnapshot | 用过期视图推进 `syncedIndex_`/回复错误结果 | 每个回锁点重校验；M5.A3/M5.B4 覆盖 |
+| R3 回锁后状态已变 | 解锁窗口内发生 step-down / truncateSuffix / compact / InstallSnapshot | 用过期视图推进 `syncedIndex_`/回复错误结果 | 每个回锁点重校验；`RaftPerf.A12/A13` 覆盖 |
 | R4 meta 落盘乱序 | 两个投票处理器并发，低 term 落盘晚于高 term | I3 被破坏（崩溃后重复投票） | `metaPersistMu_`（L13）+ M5.A4 |
-| R5 Reactor 悬垂回调 | `removePeer` 与在途请求竞争 | 回调访问已析构状态 / 触发已移除 peer 的逻辑 | 在途表按 peer 清理；M5.A6 + TSan |
+| R5 Reactor 悬垂回调 | `removePeer` 与在途请求竞争 | 回调访问已析构状态 / 触发已移除 peer 的逻辑 | 在途表按 peer 清理；`RaftReactor.R3_RemovePeerDropsInflightCallback` + TSan |
 | R6 部分写/重连风暴 | 非阻塞写只写了一半 / 对端反复断连 | 帧错位 / CPU 打满 | 写队列 + `EPOLLOUT`；重连退避；帧解析仅在完整帧时交付 |
 | R7 关闭期在途异步发送 | 退出时仍有未完成 RPC | 回调打到半析构对象 | L15 关闭顺序；`stop()` 后不再触发回调 |
-| R8 快照流式化改坏格式 | 分块写出与既有 `RKS1` 布局不一致 | 重启/安装失败 | 只改"如何写出"不改布局；M5.B2 + 既有 B4 |
-| R9 断点续传半写 | 传输中重启 / 头不匹配 | 装到残缺快照 | `.recv` 头带 `(index,term,receivedLen,crcSoFar)`；不匹配即丢弃重传；M5.B3 |
+| R8 快照流式化改坏格式 | 分块写出与既有 `RKS1` 布局不一致 | 重启/安装失败 | 只改"如何写出"不改布局；`RaftSnapshotStream.SaveStreamingWritesIdenticalFile` + 既有 `B4_Rks1V1SnapshotStillLoads` |
+| R9 断点续传半写 | 传输中重启 / 头不匹配 | 装到残缺快照 | `.recv` **尾部**带 `(index,term,receivedLen,crcSoFar)`；不匹配即丢弃重传；`RaftSnapshotResume.ContinuesAfterStoreRestart` |
 | R10 基准自欺 | 机器状态漂移 / 未 verify / 单次取样 | 假性能结论 | 同机交替 + 预热 + 3 次中位数 + `verify missing 0`（§10 方法学） |
 | R11 指标开销 | 高频采样 / 锁内复杂计算 | 反噬主指标 | 原子 O(1) + 采样只在 `status` 请求时做差；M5.5 做开/关 A/B（<1%） |
 | R12 TSan 报告 | 新旧并发面（Reactor + 回调） | 数据竞争 | TSan 全量门禁（M5.3 起硬性） |
@@ -80,17 +81,17 @@
 
 | 文件 | 改动 |
 |---|---|
-| `src/raft/raft_node.{h,cpp}` | `onAppendEntries` 两段式（§6.3）；`tick` no-op 走 `appendNoSync` + 锁外 fsync；`startElection`/`onRequestVote` 的 I5 三段式；`becomeFollower` 去 IO + `metaDirty_`；`maybeSnapshot`/`onInstallSnapshot` 的 `compact` 出锁；新增 `syncLogOutsideLock()`/`flushMetaOutsideLock()`；指标挂点（可选指针） |
-| `src/main_raft_node.cpp` | 默认改用 `TransportReactor`；接入 `Metrics`；`status` 增字段；msgType 15 处理；**显式 stop+join 替换 `_Exit(0)`** |
-| `src/raft/file_snapshot_store.cpp` | 流式 `save()`（分块 + 增量 CRC + rename + fsyncDir）；`.recv` 头带 `(index,term,receivedLen,crcSoFar)` + 续传 |
+| `src/raft/raft_node.{h,cpp}` | `onAppendEntries` 两段式（§6.3）；`tick` no-op 走 `appendNoSync` + 锁外 fsync；`startElection`/`onRequestVote` 的 I5 三段式；`becomeFollower` 去 IO + `metaDirty_`；`maybeSnapshot`/`onInstallSnapshot` 的 `compact` 出锁；新增 `flushMetaOutsideLock()`（no-op 的锁外 fsync 实际内联在 `tick` 中）；指标挂点（可选指针） |
+| `src/main_raft_node.cpp` | **保持默认 `sync`**（`--transport=reactor` 可选）；接入 `Metrics`；`status` 增字段；msgType 15 处理；`stop()+join` 已落地，但末尾**仍以 `std::_Exit(0)` 收尾**（未按计划移除） |
+| `src/raft/file_snapshot_store.cpp` | 流式 `saveStreaming()`（分块 + 增量 CRC + rename + fsyncDir）；`.recv` **尾部**带 `(index,term,receivedLen,crcSoFar)` + 续传 |
 | `src/kv/kv_state_machine.{h,cpp}` | `SnapshotView` 增流式接口（分块产出，峰值 O(块)）；**语义不变** |
 | `CMakeLists.txt` | `raftkv_raft` 追加新源文件；`raftkv_raft_tests` 追加 `tests/raft_perf_test.cpp`；新增可选 `-DENABLE_TSAN=ON` 构建开关 |
-| `tests/raft_test_harness.h` | **仅追加**：`MuHeldGuard`、`SpyLogStore`、`BlockingLogStore`、`AsyncMemoryTransport`、`makeSlowPeerCluster` |
+| `tests/raft_test_harness.h` | **仅追加**：`SpyLogStore`、`BlockingLogStore`；持锁探针在 `src/raft/lock_probe.h`（`ProbedMutex` + `consensusHeld()`），异步/慢 peer 桩为测试内局部类（`AsyncQueueTransport` / `BlockingAppendTransport`） |
 
 ### 4.2 【可选扩展】
 
 `src/raft/transport_tcp.{h,cpp}`（保留为同步对照引擎，可加指标计数）；`src/raft/file_log_store.cpp`（fsync 计数上报）；
-`src/main_raft_client.cpp`（延迟直方图采样，仅用于压测报告）；`src/raft/log_codec.{h,cpp}`（消除 M2/M3 两份 LogEntry 编解码）。
+`src/main_raft_client.cpp`（延迟直方图采样，仅用于压测报告）；~~`src/raft/log_codec.{h,cpp}`~~（消除 M2/M3 两份 LogEntry 编解码；**未实现**，两份编解码仍各自存在）。
 
 ### 4.3 【禁止改动】
 

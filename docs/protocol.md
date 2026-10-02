@@ -5,7 +5,7 @@
 ## 通用限制
 
 - 单个请求总长上限：`64 MiB`（`kMaxRequestBytes`）
-- key 长度上限：`64 KiB`（`uint16`）
+- key 长度上限：`65535` 字节（64 KiB − 1，`uint16`）
 - value 长度上限：`4 GiB - 1`（`uint32`，实际受请求总长上限约束）
 - 客户端与服务端均忽略 `SIGPIPE`，用 `send(MSG_NOSIGNAL)`/错误码处理断开
 
